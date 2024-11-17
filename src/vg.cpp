@@ -133,14 +133,24 @@ struct DrawCommand
 
 struct GPUVertexBuffer
 {
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+	bgfx::TransientVertexBuffer m_PosBufferHandle;
+	bgfx::TransientVertexBuffer m_UVBufferHandle;
+	bgfx::TransientVertexBuffer m_ColorBufferHandle;
+#else
 	bgfx::DynamicVertexBufferHandle m_PosBufferHandle;
 	bgfx::DynamicVertexBufferHandle m_UVBufferHandle;
 	bgfx::DynamicVertexBufferHandle m_ColorBufferHandle;
+#endif
 };
 
 struct GPUIndexBuffer
 {
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+	bgfx::TransientIndexBuffer m_bgfxHandle;
+#else
 	bgfx::DynamicIndexBufferHandle m_bgfxHandle;
+#endif
 };
 
 struct VertexBuffer
@@ -366,7 +376,9 @@ struct Context
 	uint32_t m_FirstVertexBufferID;
 
 	IndexBuffer* m_IndexBuffers;
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 	GPUIndexBuffer* m_GPUIndexBuffers;
+#endif
 	uint32_t m_NumIndexBuffers;
 	uint16_t m_ActiveIndexBufferID;
 
@@ -879,6 +891,7 @@ void destroyContext(Context* ctx)
 	bgfx::destroy(ctx->m_InnerColorUniform);
 	bgfx::destroy(ctx->m_OuterColorUniform);
 
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 	for (uint32_t i = 0; i < ctx->m_VertexBufferCapacity; ++i) {
 		GPUVertexBuffer* vb = &ctx->m_GPUVertexBuffers[i];
 		if (bgfx::isValid(vb->m_PosBufferHandle)) {
@@ -894,6 +907,7 @@ void destroyContext(Context* ctx)
 			vb->m_ColorBufferHandle = BGFX_INVALID_HANDLE;
 		}
 	}
+#endif
 	bx::free(allocator, ctx->m_GPUVertexBuffers);
 	bx::free(allocator, ctx->m_VertexBuffers);
 	ctx->m_GPUVertexBuffers = nullptr;
@@ -902,12 +916,13 @@ void destroyContext(Context* ctx)
 	ctx->m_NumVertexBuffers = 0;
 
 	for (uint32_t i = 0; i < ctx->m_NumIndexBuffers; ++i) {
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 		GPUIndexBuffer* gpuib = &ctx->m_GPUIndexBuffers[i];
 		if (bgfx::isValid(gpuib->m_bgfxHandle)) {
 			bgfx::destroy(gpuib->m_bgfxHandle);
 			gpuib->m_bgfxHandle = BGFX_INVALID_HANDLE;
 		}
-
+#endif
 		IndexBuffer* ib = &ctx->m_IndexBuffers[i];
         if (ib->m_Indices) {
             bx::alignedFree(allocator, ib->m_Indices, 16);
@@ -916,9 +931,13 @@ void destroyContext(Context* ctx)
 		ib->m_Capacity = 0;
 		ib->m_Count = 0;
 	}
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 	bx::free(allocator, ctx->m_GPUIndexBuffers);
+#endif
 	bx::free(allocator, ctx->m_IndexBuffers);
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 	ctx->m_GPUIndexBuffers = nullptr;
+#endif
 	ctx->m_IndexBuffers = nullptr;
 	ctx->m_ActiveIndexBufferID = UINT16_MAX;
 
@@ -1103,6 +1122,23 @@ void end(Context* ctx)
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[iVB];
 		
 		const uint32_t maxVBVertices = ctx->m_Config.m_MaxVBVertices;
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		bgfx::allocTransientVertexBuffer(&gpuvb->m_PosBufferHandle, vb->m_Count, ctx->m_PosVertexDecl);
+		bx::memCopy(gpuvb->m_PosBufferHandle.data, vb->m_Pos, sizeof(float) * 2 * vb->m_Count);
+		releaseVertexBufferData_Vec2(ctx, vb->m_Pos);
+
+		bgfx::allocTransientVertexBuffer(&gpuvb->m_UVBufferHandle, vb->m_Count, ctx->m_UVVertexDecl);
+		bx::memCopy(gpuvb->m_UVBufferHandle.data, vb->m_UV, sizeof(uv_t) * 2 * vb->m_Count);
+#if VG_CONFIG_UV_INT16
+		releaseVertexBufferData_UV(ctx, vb->m_UV);
+#else
+		releaseVertexBufferData_Vec2(ctx, vb->m_UV);
+#endif
+
+		bgfx::allocTransientVertexBuffer(&gpuvb->m_ColorBufferHandle, vb->m_Count, ctx->m_ColorVertexDecl);
+		bx::memCopy(gpuvb->m_ColorBufferHandle.data, vb->m_Color, sizeof(uint32_t) * vb->m_Count);
+		releaseVertexBufferData_Uint32(ctx, vb->m_Color);
+#else
 		if (!bgfx::isValid(gpuvb->m_PosBufferHandle)) {
 			gpuvb->m_PosBufferHandle = bgfx::createDynamicVertexBuffer(maxVBVertices, ctx->m_PosVertexDecl, 0);
 		}
@@ -1112,7 +1148,9 @@ void end(Context* ctx)
 		if (!bgfx::isValid(gpuvb->m_ColorBufferHandle)) {
 			gpuvb->m_ColorBufferHandle = bgfx::createDynamicVertexBuffer(maxVBVertices, ctx->m_ColorVertexDecl, 0);
 		}
+#endif // VG_
 
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 		const bgfx::Memory* posMem = bgfx::makeRef(vb->m_Pos, sizeof(float) * 2 * vb->m_Count, releaseVertexBufferDataCallback_Vec2, ctx);
 		const bgfx::Memory* colorMem = bgfx::makeRef(vb->m_Color, sizeof(uint32_t) * vb->m_Count, releaseVertexBufferDataCallback_Uint32, ctx);
 #if VG_CONFIG_UV_INT16
@@ -1128,10 +1166,17 @@ void end(Context* ctx)
 		vb->m_Pos = nullptr;
 		vb->m_UV = nullptr;
 		vb->m_Color = nullptr;
+#endif
 	}
 
 	// Update bgfx index buffer...
 	IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+	bgfx::TransientIndexBuffer indexBuffer;
+	bgfx::allocTransientIndexBuffer(&indexBuffer, ib->m_Count);
+	bx::memCopy(indexBuffer.data, ib->m_Indices, sizeof(int16_t) * ib->m_Count);
+	releaseIndexBuffer(ctx, ib->m_Indices);
+#else
 	GPUIndexBuffer* gpuib = &ctx->m_GPUIndexBuffers[ctx->m_ActiveIndexBufferID];
 	const bgfx::Memory* indexMem = bgfx::makeRef(&ib->m_Indices[0], sizeof(uint16_t) * ib->m_Count, releaseIndexBufferCallback, ctx);
 	if (!bgfx::isValid(gpuib->m_bgfxHandle)) {
@@ -1139,6 +1184,7 @@ void end(Context* ctx)
 	} else {
 		bgfx::update(gpuib->m_bgfxHandle, 0, indexMem);
 	}
+#endif
 
 	const uint16_t viewID = ctx->m_ViewID;
 	const uint16_t canvasWidth = ctx->m_CanvasWidth;
@@ -1173,9 +1219,13 @@ void end(Context* ctx)
 					DrawCommand* clipCmd = &ctx->m_ClipCommands[cmdClipState->m_FirstCmdID + iClip];
 
 					GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[clipCmd->m_VertexBufferID];
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+					bgfx::setVertexBuffer(0, &gpuvb->m_PosBufferHandle, clipCmd->m_FirstVertexID, clipCmd->m_NumVertices);
+					bgfx::setIndexBuffer(&indexBuffer, clipCmd->m_FirstIndexID, clipCmd->m_NumIndices);
+#else
 					bgfx::setVertexBuffer(0, gpuvb->m_PosBufferHandle, clipCmd->m_FirstVertexID, clipCmd->m_NumVertices);
 					bgfx::setIndexBuffer(gpuib->m_bgfxHandle, clipCmd->m_FirstIndexID, clipCmd->m_NumIndices);
-
+#endif
 					// Set scissor.
 					{
 						const uint16_t* cmdScissorRect = &clipCmd->m_ScissorRect[0];
@@ -1219,10 +1269,15 @@ void end(Context* ctx)
 		}
 
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[cmd->m_VertexBufferID];
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		bgfx::setVertexBuffer(0, &gpuvb->m_PosBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+		bgfx::setVertexBuffer(1, &gpuvb->m_ColorBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+		bgfx::setIndexBuffer(&indexBuffer, cmd->m_FirstIndexID, cmd->m_NumIndices);
+#else
 		bgfx::setVertexBuffer(0, gpuvb->m_PosBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
 		bgfx::setVertexBuffer(1, gpuvb->m_ColorBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
 		bgfx::setIndexBuffer(gpuib->m_bgfxHandle, cmd->m_FirstIndexID, cmd->m_NumIndices);
-
+#endif
 		// Set scissor.
 		{
 			const uint16_t* cmdScissorRect = &cmd->m_ScissorRect[0];
@@ -1238,7 +1293,11 @@ void end(Context* ctx)
 			VG_CHECK(cmd->m_HandleID != UINT16_MAX, "Invalid image handle");
 			Image* tex = &ctx->m_Images[cmd->m_HandleID];
 
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+			bgfx::setVertexBuffer(2, &gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+#else
 			bgfx::setVertexBuffer(2, gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+#endif
 			bgfx::setTexture(0, ctx->m_TexUniform, tex->m_bgfxHandle, tex->m_Flags);
 
 			bgfx::setState(0
@@ -5001,9 +5060,11 @@ static VertexBuffer* allocVertexBuffer(Context* ctx)
 
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[ctx->m_VertexBufferCapacity - 1];
 
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 		gpuvb->m_PosBufferHandle = BGFX_INVALID_HANDLE;
 		gpuvb->m_UVBufferHandle = BGFX_INVALID_HANDLE;
 		gpuvb->m_ColorBufferHandle = BGFX_INVALID_HANDLE;
+#endif
 	}
 
 	VertexBuffer* vb = &ctx->m_VertexBuffers[ctx->m_NumVertexBuffers++];
@@ -5037,8 +5098,9 @@ static uint16_t allocIndexBuffer(Context* ctx)
 	if (ibID == UINT16_MAX) {
 		ctx->m_NumIndexBuffers++;
 		ctx->m_IndexBuffers = (IndexBuffer*)bx::realloc(ctx->m_Allocator, ctx->m_IndexBuffers, sizeof(IndexBuffer) * ctx->m_NumIndexBuffers);
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 		ctx->m_GPUIndexBuffers = (GPUIndexBuffer*)bx::realloc(ctx->m_Allocator, ctx->m_GPUIndexBuffers, sizeof(GPUIndexBuffer) * ctx->m_NumIndexBuffers);
-
+#endif
 		ibID = (uint16_t)(ctx->m_NumIndexBuffers - 1);
 
 		IndexBuffer* ib = &ctx->m_IndexBuffers[ibID];
@@ -5046,8 +5108,10 @@ static uint16_t allocIndexBuffer(Context* ctx)
 		ib->m_Count = 0;
 		ib->m_Indices = nullptr;
 
+#if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 		GPUIndexBuffer* gpuib = &ctx->m_GPUIndexBuffers[ibID];
 		gpuib->m_bgfxHandle = BGFX_INVALID_HANDLE;
+#endif
 	}
 
 	return ibID;

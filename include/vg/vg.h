@@ -28,6 +28,10 @@
 #	define VG_CONFIG_UV_INT16 1
 #endif
 
+#ifndef VG_CONFIG_USE_TRANSIENT_BUFFERS
+#	define VG_CONFIG_USE_TRANSIENT_BUFFERS 1
+#endif
+
 // If set to 1, submitCommandList() calls pustState()/popState() and resetClip() before and after
 // executing the commands. Otherwise, the state produced by the command list will affect the global
 // state after the execution of the commands.
