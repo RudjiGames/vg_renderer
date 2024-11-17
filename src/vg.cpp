@@ -1121,7 +1121,6 @@ void end(Context* ctx)
 		VertexBuffer* vb = &ctx->m_VertexBuffers[iVB];
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[iVB];
 		
-		const uint32_t maxVBVertices = ctx->m_Config.m_MaxVBVertices;
 #if VG_CONFIG_USE_TRANSIENT_BUFFERS
 		bgfx::allocTransientVertexBuffer(&gpuvb->m_PosBufferHandle, vb->m_Count, ctx->m_PosVertexDecl);
 		bx::memCopy(gpuvb->m_PosBufferHandle.data, vb->m_Pos, sizeof(float) * 2 * vb->m_Count);
@@ -1139,6 +1138,7 @@ void end(Context* ctx)
 		bx::memCopy(gpuvb->m_ColorBufferHandle.data, vb->m_Color, sizeof(uint32_t) * vb->m_Count);
 		releaseVertexBufferData_Uint32(ctx, vb->m_Color);
 #else
+		const uint32_t maxVBVertices = ctx->m_Config.m_MaxVBVertices;
 		if (!bgfx::isValid(gpuvb->m_PosBufferHandle)) {
 			gpuvb->m_PosBufferHandle = bgfx::createDynamicVertexBuffer(maxVBVertices, ctx->m_PosVertexDecl, 0);
 		}
@@ -5058,9 +5058,8 @@ static VertexBuffer* allocVertexBuffer(Context* ctx)
 		ctx->m_VertexBuffers = (VertexBuffer*)bx::realloc(ctx->m_Allocator, ctx->m_VertexBuffers, sizeof(VertexBuffer) * ctx->m_VertexBufferCapacity);
 		ctx->m_GPUVertexBuffers = (GPUVertexBuffer*)bx::realloc(ctx->m_Allocator, ctx->m_GPUVertexBuffers, sizeof(GPUVertexBuffer) * ctx->m_VertexBufferCapacity);
 
-		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[ctx->m_VertexBufferCapacity - 1];
-
 #if !VG_CONFIG_USE_TRANSIENT_BUFFERS
+		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[ctx->m_VertexBufferCapacity - 1];
 		gpuvb->m_PosBufferHandle = BGFX_INVALID_HANDLE;
 		gpuvb->m_UVBufferHandle = BGFX_INVALID_HANDLE;
 		gpuvb->m_ColorBufferHandle = BGFX_INVALID_HANDLE;
