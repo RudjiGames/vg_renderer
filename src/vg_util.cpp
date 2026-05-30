@@ -331,7 +331,9 @@ void genQuadIndices_unaligned(uint16_t* dst, uint32_t n, uint16_t firstVertexID)
 
 void batchTransformTextQuads(const float* __restrict quads, uint32_t n, const float* __restrict mtx, float* __restrict transformedVertices)
 {
-#if VG_CONFIG_ENABLE_SIMD
+// NOTE: The bx::simd_* wrapper API the original SIMD path relied on was removed from
+// the current bx, so this branch is disabled and the scalar implementation is used.
+#if 0
 	const bx::simd128_t mtx0 = bx::simd_splat(mtx[0]);
 	const bx::simd128_t mtx1 = bx::simd_splat(mtx[1]);
 	const bx::simd128_t mtx2 = bx::simd_splat(mtx[2]);
