@@ -1011,7 +1011,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 	const uint32_t numSegments = numPathVertices - (_Closed ? 0 : 1);
 	const float hsw = strokeWidth * 0.5f;
 	const float da = bx::acos((stroker->m_Scale * hsw) / ((stroker->m_Scale * hsw) + stroker->m_TesselationTolerance)) * 2.0f;
-	const uint32_t numPointsHalfCircle = bx::uint32_max(2u, (uint32_t)bx::ceil(bx::kPi / da));
+	const uint32_t numPointsHalfCircle = bx::max(2u, (uint32_t)bx::ceil(bx::kPi / da));
 
 	resetGeometry(stroker);
 
@@ -1143,7 +1143,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 						a12 += bx::kPi2;
 					}
 
-					numArcPoints = bx::uint32_max(2u, (uint32_t)((a12 - a01) / da));
+					numArcPoints = bx::max(2u, (uint32_t)((a12 - a01) / da));
 					arcDa = ((a12 - a01) / (float)numArcPoints);
 				}
 
@@ -1241,7 +1241,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 						a12 -= bx::kPi2;
 					}
 
-					numArcPoints = bx::uint32_max(2u, (uint32_t)((a01 - a12) / da));
+					numArcPoints = bx::max(2u, (uint32_t)((a01 - a12) / da));
 					arcDa = ((a12 - a01) / (float)numArcPoints);
 				}
 
@@ -1396,7 +1396,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 	const float hsw = (strokeWidth - stroker->m_FringeWidth) * 0.5f;
 	const float hsw_aa = hsw + stroker->m_FringeWidth;
 	const float da = bx::acos((stroker->m_Scale * hsw) / ((stroker->m_Scale * hsw) + stroker->m_TesselationTolerance)) * 2.0f;
-	const uint32_t numPointsHalfCircle = bx::uint32_max(2u, (uint32_t)bx::ceil(bx::kPi / da));
+	const uint32_t numPointsHalfCircle = bx::max(2u, (uint32_t)bx::ceil(bx::kPi / da));
 
 	resetGeometry(stroker);
 
@@ -1591,7 +1591,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 						a12 += bx::kPi2;
 					}
 
-					numArcPoints = bx::uint32_max(2u, (uint32_t)((a12 - a01) / da));
+					numArcPoints = bx::max(2u, (uint32_t)((a12 - a01) / da));
 					arcDa = ((a12 - a01) / (float)numArcPoints);
 				}
 
@@ -1747,7 +1747,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 						a12 -= bx::kPi2;
 					}
 
-					numArcPoints = bx::uint32_max(2u, (uint32_t)((a01 - a12) / da));
+					numArcPoints = bx::max(2u, (uint32_t)((a01 - a12) / da));
 					arcDa = ((a12 - a01) / (float)numArcPoints);
 				}
 

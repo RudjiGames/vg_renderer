@@ -5428,7 +5428,7 @@ static uint32_t allocIndices(Context* ctx, uint32_t numIndices)
 	if (ib->m_Count + numIndices > ib->m_Capacity) {
 		const uint32_t nextCapacity = ib->m_Capacity != 0 ? (ib->m_Capacity * 3) / 2 : 32;
 
-		ib->m_Capacity = bx::uint32_max(nextCapacity, ib->m_Count + numIndices);
+		ib->m_Capacity = bx::max(nextCapacity, ib->m_Count + numIndices);
 		ib->m_Indices = (uint16_t*)bx::alignedRealloc(ctx->m_Allocator, ib->m_Indices, sizeof(uint16_t) * ib->m_Capacity, 16);
 	}
 
@@ -5556,7 +5556,7 @@ static ImageHandle allocImage(Context* ctx)
 	if (handle.idx >= ctx->m_ImageCapacity) {
 		const uint32_t oldCapacity = ctx->m_ImageCapacity;
 
-		ctx->m_ImageCapacity = bx::uint32_min(bx::uint32_max(ctx->m_ImageCapacity + 4, handle.idx + 1),
+		ctx->m_ImageCapacity = bx::min(bx::max(ctx->m_ImageCapacity + 4, handle.idx + 1),
 																				  ctx->m_Config.m_MaxImages);
 		ctx->m_Images = (Image*)bx::realloc(ctx->m_Allocator, ctx->m_Images, sizeof(Image) * ctx->m_ImageCapacity);
 		if (!ctx->m_Images) {
