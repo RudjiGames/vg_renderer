@@ -134,15 +134,13 @@ void memset128(void* __restrict dst, uint32_t n128, const void* __restrict src)
 }
 
 // Transforms 2 interleaved positions { x0, y0, x1, y1 } at once.
-//   x' = (x * m[0] + m[4]) + y * m[2]
-//   y' = (x * m[1] + m[5]) + y * m[3]
-// NOTE: The evaluation order is part of the contract (see batchTransformPositions()). All code paths
-// (SIMD body, SIMD tail and the non-SIMD fallback) use it so they produce bit-identical results.
-static inline __m128 transformPositions2(__m128 xy, __m128 mtx0101, __m128 mtx2323, __m128 mtx4545)
+//   x' = (x * m[0] + y * m[2]) + m[4]
+//   y' = (y * m[3] + x * m[1]) + m[5]  (== (x * m[1] + y * m[3]) + m[5]; fp addition is commutative)
+// Same evaluation order as transformPos2D(), so the SIMD body, the tail and the non-SIMD path all match.
+static inline __m128 transformPositions2(__m128 xy, __m128 mtx0303, __m128 mtx2121, __m128 mtx4545)
 {
-	const __m128 xx = _mm_shuffle_ps(xy, xy, _MM_SHUFFLE(2, 2, 0, 0)); // { x0, x0, x1, x1 }
-	const __m128 yy = _mm_shuffle_ps(xy, xy, _MM_SHUFFLE(3, 3, 1, 1)); // { y0, y0, y1, y1 }
-	return _mm_add_ps(_mm_add_ps(_mm_mul_ps(xx, mtx0101), mtx4545), _mm_mul_ps(yy, mtx2323));
+	const __m128 yx = _mm_shuffle_ps(xy, xy, _MM_SHUFFLE(2, 3, 0, 1)); // { y0, x0, y1, x1 }
+	return _mm_add_ps(_mm_add_ps(_mm_mul_ps(xy, mtx0303), _mm_mul_ps(yx, mtx2121)), mtx4545);
 }
 
 void batchTransformPositions(const float* __restrict src, uint32_t n, float* __restrict dst, const float* __restrict mtx)
@@ -151,8 +149,8 @@ void batchTransformPositions(const float* __restrict src, uint32_t n, float* __r
 	const __m128 mtx0123 = _mm_loadu_ps(mtx);
 	const __m128 mtx45 = _mm_loadl_pi(_mm_setzero_ps(), (const __m64*)(mtx + 4));
 
-	const __m128 mtx0101 = _mm_movelh_ps(mtx0123, mtx0123); // { m0, m1, m0, m1 }
-	const __m128 mtx2323 = _mm_movehl_ps(mtx0123, mtx0123); // { m2, m3, m2, m3 }
+	const __m128 mtx0303 = _mm_shuffle_ps(mtx0123, mtx0123, _MM_SHUFFLE(3, 0, 3, 0)); // { m0, m3, m0, m3 }
+	const __m128 mtx2121 = _mm_shuffle_ps(mtx0123, mtx0123, _MM_SHUFFLE(1, 2, 1, 2)); // { m2, m1, m2, m1 }
 	const __m128 mtx4545 = _mm_movelh_ps(mtx45, mtx45);     // { m4, m5, m4, m5 }
 
 	const uint32_t iter = n >> 3;
@@ -162,10 +160,10 @@ void batchTransformPositions(const float* __restrict src, uint32_t n, float* __r
 		const __m128 xy45 = _mm_loadu_ps(src + 8);  // { x4, y4, x5, y5 }
 		const __m128 xy67 = _mm_loadu_ps(src + 12); // { x6, y6, x7, y7 }
 
-		_mm_storeu_ps(dst + 0, transformPositions2(xy01, mtx0101, mtx2323, mtx4545));
-		_mm_storeu_ps(dst + 4, transformPositions2(xy23, mtx0101, mtx2323, mtx4545));
-		_mm_storeu_ps(dst + 8, transformPositions2(xy45, mtx0101, mtx2323, mtx4545));
-		_mm_storeu_ps(dst + 12, transformPositions2(xy67, mtx0101, mtx2323, mtx4545));
+		_mm_storeu_ps(dst + 0, transformPositions2(xy01, mtx0303, mtx2121, mtx4545));
+		_mm_storeu_ps(dst + 4, transformPositions2(xy23, mtx0303, mtx2121, mtx4545));
+		_mm_storeu_ps(dst + 8, transformPositions2(xy45, mtx0303, mtx2121, mtx4545));
+		_mm_storeu_ps(dst + 12, transformPositions2(xy67, mtx0303, mtx2121, mtx4545));
 
 		src += 16;
 		dst += 16;
@@ -176,8 +174,8 @@ void batchTransformPositions(const float* __restrict src, uint32_t n, float* __r
 		const __m128 xy01 = _mm_loadu_ps(src + 0);
 		const __m128 xy23 = _mm_loadu_ps(src + 4);
 
-		_mm_storeu_ps(dst + 0, transformPositions2(xy01, mtx0101, mtx2323, mtx4545));
-		_mm_storeu_ps(dst + 4, transformPositions2(xy23, mtx0101, mtx2323, mtx4545));
+		_mm_storeu_ps(dst + 0, transformPositions2(xy01, mtx0303, mtx2121, mtx4545));
+		_mm_storeu_ps(dst + 4, transformPositions2(xy23, mtx0303, mtx2121, mtx4545));
 
 		src += 8;
 		dst += 8;
@@ -186,7 +184,7 @@ void batchTransformPositions(const float* __restrict src, uint32_t n, float* __r
 
 	if (rem >= 2) {
 		const __m128 xy01 = _mm_loadu_ps(src);
-		_mm_storeu_ps(dst, transformPositions2(xy01, mtx0101, mtx2323, mtx4545));
+		_mm_storeu_ps(dst, transformPositions2(xy01, mtx0303, mtx2121, mtx4545));
 
 		src += 4;
 		dst += 4;
@@ -194,11 +192,7 @@ void batchTransformPositions(const float* __restrict src, uint32_t n, float* __r
 	}
 
 	if (rem) {
-		// Same evaluation order as transformPositions2()
-		const float x = src[0];
-		const float y = src[1];
-		dst[0] = (x * mtx[0] + mtx[4]) + y * mtx[2];
-		dst[1] = (x * mtx[1] + mtx[5]) + y * mtx[3];
+		transformPos2D(src[0], src[1], mtx, dst);
 	}
 }
 #else
@@ -241,14 +235,9 @@ void memset128(void* __restrict dst, uint32_t n128, const void* __restrict src)
 
 void batchTransformPositions(const float* __restrict v, uint32_t n, float* __restrict p, const float* __restrict mtx)
 {
-	// NOTE: Same evaluation order as the SIMD version (x * m[0] + m[4]) + y * m[2] (which differs from
-	// transformPos2D()) so both paths produce bit-identical results.
 	for (uint32_t i = 0; i < n; ++i) {
 		const uint32_t id = i << 1;
-		const float x = v[id + 0];
-		const float y = v[id + 1];
-		p[id + 0] = (x * mtx[0] + mtx[4]) + y * mtx[2];
-		p[id + 1] = (x * mtx[1] + mtx[5]) + y * mtx[3];
+		transformPos2D(v[id], v[id + 1], mtx, &p[id]);
 	}
 }
 #endif
