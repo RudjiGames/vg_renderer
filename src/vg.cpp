@@ -448,9 +448,6 @@ struct Context
 	uint32_t m_FontImageID;
 	uv_t m_FontImageWhitePixelUV[2];
 
-	float* m_TextVertices;
-	FONSquad* m_TextQuads;
-	uint32_t m_TextQuadCapacity;
 	FONSstring m_TextString;
 	FontData* m_FontData;
 	uint32_t m_NextFontID;
@@ -495,15 +492,15 @@ static void releaseVertexBufferDataCallback_UV(void* ptr, void* userData);
 
 static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_t numIndices, DrawCommand::Type::Enum type, uint16_t handle);
 static DrawCommand* allocClipCommand(Context* ctx, uint32_t numVertices, uint32_t numIndices);
-static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices);
-static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices);
-static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices);
-static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices);
+static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 
 static ImageHandle allocImage(Context* ctx);
 static void resetImage(Image* img);
 
-static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color);
+static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQuads, Color color, float tx, float ty);
 static bool allocTextAtlas(Context* ctx);
 static void flushTextAtlas(Context* ctx);
 
@@ -1044,16 +1041,6 @@ void destroyContext(Context* ctx)
 
 	destroyStroker(ctx->m_Stroker);
 	ctx->m_Stroker = nullptr;
-
-    if (ctx->m_TextQuads) {
-        bx::alignedFree(allocator, ctx->m_TextQuads, 16);
-        ctx->m_TextQuads = nullptr;
-    }
-
-    if (ctx->m_TextVertices) {
-        bx::alignedFree(allocator, ctx->m_TextVertices, 16);
-        ctx->m_TextVertices = nullptr;
-    }
 
     if (ctx->m_TransformedVertices) {
         bx::alignedFree(allocator, ctx->m_TransformedVertices, 16);
@@ -4334,23 +4321,10 @@ static void ctxText(Context* ctx, const TextConfig& cfg, float x, float y, const
 		return;
 	}
 
-	if (ctx->m_TextQuadCapacity < (uint32_t)numBakedChars) {
-		bx::AllocatorI* allocator = ctx->m_Allocator;
-
-		ctx->m_TextQuadCapacity = (uint32_t)numBakedChars;
-		ctx->m_TextQuads = (FONSquad*)bx::alignedRealloc(allocator, ctx->m_TextQuads, sizeof(FONSquad) * ctx->m_TextQuadCapacity, 16);
-		ctx->m_TextVertices = (float*)bx::alignedRealloc(allocator, ctx->m_TextVertices, sizeof(float) * 2 * (ctx->m_TextQuadCapacity * 4), 16);
-	}
-
-	bx::memCopy(ctx->m_TextQuads, vgs->m_Quads, sizeof(FONSquad) * numBakedChars);
-
 	float dx = 0.0f, dy = 0.0f;
 	fonsAlignString(fons, vgs, cfg.m_Alignment, &dx, &dy);
 
-	ctxPushState(ctx);
-	ctxTransformTranslate(ctx, x + dx / scale, y + dy / scale);
-	renderTextQuads(ctx, numBakedChars, cfg.m_Color);
-	ctxPopState(ctx);
+	renderTextQuads(ctx, vgs->m_Quads, (uint32_t)numBakedChars, cfg.m_Color, x + dx / scale, y + dy / scale);
 }
 
 static void ctxTextBox(Context* ctx, const TextConfig& cfg, float x, float y, float breakWidth, const char* str, const char* end, uint32_t textboxFlags)
@@ -5377,7 +5351,17 @@ static void releaseIndexBuffer(Context* ctx, uint16_t* data)
 	}
 }
 
-static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices)
+// Copies the positions into the vertex buffer, optionally transforming them by 'mtx' on the way.
+static inline void writePositions(float* dstPos, const float* vtx, uint32_t numVertices, const float* mtx)
+{
+	if (mtx) {
+		vgutil::batchTransformPositions(vtx, numVertices, dstPos, mtx);
+	} else {
+		bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	}
+}
+
+static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	// Allocate the draw command
 	const ImageHandle fontImg = ctx->m_FontImages[0];
@@ -5388,7 +5372,7 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	const uv_t* uv = getWhitePixelUV(ctx);
 
@@ -5416,7 +5400,7 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 	cmd->m_NumIndices += numIndices;
 }
 
-static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgPatternHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices)
+static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgPatternHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::ImagePattern, imgPatternHandle.idx);
 
@@ -5424,7 +5408,7 @@ static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgP
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	uint32_t* dstColor = &vb->m_Color[vbOffset];
 	if (numColors == numVertices) {
@@ -5442,7 +5426,7 @@ static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgP
 	cmd->m_NumIndices += numIndices;
 }
 
-static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradientHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices)
+static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradientHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::ColorGradient, gradientHandle.idx);
 
@@ -5450,7 +5434,7 @@ static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradien
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	uint32_t* dstColor = &vb->m_Color[vbOffset];
 	if (numColors == numVertices) {
@@ -5468,7 +5452,7 @@ static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradien
 	cmd->m_NumIndices += numIndices;
 }
 
-static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices)
+static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	// Allocate the draw command
 	DrawCommand* cmd = allocClipCommand(ctx, numVertices, numIndices);
@@ -5478,7 +5462,7 @@ static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numV
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	// Index buffer
 	IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
@@ -5711,7 +5695,9 @@ static bool allocTextAtlas(Context* ctx)
 	return true;
 }
 
-static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
+// Renders the quads translated by (tx, ty) in the current coordinate system. Positions are
+// transformed directly into the vertex buffer.
+static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQuads, Color color, float tx, float ty)
 {
 	const State* state = getState(ctx);
 	const float scale = state->m_FontScale * ctx->m_DevicePixelRatio;
@@ -5722,16 +5708,15 @@ static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
 		return;
 	}
 
+	// Same as translating the current transform by (tx, ty) (see ctxTransformTranslate()) and scaling by 1/scale.
+	const float* stateMtx = state->m_TransformMtx;
 	float mtx[6];
-	mtx[0] = state->m_TransformMtx[0] * invscale;
-	mtx[1] = state->m_TransformMtx[1] * invscale;
-	mtx[2] = state->m_TransformMtx[2] * invscale;
-	mtx[3] = state->m_TransformMtx[3] * invscale;
-	mtx[4] = state->m_TransformMtx[4];
-	mtx[5] = state->m_TransformMtx[5];
-
-	// TODO: Calculate bounding rect of the quads.
-	vgutil::batchTransformTextQuads(&ctx->m_TextQuads->x0, numQuads, mtx, ctx->m_TextVertices);
+	mtx[0] = stateMtx[0] * invscale;
+	mtx[1] = stateMtx[1] * invscale;
+	mtx[2] = stateMtx[2] * invscale;
+	mtx[3] = stateMtx[3] * invscale;
+	mtx[4] = stateMtx[4] + (stateMtx[0] * tx + stateMtx[2] * ty);
+	mtx[5] = stateMtx[5] + (stateMtx[1] * tx + stateMtx[3] * ty);
 
 	const uint32_t numDrawVertices = numQuads * 4;
 	const uint32_t numDrawIndices = numQuads * 6;
@@ -5741,15 +5726,16 @@ static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
 	VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
+	// TODO: Calculate bounding rect of the quads.
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, ctx->m_TextVertices, sizeof(float) * 2 * numDrawVertices);
+	vgutil::batchTransformTextQuads(&quads->x0, numQuads, mtx, dstPos);
 
 	uint32_t* dstColor = &vb->m_Color[vbOffset];
 	vgutil::memset32(dstColor, numDrawVertices, &c);
 
 #if VG_CONFIG_UV_INT16
 	int16_t* dstUV = &vb->m_UV[vbOffset << 1];
-	const FONSquad* q = ctx->m_TextQuads;
+	const FONSquad* q = quads;
 	uint32_t nq = numQuads;
 	while (nq-- > 0) {
 		const float s0 = q->s0;
@@ -5767,7 +5753,7 @@ static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
 	}
 #else
 	float* dstUV = &vb->m_UV[vbOffset << 1];
-	const FONSquad* q = ctx->m_TextQuads;
+	const FONSquad* q = quads;
 	uint32_t nq = numQuads;
 	while (nq-- > 0) {
 		const float s0 = q->s0;
@@ -6368,22 +6354,16 @@ static void submitCachedMesh(Context* ctx, Color col, const CachedMesh* meshList
 		for (uint32_t i = 0; i < numMeshes; ++i) {
 			const CachedMesh* mesh = &meshList[i];
 			const uint32_t numVertices = mesh->m_NumVertices;
-			float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
-			vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-			createDrawCommand_Clip(ctx, transformedVertices, numVertices, mesh->m_Indices, mesh->m_NumIndices);
+			createDrawCommand_Clip(ctx, mesh->m_Pos, numVertices, mesh->m_Indices, mesh->m_NumIndices, mtx);
 		}
 	} else {
 		for (uint32_t i = 0; i < numMeshes; ++i) {
 			const CachedMesh* mesh = &meshList[i];
 			const uint32_t numVertices = mesh->m_NumVertices;
-			float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
 			const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 			const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 			
-			vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-			createDrawCommand_VertexColor(ctx, transformedVertices, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices);
+			createDrawCommand_VertexColor(ctx, mesh->m_Pos, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices, mtx);
 		}
 	}
 }
@@ -6402,13 +6382,10 @@ static void submitCachedMesh(Context* ctx, GradientHandle gradientHandle, const 
 	for (uint32_t i = 0; i < numMeshes; ++i) {
 		const CachedMesh* mesh = &meshList[i];
 		const uint32_t numVertices = mesh->m_NumVertices;
-		float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
 		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 		const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 
-		vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-		createDrawCommand_ColorGradient(ctx, gradientHandle, transformedVertices, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices);
+		createDrawCommand_ColorGradient(ctx, gradientHandle, mesh->m_Pos, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices, mtx);
 	}
 }
 
@@ -6426,13 +6403,10 @@ static void submitCachedMesh(Context* ctx, ImagePatternHandle imgPattern, Color 
 	for (uint32_t i = 0; i < numMeshes; ++i) {
 		const CachedMesh* mesh = &meshList[i];
 		const uint32_t numVertices = mesh->m_NumVertices;
-		float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
 		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 		const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 
-		vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-		createDrawCommand_ImagePattern(ctx, imgPattern, transformedVertices, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices);
+		createDrawCommand_ImagePattern(ctx, imgPattern, mesh->m_Pos, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices, mtx);
 	}
 }
 #endif // VG_CONFIG_ENABLE_SHAPE_CACHING
