@@ -3193,7 +3193,7 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 		for (uint32_t i = 0; i < numSubPaths; ++i) {
 			const SubPath* subPath = &subPaths[i];
 			if (subPath->m_NumVertices < 3) {
-				return;
+				continue;
 			}
 
 			const float* vtx = &pathVertices[subPath->m_FirstVertexID << 1];
@@ -3286,7 +3286,7 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 			const uint32_t numPathVertices = subPath->m_NumVertices;
 
 			if (aa) {
-				strokerConvexFillAA(stroker, &mesh, vtx, numPathVertices, Colors::Black);
+				strokerConvexFillAA(stroker, &mesh, vtx, numPathVertices, black);
 				colors = mesh.m_ColorBuffer;
 				numColors = mesh.m_NumVertices;
 			} else {
@@ -3306,7 +3306,7 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 		for (uint32_t i = 0; i < numSubPaths; ++i) {
 			const SubPath* subPath = &subPaths[i];
 			if (subPath->m_NumVertices < 3) {
-				return;
+				continue;
 			}
 
 			const float* vtx = &pathVertices[subPath->m_FirstVertexID << 1];
@@ -3417,7 +3417,7 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 		for (uint32_t i = 0; i < numSubPaths; ++i) {
 			const SubPath* subPath = &subPaths[i];
 			if (subPath->m_NumVertices < 3) {
-				return;
+				continue;
 			}
 
 			const float* vtx = &pathVertices[subPath->m_FirstVertexID << 1];
@@ -3607,9 +3607,9 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 
 		if (aa) {
 			if (isThin) {
-				strokerPolylineStrokeAAThin(stroker, &mesh, vtx, numPathVertices, isClosed, vg::Colors::Black, lineCap, lineJoin);
+				strokerPolylineStrokeAAThin(stroker, &mesh, vtx, numPathVertices, isClosed, black, lineCap, lineJoin);
 			} else {
-				strokerPolylineStrokeAA(stroker, &mesh, vtx, numPathVertices, isClosed, vg::Colors::Black, strokeWidth, lineCap, lineJoin);
+				strokerPolylineStrokeAA(stroker, &mesh, vtx, numPathVertices, isClosed, black, strokeWidth, lineCap, lineJoin);
 			}
 
 			colors = mesh.m_ColorBuffer;
@@ -3654,7 +3654,7 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 	const float scaledStrokeWidth = ((flags & StrokeFlags::FixedWidth) != 0) ? width : bx::clamp<float>(width * avgScale, 0.0f, 200.0f);
 	const bool isThin = scaledStrokeWidth <= fringeWidth;
 
-	const float alphaScale = isThin ? globalAlpha : globalAlpha * bx::square(bx::clamp<float>(scaledStrokeWidth, 0.0f, fringeWidth));
+	const float alphaScale = !isThin ? globalAlpha : globalAlpha * bx::square(bx::clamp<float>(scaledStrokeWidth, 0.0f, fringeWidth));
 	const Color col = colorSetAlpha(color, (uint8_t)(alphaScale * colorGetAlpha(color)));
 	if (!hasCache && colorGetAlpha(col) == 0) {
 		return;
@@ -6117,7 +6117,9 @@ static void clCacheRender(Context* ctx, CommandList* cl)
 			ctxSetScissor(ctx, rect[0], rect[1], rect[2], rect[3]);
 
 			if (cullCmds) {
-				skipCmds = (rect[2] < 1.0f) || (rect[3] < 1.0f);
+				const State* state = getState(ctx);
+				const float* scissorRect = &state->m_ScissorRect[0];
+				skipCmds = (scissorRect[2] < 1.0f) || (scissorRect[3] < 1.0f);
 			}
 		} break;
 		case CommandType::IntersectScissor: {
@@ -6167,6 +6169,10 @@ static void clCacheRender(Context* ctx, CommandList* cl)
 			const float* viewBox = (float*)cmd;
 			cmd += sizeof(float) * 4;
 			ctxSetViewBox(ctx, viewBox[0], viewBox[1], viewBox[2], viewBox[3]);
+		} break;
+		case CommandType::SetGlobalAlpha: {
+			const float alpha = CMD_READ(cmd, float);
+			ctxSetGlobalAlpha(ctx, alpha);
 		} break;
 		case CommandType::BeginClip: {
 			const ClipRule::Enum rule = CMD_READ(cmd, ClipRule::Enum);
