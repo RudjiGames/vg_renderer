@@ -264,6 +264,7 @@ struct CachedMesh
 	uint32_t m_NumVertices;
 	uint32_t m_NumIndices;
 	uint32_t m_DataOffset; // Offset of m_Pos in CommandListCache::m_Data
+	uint32_t m_Color;      // Used when m_Colors is null
 };
 
 struct CachedCommand
@@ -418,6 +419,9 @@ struct Context
 	uint32_t m_TransformedVertexCapacity;
 	bool m_PathTransformed;
 
+	uint32_t* m_AlphaScaledColors;
+	uint32_t m_AlphaScaledColorCapacity;
+
 	DrawCommand* m_DrawCommands;
 	uint32_t m_NumDrawCommands;
 	uint32_t m_DrawCommandCapacity;
@@ -468,6 +472,7 @@ static const uv_t* getWhitePixelUV(Context* ctx);
 static void updateWhitePixelUV(Context* ctx);
 
 static float* allocTransformedVertices(Context* ctx, uint32_t numVertices);
+static const uint32_t* scaleColorsAlpha(Context* ctx, const uint32_t* colors, uint32_t numColors, float alpha);
 static const float* transformPath(Context* ctx);
 
 static VertexBuffer* allocVertexBuffer(Context* ctx);
@@ -1054,6 +1059,9 @@ void destroyContext(Context* ctx)
         bx::alignedFree(allocator, ctx->m_TransformedVertices, 16);
         ctx->m_TransformedVertices = nullptr;
     }
+
+	bx::free(allocator, ctx->m_AlphaScaledColors);
+	ctx->m_AlphaScaledColors = nullptr;
 
 #if BX_CONFIG_SUPPORTS_THREADING
 	bx::deleteObject(allocator, ctx->m_DataPoolMutex);
@@ -3145,6 +3153,8 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const Color col = recordClipCommands ? Colors::Black : colorSetAlpha(color, (uint8_t)(globalAlpha * colorGetAlpha(color)));
 	if (!hasCache && colorGetAlpha(col) == 0) {
@@ -3203,7 +3213,7 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 			if (recordClipCommands) {
 				createDrawCommand_Clip(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			} else {
-				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			}
 		}
 	} else if (pathType == PathType::Concave) {
@@ -3243,7 +3253,7 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 			if (recordClipCommands) {
 				createDrawCommand_Clip(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			} else {
-				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			}
 		}
 	}
@@ -3263,6 +3273,8 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	const bool hasCache = getCommandListCacheStackTop(ctx) != nullptr;
+#else
+	const bool hasCache = false;
 #endif
 
 	const float* pathVertices = transformPath(ctx);
@@ -3288,7 +3300,9 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 
 
 	const State *state = getState(ctx);
-	const Color black = colorSetAlpha(Colors::Black, 0xff * state->m_GlobalAlpha);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
+	const Color black = colorSetAlpha(Colors::Black, (uint8_t)(0xff * (hasCache ? 1.0f : state->m_GlobalAlpha)));
 	Mesh mesh;
 	const uint32_t* colors = &black;
 	uint32_t numColors = 1;
@@ -3317,7 +3331,7 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 			}
 #endif
 
-			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	} else if (pathType == PathType::Concave) {
 		strokerConcaveFillBegin(stroker);
@@ -3349,7 +3363,7 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 			}
 #endif
 
-			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	}
 
@@ -3373,6 +3387,8 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const Color col = colorSetAlpha(color, (uint8_t)(globalAlpha * colorGetAlpha(color)));
 	if (!hasCache && colorGetAlpha(col) == 0) {
@@ -3428,7 +3444,7 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 			}
 #endif
 
-			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	} else if (pathType == PathType::Concave) {
 		strokerConcaveFillBegin(stroker);
@@ -3464,7 +3480,7 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 			}
 #endif
 
-			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	}
 
@@ -3486,6 +3502,8 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float avgScale = state->m_AvgScale;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const float fringeWidth = ctx->m_FringeWidth;
@@ -3557,7 +3575,7 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 		if (recordClipCommands) {
 			createDrawCommand_Clip(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		} else {
-			createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	}
 
@@ -3576,6 +3594,8 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	const bool hasCache = getCommandListCacheStackTop(ctx) != nullptr;
+#else
+	const bool hasCache = false;
 #endif
 
 	const LineJoin::Enum lineJoin = VG_STROKE_FLAGS_LINE_JOIN(flags);
@@ -3589,6 +3609,8 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 	const float* pathVertices = transformPath(ctx);
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float avgScale = state->m_AvgScale;
 	float strokeWidth = ((flags & StrokeFlags::FixedWidth) != 0) ? width : bx::clamp<float>(width * avgScale, 0.0f, 200.0f);
 	bool isThin = false;
@@ -3619,7 +3641,7 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 		const bool isClosed = subPath->m_IsClosed;
 
 		Mesh mesh;
-		const uint32_t black = colorSetAlpha(Colors::Black, 0xff * state->m_GlobalAlpha);
+		const uint32_t black = colorSetAlpha(Colors::Black, (uint8_t)(0xff * (hasCache ? 1.0f : state->m_GlobalAlpha)));
 		const uint32_t* colors = &black;
 		uint32_t numColors = 1;
 
@@ -3642,7 +3664,7 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 		}
 #endif
 
-		createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+		createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 	}
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
@@ -3665,6 +3687,8 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float avgScale = state->m_AvgScale;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const float fringeWidth = ctx->m_FringeWidth;
@@ -3734,7 +3758,7 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 		}
 #endif
 
-		createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+		createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 	}
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
@@ -5057,6 +5081,30 @@ static float* allocTransformedVertices(Context* ctx, uint32_t numVertices)
 	return ctx->m_TransformedVertices;
 }
 
+// Returns colors with their alpha multiplied by 'alpha'. Returns the input array unchanged if alpha is 1.
+// The returned pointer is valid until the next call.
+static const uint32_t* scaleColorsAlpha(Context* ctx, const uint32_t* colors, uint32_t numColors, float alpha)
+{
+	if (alpha >= 1.0f) {
+		return colors;
+	}
+
+	if (numColors > ctx->m_AlphaScaledColorCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(numColors, ctx->m_AlphaScaledColorCapacity + (ctx->m_AlphaScaledColorCapacity >> 1));
+		bx::free(ctx->m_Allocator, ctx->m_AlphaScaledColors);
+		ctx->m_AlphaScaledColors = (uint32_t*)bx::alloc(ctx->m_Allocator, sizeof(uint32_t) * newCapacity);
+		ctx->m_AlphaScaledColorCapacity = newCapacity;
+	}
+
+	uint32_t* dst = ctx->m_AlphaScaledColors;
+	for (uint32_t i = 0; i < numColors; ++i) {
+		const Color c = colors[i];
+		dst[i] = colorSetAlpha(c, (uint8_t)(alpha * colorGetAlpha(c)));
+	}
+
+	return dst;
+}
+
 static bool isIdentity(const float* transform)
 {
 	return ((transform[0] == 1.0f) &&
@@ -5998,6 +6046,7 @@ static void addCachedCommand(Context* ctx, const float* pos, uint32_t numVertice
 
 	if (numColors == 1) {
 		mesh->m_Colors = nullptr;
+		mesh->m_Color = colors[0];
 	} else {
 		VG_CHECK(numColors == numVertices, "Invalid number of colors");
 		mesh->m_Colors = (uint32_t*)mem;
@@ -6308,10 +6357,12 @@ static void clCacheReset(Context* ctx, CommandListCache* cache)
 
 static void submitCachedMesh(Context* ctx, Color col, const CachedMesh* meshList, uint32_t numMeshes)
 {
+	BX_UNUSED(col); // The color used when recording the mesh is stored in CachedMesh::m_Color.
 	const bool recordClipCommands = ctx->m_RecordClipCommands;
 
 	const State* state = getState(ctx);
 	const float* mtx = state->m_TransformMtx;
+	const float globalAlpha = state->m_GlobalAlpha;
 
 	if (recordClipCommands) {
 		for (uint32_t i = 0; i < numMeshes; ++i) {
@@ -6328,11 +6379,11 @@ static void submitCachedMesh(Context* ctx, Color col, const CachedMesh* meshList
 			const uint32_t numVertices = mesh->m_NumVertices;
 			float* transformedVertices = allocTransformedVertices(ctx, numVertices);
 
-			const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &col;
+			const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 			const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 			
 			vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-			createDrawCommand_VertexColor(ctx, transformedVertices, numVertices, colors, numColors, mesh->m_Indices, mesh->m_NumIndices);
+			createDrawCommand_VertexColor(ctx, transformedVertices, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices);
 		}
 	}
 }
@@ -6346,17 +6397,18 @@ static void submitCachedMesh(Context* ctx, GradientHandle gradientHandle, const 
 	const State* state = getState(ctx);
 	const float* mtx = state->m_TransformMtx;
 
-	const uint32_t black = Colors::Black;
+	const float globalAlpha = state->m_GlobalAlpha;
+
 	for (uint32_t i = 0; i < numMeshes; ++i) {
 		const CachedMesh* mesh = &meshList[i];
 		const uint32_t numVertices = mesh->m_NumVertices;
 		float* transformedVertices = allocTransformedVertices(ctx, numVertices);
 
-		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &black;
+		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 		const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 
 		vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-		createDrawCommand_ColorGradient(ctx, gradientHandle, transformedVertices, numVertices, colors, numColors, mesh->m_Indices, mesh->m_NumIndices);
+		createDrawCommand_ColorGradient(ctx, gradientHandle, transformedVertices, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices);
 	}
 }
 
@@ -6365,20 +6417,22 @@ static void submitCachedMesh(Context* ctx, ImagePatternHandle imgPattern, Color 
 	VG_CHECK(!ctx->m_RecordClipCommands, "Only submitCachedMesh(Color) is supported inside BeginClip()/EndClip()");
 	VG_CHECK(isValid(imgPattern), "Invalid image pattern handle");
 	VG_CHECK(!isLocal(imgPattern), "Invalid image pattern handle");
+	BX_UNUSED(col); // The color used when recording the mesh is stored in CachedMesh::m_Color.
 
 	const State* state = getState(ctx);
 	const float* mtx = state->m_TransformMtx;
+	const float globalAlpha = state->m_GlobalAlpha;
 
 	for (uint32_t i = 0; i < numMeshes; ++i) {
 		const CachedMesh* mesh = &meshList[i];
 		const uint32_t numVertices = mesh->m_NumVertices;
 		float* transformedVertices = allocTransformedVertices(ctx, numVertices);
 
-		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &col;
+		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 		const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 
 		vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-		createDrawCommand_ImagePattern(ctx, imgPattern, transformedVertices, numVertices, colors, numColors, mesh->m_Indices, mesh->m_NumIndices);
+		createDrawCommand_ImagePattern(ctx, imgPattern, transformedVertices, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices);
 	}
 }
 #endif // VG_CONFIG_ENABLE_SHAPE_CACHING
