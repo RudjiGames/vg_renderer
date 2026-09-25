@@ -138,12 +138,11 @@ struct libtess2Allocator
 static void* libtess2Alloc(void* userData, uint32_t size)
 {
 	libtess2Allocator* alloc = (libtess2Allocator*)userData;
-	if (alloc->m_Size + size > alloc->m_Capacity) {
-		return nullptr;
-	}
-
 	// Align all allocations to 16 bytes
 	uint32_t offset = (alloc->m_Size & ~0x0F) + ((alloc->m_Size & 0x0F) != 0 ? 0x10 : 0);
+	if (offset + size > alloc->m_Capacity) {
+		return nullptr;
+	}
 
 	uint8_t* mem = &alloc->m_Buffer[offset];
 	alloc->m_Size = offset + size;
@@ -401,6 +400,7 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 		float* dstPos = &stroker->m_PosBuffer->x;
 
 		const __m128 xmm_epsilon = _mm_set_ps1(VG_EPSILON);
+		const __m128 xmm_absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
 		const __m128 vec2x2_perpCCW_xorMask = _mm_castsi128_ps(_mm_set_epi32(0, 0x80000000, 0, 0x80000000));
 
 		const uint32_t numIter = lastVertexID >> 2;
@@ -464,7 +464,7 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 
 			const __m128 inv_cross012_123_234_345 = xmm_rcp(cross012_123_234_345);
 
-			const __m128 cross_gt_eps012_123_234_345 = _mm_cmpge_ps(cross012_123_234_345, xmm_epsilon);
+			const __m128 cross_gt_eps012_123_234_345 = _mm_cmpgt_ps(_mm_and_ps(cross012_123_234_345, xmm_absMask), xmm_epsilon);
 
 			const __m128 inv_cross012_123 = _mm_shuffle_ps(inv_cross012_123_234_345, inv_cross012_123_234_345, _MM_SHUFFLE(1, 1, 0, 0));
 			const __m128 inv_cross234_345 = _mm_shuffle_ps(inv_cross012_123_234_345, inv_cross012_123_234_345, _MM_SHUFFLE(3, 3, 2, 2));
@@ -557,7 +557,7 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 			const __m128 d012xy_d123xy = _mm_sub_ps(d01xy_d12xy, d12xy_d23xy);
 			const __m128 v012_123_true = _mm_mul_ps(d012xy_d123xy, inv_cross012_123);
 
-			const __m128 cross_gt_eps = _mm_cmpge_ps(cross012_123, xmm_epsilon);
+			const __m128 cross_gt_eps = _mm_cmpgt_ps(_mm_and_ps(cross012_123, xmm_absMask), xmm_epsilon);
 			const __m128 v012_123_true_masked = _mm_and_ps(cross_gt_eps, v012_123_true);
 			const __m128 v012_123_fake_masked = _mm_andnot_ps(cross_gt_eps, v012_123_fake);
 			const __m128 v012_123 = _mm_or_ps(v012_123_true_masked, v012_123_fake_masked);

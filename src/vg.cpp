@@ -878,6 +878,12 @@ void destroyContext(Context* ctx)
 
 	fonsDestroyString(&ctx->m_TextString);
 
+	// Destroy all command lists the user hasn't destroyed.
+	while (ctx->m_CmdListHandleAlloc->getNumHandles() != 0) {
+		const CommandListHandle handle = { ctx->m_CmdListHandleAlloc->getHandles()[0] };
+		destroyCommandList(ctx, handle);
+	}
+
 	for (uint32_t i = 0; i < DrawCommand::Type::NumTypes; ++i) {
 		if (bgfx::isValid(ctx->m_ProgramHandle[i])) {
 			bgfx::destroy(ctx->m_ProgramHandle[i]);
@@ -1009,7 +1015,7 @@ void destroyContext(Context* ctx)
 
 	for (uint32_t i = 0; i < ctx->m_ImageCapacity; ++i) {
 		Image* img = &ctx->m_Images[i];
-		if (bgfx::isValid(img->m_bgfxHandle)) {
+		if (img->m_Owned && bgfx::isValid(img->m_bgfxHandle)) {
 			bgfx::destroy(img->m_bgfxHandle);
 		}
 	}
@@ -1095,7 +1101,9 @@ void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasH
 void end(Context* ctx)
 {
 	VG_CHECK(ctx->m_StateStackTop == 0, "pushState()/popState() mismatch");
+#if VG_CONFIG_COMMAND_LIST_BEGIN_END_API
 	VG_CHECK(!isValid(ctx->m_ActiveCommandList), "endCommandList() hasn't been called");
+#endif
 
 	const uint32_t numDrawCommands = ctx->m_NumDrawCommands;
 	if (numDrawCommands == 0) {
@@ -2381,7 +2389,9 @@ bool isImageValid(Context* ctx, ImageHandle image)
 
 CommandListHandle createCommandList(Context* ctx, uint32_t flags)
 {
+#if VG_CONFIG_COMMAND_LIST_BEGIN_END_API
 	VG_CHECK(!isValid(ctx->m_ActiveCommandList), "Cannot create command list while inside a beginCommandList()/endCommandList() block");
+#endif
 
 	CommandListHandle handle = allocCommandList(ctx);
 	if (!isValid(handle)) {
@@ -2396,7 +2406,9 @@ CommandListHandle createCommandList(Context* ctx, uint32_t flags)
 
 void destroyCommandList(Context* ctx, CommandListHandle handle)
 {
+#if VG_CONFIG_COMMAND_LIST_BEGIN_END_API
 	VG_CHECK(!isValid(ctx->m_ActiveCommandList), "Cannot destroy command list while inside a beginCommandList()/endCommandList() block");
+#endif
 	VG_CHECK(isValid(handle), "Invalid command list handle");
 
 	bx::AllocatorI* allocator = ctx->m_Allocator;

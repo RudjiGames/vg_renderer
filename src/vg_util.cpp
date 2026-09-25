@@ -16,8 +16,8 @@ bool invertMatrix3(const float* __restrict t, float* __restrict inv)
 	// nvgTransformInverse
 	double invdet, det = (double)t[0] * t[3] - (double)t[2] * t[1];
 	if (det > -1e-6 && det < 1e-6) {
-		inv[0] = inv[2] = 1.0f;
-		inv[1] = inv[3] = inv[4] = inv[5] = 0.0f;
+		inv[0] = inv[3] = 1.0f;
+		inv[1] = inv[2] = inv[4] = inv[5] = 0.0f;
 		return false;
 	}
 
