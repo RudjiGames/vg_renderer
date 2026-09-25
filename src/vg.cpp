@@ -263,6 +263,8 @@ struct CachedMesh
 	uint16_t* m_Indices;
 	uint32_t m_NumVertices;
 	uint32_t m_NumIndices;
+	uint32_t m_DataOffset; // Offset of m_Pos in CommandListCache::m_Data
+	uint32_t m_Color;      // Used when m_Colors is null
 };
 
 struct CachedCommand
@@ -276,8 +278,13 @@ struct CommandListCache
 {
 	CachedMesh* m_Meshes;
 	uint32_t m_NumMeshes;
+	uint32_t m_MeshCapacity;
 	CachedCommand* m_Commands;
 	uint32_t m_NumCommands;
+	uint32_t m_CommandCapacity;
+	uint8_t* m_Data; // Vertex/color/index data of all meshes
+	uint32_t m_DataSize;
+	uint32_t m_DataCapacity;
 	float m_AvgScale;
 };
 
@@ -412,6 +419,9 @@ struct Context
 	uint32_t m_TransformedVertexCapacity;
 	bool m_PathTransformed;
 
+	uint32_t* m_AlphaScaledColors;
+	uint32_t m_AlphaScaledColorCapacity;
+
 	DrawCommand* m_DrawCommands;
 	uint32_t m_NumDrawCommands;
 	uint32_t m_DrawCommandCapacity;
@@ -438,9 +448,6 @@ struct Context
 	uint32_t m_FontImageID;
 	uv_t m_FontImageWhitePixelUV[2];
 
-	float* m_TextVertices;
-	FONSquad* m_TextQuads;
-	uint32_t m_TextQuadCapacity;
 	FONSstring m_TextString;
 	FontData* m_FontData;
 	uint32_t m_NextFontID;
@@ -462,6 +469,7 @@ static const uv_t* getWhitePixelUV(Context* ctx);
 static void updateWhitePixelUV(Context* ctx);
 
 static float* allocTransformedVertices(Context* ctx, uint32_t numVertices);
+static const uint32_t* scaleColorsAlpha(Context* ctx, const uint32_t* colors, uint32_t numColors, float alpha);
 static const float* transformPath(Context* ctx);
 
 static VertexBuffer* allocVertexBuffer(Context* ctx);
@@ -484,15 +492,15 @@ static void releaseVertexBufferDataCallback_UV(void* ptr, void* userData);
 
 static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_t numIndices, DrawCommand::Type::Enum type, uint16_t handle);
 static DrawCommand* allocClipCommand(Context* ctx, uint32_t numVertices, uint32_t numIndices);
-static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices);
-static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices);
-static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices);
-static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices);
+static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 
 static ImageHandle allocImage(Context* ctx);
 static void resetImage(Image* img);
 
-static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color);
+static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQuads, Color color, float tx, float ty);
 static bool allocTextAtlas(Context* ctx);
 static void flushTextAtlas(Context* ctx);
 
@@ -1034,20 +1042,13 @@ void destroyContext(Context* ctx)
 	destroyStroker(ctx->m_Stroker);
 	ctx->m_Stroker = nullptr;
 
-    if (ctx->m_TextQuads) {
-        bx::alignedFree(allocator, ctx->m_TextQuads, 16);
-        ctx->m_TextQuads = nullptr;
-    }
-
-    if (ctx->m_TextVertices) {
-        bx::alignedFree(allocator, ctx->m_TextVertices, 16);
-        ctx->m_TextVertices = nullptr;
-    }
-
     if (ctx->m_TransformedVertices) {
         bx::alignedFree(allocator, ctx->m_TransformedVertices, 16);
         ctx->m_TransformedVertices = nullptr;
     }
+
+	bx::free(allocator, ctx->m_AlphaScaledColors);
+	ctx->m_AlphaScaledColors = nullptr;
 
 #if BX_CONFIG_SUPPORTS_THREADING
 	bx::deleteObject(allocator, ctx->m_DataPoolMutex);
@@ -3139,6 +3140,8 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const Color col = recordClipCommands ? Colors::Black : colorSetAlpha(color, (uint8_t)(globalAlpha * colorGetAlpha(color)));
 	if (!hasCache && colorGetAlpha(col) == 0) {
@@ -3197,7 +3200,7 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 			if (recordClipCommands) {
 				createDrawCommand_Clip(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			} else {
-				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			}
 		}
 	} else if (pathType == PathType::Concave) {
@@ -3237,7 +3240,7 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 			if (recordClipCommands) {
 				createDrawCommand_Clip(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			} else {
-				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+				createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 			}
 		}
 	}
@@ -3257,6 +3260,8 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	const bool hasCache = getCommandListCacheStackTop(ctx) != nullptr;
+#else
+	const bool hasCache = false;
 #endif
 
 	const float* pathVertices = transformPath(ctx);
@@ -3282,7 +3287,9 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 
 
 	const State *state = getState(ctx);
-	const Color black = colorSetAlpha(Colors::Black, 0xff * state->m_GlobalAlpha);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
+	const Color black = colorSetAlpha(Colors::Black, (uint8_t)(0xff * (hasCache ? 1.0f : state->m_GlobalAlpha)));
 	Mesh mesh;
 	const uint32_t* colors = &black;
 	uint32_t numColors = 1;
@@ -3311,7 +3318,7 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 			}
 #endif
 
-			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	} else if (pathType == PathType::Concave) {
 		strokerConcaveFillBegin(stroker);
@@ -3343,7 +3350,7 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 			}
 #endif
 
-			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	}
 
@@ -3367,6 +3374,8 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const Color col = colorSetAlpha(color, (uint8_t)(globalAlpha * colorGetAlpha(color)));
 	if (!hasCache && colorGetAlpha(col) == 0) {
@@ -3422,7 +3431,7 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 			}
 #endif
 
-			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	} else if (pathType == PathType::Concave) {
 		strokerConcaveFillBegin(stroker);
@@ -3458,7 +3467,7 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 			}
 #endif
 
-			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	}
 
@@ -3480,6 +3489,8 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float avgScale = state->m_AvgScale;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const float fringeWidth = ctx->m_FringeWidth;
@@ -3551,7 +3562,7 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 		if (recordClipCommands) {
 			createDrawCommand_Clip(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		} else {
-			createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+			createDrawCommand_VertexColor(ctx, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	}
 
@@ -3570,6 +3581,8 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	const bool hasCache = getCommandListCacheStackTop(ctx) != nullptr;
+#else
+	const bool hasCache = false;
 #endif
 
 	const LineJoin::Enum lineJoin = VG_STROKE_FLAGS_LINE_JOIN(flags);
@@ -3583,6 +3596,8 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 	const float* pathVertices = transformPath(ctx);
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float avgScale = state->m_AvgScale;
 	float strokeWidth = ((flags & StrokeFlags::FixedWidth) != 0) ? width : bx::clamp<float>(width * avgScale, 0.0f, 200.0f);
 	bool isThin = false;
@@ -3613,7 +3628,7 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 		const bool isClosed = subPath->m_IsClosed;
 
 		Mesh mesh;
-		const uint32_t black = colorSetAlpha(Colors::Black, 0xff * state->m_GlobalAlpha);
+		const uint32_t black = colorSetAlpha(Colors::Black, (uint8_t)(0xff * (hasCache ? 1.0f : state->m_GlobalAlpha)));
 		const uint32_t* colors = &black;
 		uint32_t numColors = 1;
 
@@ -3636,7 +3651,7 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 		}
 #endif
 
-		createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+		createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 	}
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
@@ -3659,6 +3674,8 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 #endif
 
 	const State* state = getState(ctx);
+	// Cached meshes are recorded with a global alpha of 1; apply the current global alpha when drawing.
+	const float drawAlpha = hasCache ? state->m_GlobalAlpha : 1.0f;
 	const float avgScale = state->m_AvgScale;
 	const float globalAlpha = hasCache ? 1.0f : state->m_GlobalAlpha;
 	const float fringeWidth = ctx->m_FringeWidth;
@@ -3728,7 +3745,7 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 		}
 #endif
 
-		createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, colors, numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
+		createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 	}
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
@@ -4036,14 +4053,37 @@ static void ctxPopState(Context* ctx)
 	}
 }
 
+static bool scissorRectEqual(const uint16_t* cmdScissor, const float* stateScissor)
+{
+	return cmdScissor[0] == (uint16_t)stateScissor[0]
+		&& cmdScissor[1] == (uint16_t)stateScissor[1]
+		&& cmdScissor[2] == (uint16_t)stateScissor[2]
+		&& cmdScissor[3] == (uint16_t)stateScissor[3];
+}
+
+// Only break batching if the scissor rect actually differs from the one used by the last draw/clip command.
+static void onScissorRectChanged(Context* ctx)
+{
+	const float* stateScissor = &getState(ctx)->m_ScissorRect[0];
+
+	const uint32_t numDrawCommands = ctx->m_NumDrawCommands;
+	if (numDrawCommands != 0 && !scissorRectEqual(&ctx->m_DrawCommands[numDrawCommands - 1].m_ScissorRect[0], stateScissor)) {
+		ctx->m_ForceNewDrawCommand = true;
+	}
+
+	const uint32_t numClipCommands = ctx->m_NumClipCommands;
+	if (numClipCommands != 0 && !scissorRectEqual(&ctx->m_ClipCommands[numClipCommands - 1].m_ScissorRect[0], stateScissor)) {
+		ctx->m_ForceNewClipCommand = true;
+	}
+}
+
 static void ctxResetScissor(Context* ctx)
 {
 	State* state = getState(ctx);
 	state->m_ScissorRect[0] = state->m_ScissorRect[1] = 0.0f;
 	state->m_ScissorRect[2] = (float)ctx->m_CanvasWidth;
 	state->m_ScissorRect[3] = (float)ctx->m_CanvasHeight;
-	ctx->m_ForceNewDrawCommand = true;
-	ctx->m_ForceNewClipCommand = true;
+	onScissorRectChanged(ctx);
 }
 
 static void ctxSetScissor(Context* ctx, float x, float y, float w, float h)
@@ -4066,8 +4106,7 @@ static void ctxSetScissor(Context* ctx, float x, float y, float w, float h)
 	state->m_ScissorRect[1] = miny;
 	state->m_ScissorRect[2] = maxx - minx;
 	state->m_ScissorRect[3] = maxy - miny;
-	ctx->m_ForceNewDrawCommand = true;
-	ctx->m_ForceNewClipCommand = true;
+	onScissorRectChanged(ctx);
 }
 
 static bool ctxIntersectScissor(Context* ctx, float x, float y, float w, float h)
@@ -4093,8 +4132,7 @@ static bool ctxIntersectScissor(Context* ctx, float x, float y, float w, float h
 	state->m_ScissorRect[2] = newRectWidth;
 	state->m_ScissorRect[3] = newRectHeight;
 
-	ctx->m_ForceNewDrawCommand = true;
-	ctx->m_ForceNewClipCommand = true;
+	onScissorRectChanged(ctx);
 
 	return newRectWidth >= 1.0f && newRectHeight >= 1.0f;
 }
@@ -4129,7 +4167,7 @@ static void ctxTransformTranslate(Context* ctx, float x, float y)
 	state->m_TransformMtx[4] += state->m_TransformMtx[0] * x + state->m_TransformMtx[2] * y;
 	state->m_TransformMtx[5] += state->m_TransformMtx[1] * x + state->m_TransformMtx[3] * y;
 
-	updateState(state);
+	// NOTE: No need to call updateState() here; translation doesn't affect the scale.
 }
 
 static void ctxTransformRotate(Context* ctx, float ang_rad)
@@ -4283,23 +4321,10 @@ static void ctxText(Context* ctx, const TextConfig& cfg, float x, float y, const
 		return;
 	}
 
-	if (ctx->m_TextQuadCapacity < (uint32_t)numBakedChars) {
-		bx::AllocatorI* allocator = ctx->m_Allocator;
-
-		ctx->m_TextQuadCapacity = (uint32_t)numBakedChars;
-		ctx->m_TextQuads = (FONSquad*)bx::alignedRealloc(allocator, ctx->m_TextQuads, sizeof(FONSquad) * ctx->m_TextQuadCapacity, 16);
-		ctx->m_TextVertices = (float*)bx::alignedRealloc(allocator, ctx->m_TextVertices, sizeof(float) * 2 * (ctx->m_TextQuadCapacity * 4), 16);
-	}
-
-	bx::memCopy(ctx->m_TextQuads, vgs->m_Quads, sizeof(FONSquad) * numBakedChars);
-
 	float dx = 0.0f, dy = 0.0f;
 	fonsAlignString(fons, vgs, cfg.m_Alignment, &dx, &dy);
 
-	ctxPushState(ctx);
-	ctxTransformTranslate(ctx, x + dx / scale, y + dy / scale);
-	renderTextQuads(ctx, numBakedChars, cfg.m_Color);
-	ctxPopState(ctx);
+	renderTextQuads(ctx, vgs->m_Quads, (uint32_t)numBakedChars, cfg.m_Color, x + dx / scale, y + dy / scale);
 }
 
 static void ctxTextBox(Context* ctx, const TextConfig& cfg, float x, float y, float breakWidth, const char* str, const char* end, uint32_t textboxFlags)
@@ -5017,12 +5042,41 @@ static void updateState(State* state)
 static float* allocTransformedVertices(Context* ctx, uint32_t numVertices)
 {
 	if (numVertices > ctx->m_TransformedVertexCapacity) {
+		// Previous contents are not needed, so free + alloc instead of realloc to avoid a useless copy.
 		bx::AllocatorI* allocator = ctx->m_Allocator;
-		ctx->m_TransformedVertices = (float*)bx::alignedRealloc(allocator, ctx->m_TransformedVertices, sizeof(float) * 2 * numVertices, 16);
-		ctx->m_TransformedVertexCapacity = numVertices;
+		const uint32_t newCapacity = bx::max<uint32_t>(numVertices, ctx->m_TransformedVertexCapacity + (ctx->m_TransformedVertexCapacity >> 1));
+		if (ctx->m_TransformedVertices) {
+			bx::alignedFree(allocator, ctx->m_TransformedVertices, 16);
+		}
+		ctx->m_TransformedVertices = (float*)bx::alignedAlloc(allocator, sizeof(float) * 2 * newCapacity, 16);
+		ctx->m_TransformedVertexCapacity = newCapacity;
 	}
 
 	return ctx->m_TransformedVertices;
+}
+
+// Returns colors with their alpha multiplied by 'alpha'. Returns the input array unchanged if alpha is 1.
+// The returned pointer is valid until the next call.
+static const uint32_t* scaleColorsAlpha(Context* ctx, const uint32_t* colors, uint32_t numColors, float alpha)
+{
+	if (alpha >= 1.0f) {
+		return colors;
+	}
+
+	if (numColors > ctx->m_AlphaScaledColorCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(numColors, ctx->m_AlphaScaledColorCapacity + (ctx->m_AlphaScaledColorCapacity >> 1));
+		bx::free(ctx->m_Allocator, ctx->m_AlphaScaledColors);
+		ctx->m_AlphaScaledColors = (uint32_t*)bx::alloc(ctx->m_Allocator, sizeof(uint32_t) * newCapacity);
+		ctx->m_AlphaScaledColorCapacity = newCapacity;
+	}
+
+	uint32_t* dst = ctx->m_AlphaScaledColors;
+	for (uint32_t i = 0; i < numColors; ++i) {
+		const Color c = colors[i];
+		dst[i] = colorSetAlpha(c, (uint8_t)(alpha * colorGetAlpha(c)));
+	}
+
+	return dst;
 }
 
 static bool isIdentity(const float* transform)
@@ -5297,7 +5351,17 @@ static void releaseIndexBuffer(Context* ctx, uint16_t* data)
 	}
 }
 
-static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices)
+// Copies the positions into the vertex buffer, optionally transforming them by 'mtx' on the way.
+static inline void writePositions(float* dstPos, const float* vtx, uint32_t numVertices, const float* mtx)
+{
+	if (mtx) {
+		vgutil::batchTransformPositions(vtx, numVertices, dstPos, mtx);
+	} else {
+		bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	}
+}
+
+static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	// Allocate the draw command
 	const ImageHandle fontImg = ctx->m_FontImages[0];
@@ -5308,7 +5372,7 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	const uv_t* uv = getWhitePixelUV(ctx);
 
@@ -5336,7 +5400,7 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 	cmd->m_NumIndices += numIndices;
 }
 
-static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgPatternHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices)
+static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgPatternHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::ImagePattern, imgPatternHandle.idx);
 
@@ -5344,7 +5408,7 @@ static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgP
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	uint32_t* dstColor = &vb->m_Color[vbOffset];
 	if (numColors == numVertices) {
@@ -5362,7 +5426,7 @@ static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgP
 	cmd->m_NumIndices += numIndices;
 }
 
-static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradientHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices)
+static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradientHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::ColorGradient, gradientHandle.idx);
 
@@ -5370,7 +5434,7 @@ static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradien
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	uint32_t* dstColor = &vb->m_Color[vbOffset];
 	if (numColors == numVertices) {
@@ -5388,7 +5452,7 @@ static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradien
 	cmd->m_NumIndices += numIndices;
 }
 
-static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices)
+static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
 	// Allocate the draw command
 	DrawCommand* cmd = allocClipCommand(ctx, numVertices, numIndices);
@@ -5398,7 +5462,7 @@ static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numV
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, vtx, sizeof(float) * 2 * numVertices);
+	writePositions(dstPos, vtx, numVertices, mtx);
 
 	// Index buffer
 	IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
@@ -5474,7 +5538,7 @@ static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_
 
 	// The new draw command cannot be combined with the previous one. Create a new one.
 	if (ctx->m_NumDrawCommands == ctx->m_DrawCommandCapacity) {
-		ctx->m_DrawCommandCapacity = ctx->m_DrawCommandCapacity + 32;
+		ctx->m_DrawCommandCapacity = bx::max<uint32_t>(ctx->m_DrawCommandCapacity + 32, ctx->m_DrawCommandCapacity + (ctx->m_DrawCommandCapacity >> 1));
 		ctx->m_DrawCommands = (DrawCommand*)bx::realloc(ctx->m_Allocator, ctx->m_DrawCommands, sizeof(DrawCommand) * ctx->m_DrawCommandCapacity);
 	}
 
@@ -5523,7 +5587,7 @@ static DrawCommand* allocClipCommand(Context* ctx, uint32_t numVertices, uint32_
 
 	// The new clip command cannot be combined with the previous one. Create a new one.
 	if (ctx->m_NumClipCommands == ctx->m_ClipCommandCapacity) {
-		ctx->m_ClipCommandCapacity = ctx->m_ClipCommandCapacity + 32;
+		ctx->m_ClipCommandCapacity = bx::max<uint32_t>(ctx->m_ClipCommandCapacity + 32, ctx->m_ClipCommandCapacity + (ctx->m_ClipCommandCapacity >> 1));
 		ctx->m_ClipCommands = (DrawCommand*)bx::realloc(ctx->m_Allocator, ctx->m_ClipCommands, sizeof(DrawCommand) * ctx->m_ClipCommandCapacity);
 	}
 
@@ -5631,7 +5695,9 @@ static bool allocTextAtlas(Context* ctx)
 	return true;
 }
 
-static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
+// Renders the quads translated by (tx, ty) in the current coordinate system. Positions are
+// transformed directly into the vertex buffer.
+static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQuads, Color color, float tx, float ty)
 {
 	const State* state = getState(ctx);
 	const float scale = state->m_FontScale * ctx->m_DevicePixelRatio;
@@ -5642,16 +5708,15 @@ static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
 		return;
 	}
 
+	// Same as translating the current transform by (tx, ty) (see ctxTransformTranslate()) and scaling by 1/scale.
+	const float* stateMtx = state->m_TransformMtx;
 	float mtx[6];
-	mtx[0] = state->m_TransformMtx[0] * invscale;
-	mtx[1] = state->m_TransformMtx[1] * invscale;
-	mtx[2] = state->m_TransformMtx[2] * invscale;
-	mtx[3] = state->m_TransformMtx[3] * invscale;
-	mtx[4] = state->m_TransformMtx[4];
-	mtx[5] = state->m_TransformMtx[5];
-
-	// TODO: Calculate bounding rect of the quads.
-	vgutil::batchTransformTextQuads(&ctx->m_TextQuads->x0, numQuads, mtx, ctx->m_TextVertices);
+	mtx[0] = stateMtx[0] * invscale;
+	mtx[1] = stateMtx[1] * invscale;
+	mtx[2] = stateMtx[2] * invscale;
+	mtx[3] = stateMtx[3] * invscale;
+	mtx[4] = stateMtx[4] + (stateMtx[0] * tx + stateMtx[2] * ty);
+	mtx[5] = stateMtx[5] + (stateMtx[1] * tx + stateMtx[3] * ty);
 
 	const uint32_t numDrawVertices = numQuads * 4;
 	const uint32_t numDrawIndices = numQuads * 6;
@@ -5661,15 +5726,16 @@ static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
 	VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
 	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
 
+	// TODO: Calculate bounding rect of the quads.
 	float* dstPos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(dstPos, ctx->m_TextVertices, sizeof(float) * 2 * numDrawVertices);
+	vgutil::batchTransformTextQuads(&quads->x0, numQuads, mtx, dstPos);
 
 	uint32_t* dstColor = &vb->m_Color[vbOffset];
 	vgutil::memset32(dstColor, numDrawVertices, &c);
 
 #if VG_CONFIG_UV_INT16
 	int16_t* dstUV = &vb->m_UV[vbOffset << 1];
-	const FONSquad* q = ctx->m_TextQuads;
+	const FONSquad* q = quads;
 	uint32_t nq = numQuads;
 	while (nq-- > 0) {
 		const float s0 = q->s0;
@@ -5687,7 +5753,7 @@ static void renderTextQuads(Context* ctx, uint32_t numQuads, Color color)
 	}
 #else
 	float* dstUV = &vb->m_UV[vbOffset << 1];
-	const FONSquad* q = ctx->m_TextQuads;
+	const FONSquad* q = quads;
 	uint32_t nq = numQuads;
 	while (nq-- > 0) {
 		const float s0 = q->s0;
@@ -5731,18 +5797,27 @@ static void flushTextAtlas(Context* ctx)
 	int iw, ih;
 	const uint8_t* a8Data = fonsGetTextureData(fons, &iw, &ih);
 	VG_CHECK(iw > 0 && ih > 0, "Invalid font atlas dimensions");
+	BX_UNUSED(ih);
 
-	// TODO: Convert only the dirty part of the texture (it's the only part that will be uploaded to the backend)
-	uint32_t* rgbaData = (uint32_t*)bx::alloc(ctx->m_Allocator, sizeof(uint32_t) * iw * ih);
-	vgutil::convertA8_to_RGBA8(rgbaData, a8Data, (uint32_t)iw, (uint32_t)ih, 0x00FFFFFF);
+	const int x = dirty[0];
+	const int y = dirty[1];
+	const int w = dirty[2] - dirty[0];
+	const int h = dirty[3] - dirty[1];
+	if (w <= 0 || h <= 0) {
+		return;
+	}
 
-	int x = dirty[0];
-	int y = dirty[1];
-	int w = dirty[2] - dirty[0];
-	int h = dirty[3] - dirty[1];
-	updateImage(ctx, fontImage, (uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, (const uint8_t*)rgbaData);
+	const Image* tex = &ctx->m_Images[fontImage.idx];
+	VG_CHECK(bgfx::isValid(tex->m_bgfxHandle), "Invalid texture handle");
 
-	bx::free(ctx->m_Allocator, rgbaData);
+	// Convert only the dirty rect, directly into the memory block that will be uploaded.
+	const bgfx::Memory* mem = bgfx::alloc((uint32_t)(w * h) * sizeof(uint32_t));
+	uint32_t* rgbaData = (uint32_t*)mem->data;
+	for (int row = 0; row < h; ++row) {
+		vgutil::convertA8_to_RGBA8(&rgbaData[row * w], &a8Data[(y + row) * iw + x], (uint32_t)w, 1, 0x00FFFFFF);
+	}
+
+	bgfx::updateTexture2D(tex->m_bgfxHandle, 0, 0, (uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, mem, UINT16_MAX);
 }
 
 static CommandListHandle allocCommandList(Context* ctx)
@@ -5779,7 +5854,11 @@ static void freeCommandListCache(Context* ctx, CommandListCache* cache)
 {
 	bx::AllocatorI* allocator = ctx->m_Allocator;
 
-	clCacheReset(ctx, cache);
+	if (cache->m_Data) {
+		bx::alignedFree(allocator, cache->m_Data, 16);
+	}
+	bx::free(allocator, cache->m_Meshes);
+	bx::free(allocator, cache->m_Commands);
 	bx::free(allocator, cache);
 }
 #endif
@@ -5795,7 +5874,7 @@ static uint8_t* clAllocCommand(Context* ctx, CommandList* cl, CommandType::Enum 
 	VG_CHECK(isAligned(pos, VG_CONFIG_COMMAND_LIST_ALIGNMENT), "Unaligned command buffer position");
 
 	if (pos + totalSize > cl->m_CommandBufferCapacity) {
-		const uint32_t capacityDelta = bx::max<uint32_t>(totalSize, 256);
+		const uint32_t capacityDelta = bx::max<uint32_t>(bx::max<uint32_t>(totalSize, 256), cl->m_CommandBufferCapacity >> 1);
 		cl->m_CommandBufferCapacity += capacityDelta;
 		cl->m_CommandBuffer = (uint8_t*)bx::alignedRealloc(ctx->m_Allocator, cl->m_CommandBuffer, cl->m_CommandBufferCapacity, VG_CONFIG_COMMAND_LIST_ALIGNMENT);
 
@@ -5818,7 +5897,7 @@ static uint8_t* clAllocCommand(Context* ctx, CommandList* cl, CommandType::Enum 
 static uint32_t clStoreString(Context* ctx, CommandList* cl, const char* str, uint32_t len)
 {
 	if (cl->m_StringBufferPos + len > cl->m_StringBufferCapacity) {
-		cl->m_StringBufferCapacity += bx::max<uint32_t>(len, 128);
+		cl->m_StringBufferCapacity += bx::max<uint32_t>(bx::max<uint32_t>(len, 128), cl->m_StringBufferCapacity >> 1);
 		cl->m_StringBuffer = (char*)bx::realloc(ctx->m_Allocator, cl->m_StringBuffer, cl->m_StringBufferCapacity);
 	}
 
@@ -5870,8 +5949,11 @@ static void beginCachedCommand(Context* ctx)
 
 	bx::AllocatorI* allocator = ctx->m_Allocator;
 
+	if (cache->m_NumCommands == cache->m_CommandCapacity) {
+		cache->m_CommandCapacity = bx::max<uint32_t>(16, cache->m_CommandCapacity + (cache->m_CommandCapacity >> 1));
+		cache->m_Commands = (CachedCommand*)bx::realloc(allocator, cache->m_Commands, sizeof(CachedCommand) * cache->m_CommandCapacity);
+	}
 	cache->m_NumCommands++;
-	cache->m_Commands = (CachedCommand*)bx::realloc(allocator, cache->m_Commands, sizeof(CachedCommand) * cache->m_NumCommands);
 
 	CachedCommand* lastCmd = &cache->m_Commands[cache->m_NumCommands - 1];
 	lastCmd->m_FirstMeshID = (uint16_t)cache->m_NumMeshes;
@@ -5900,17 +5982,47 @@ static void addCachedCommand(Context* ctx, const float* pos, uint32_t numVertice
 
 	bx::AllocatorI* allocator = ctx->m_Allocator;
 
+	if (cache->m_NumMeshes == cache->m_MeshCapacity) {
+		cache->m_MeshCapacity = bx::max<uint32_t>(16, cache->m_MeshCapacity + (cache->m_MeshCapacity >> 1));
+		cache->m_Meshes = (CachedMesh*)bx::realloc(allocator, cache->m_Meshes, sizeof(CachedMesh) * cache->m_MeshCapacity);
+	}
 	cache->m_NumMeshes++;
-	cache->m_Meshes = (CachedMesh*)bx::realloc(allocator, cache->m_Meshes, sizeof(CachedMesh) * cache->m_NumMeshes);
-
-	CachedMesh* mesh = &cache->m_Meshes[cache->m_NumMeshes - 1];
 
 	const uint32_t totalMem = 0
 		+ alignSize(sizeof(float) * 2 * numVertices, 16)
 		+ ((numColors != 1) ? alignSize(sizeof(uint32_t) * numVertices, 16) : 0)
 		+ alignSize(sizeof(uint16_t) * numIndices, 16);
 
-	uint8_t* mem = (uint8_t*)bx::alignedAlloc(allocator, totalMem, 16);
+	// All mesh data lives in a single growable buffer. When it moves, rebase the pointers of the existing meshes.
+	if (cache->m_DataSize + totalMem > cache->m_DataCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(cache->m_DataSize + totalMem, cache->m_DataCapacity + (cache->m_DataCapacity >> 1));
+		uint8_t* newData = (uint8_t*)bx::alignedAlloc(allocator, newCapacity, 16);
+		if (cache->m_Data) {
+			bx::memCopy(newData, cache->m_Data, cache->m_DataSize);
+			bx::alignedFree(allocator, cache->m_Data, 16);
+		}
+		cache->m_Data = newData;
+		cache->m_DataCapacity = newCapacity;
+
+		const uint32_t numPrevMeshes = cache->m_NumMeshes - 1;
+		for (uint32_t i = 0; i < numPrevMeshes; ++i) {
+			CachedMesh* prevMesh = &cache->m_Meshes[i];
+			uint8_t* prevMem = newData + prevMesh->m_DataOffset;
+			prevMesh->m_Pos = (float*)prevMem;
+			prevMem += alignSize(sizeof(float) * 2 * prevMesh->m_NumVertices, 16);
+			if (prevMesh->m_Colors) {
+				prevMesh->m_Colors = (uint32_t*)prevMem;
+				prevMem += alignSize(sizeof(uint32_t) * prevMesh->m_NumVertices, 16);
+			}
+			prevMesh->m_Indices = (uint16_t*)prevMem;
+		}
+	}
+
+	CachedMesh* mesh = &cache->m_Meshes[cache->m_NumMeshes - 1];
+	mesh->m_DataOffset = cache->m_DataSize;
+
+	uint8_t* mem = cache->m_Data + cache->m_DataSize;
+	cache->m_DataSize += totalMem;
 	mesh->m_Pos = (float*)mem;
 	mem += alignSize(sizeof(float) * 2 * numVertices, 16);
 	
@@ -5920,6 +6032,7 @@ static void addCachedCommand(Context* ctx, const float* pos, uint32_t numVertice
 
 	if (numColors == 1) {
 		mesh->m_Colors = nullptr;
+		mesh->m_Color = colors[0];
 	} else {
 		VG_CHECK(numColors == numVertices, "Invalid number of colors");
 		mesh->m_Colors = (uint32_t*)mem;
@@ -6218,48 +6331,39 @@ static void clCacheRender(Context* ctx, CommandList* cl)
 #endif
 }
 
+// Keeps the allocated buffers around so that rebuilding the cache (e.g. every frame while zooming) doesn't reallocate.
 static void clCacheReset(Context* ctx, CommandListCache* cache)
 {
-	bx::AllocatorI* allocator = ctx->m_Allocator;
-
-	const uint32_t numMeshes = cache->m_NumMeshes;
-	for (uint32_t i = 0; i < numMeshes; ++i) {
-		CachedMesh* mesh = &cache->m_Meshes[i];
-		bx::alignedFree(allocator, mesh->m_Pos, 16);
-	}
-	bx::free(allocator, cache->m_Meshes);
-	bx::free(allocator, cache->m_Commands);
-
-	bx::memSet(cache, 0, sizeof(CommandListCache));
+	BX_UNUSED(ctx);
+	cache->m_NumMeshes = 0;
+	cache->m_NumCommands = 0;
+	cache->m_DataSize = 0;
+	cache->m_AvgScale = 0.0f;
 }
 
 static void submitCachedMesh(Context* ctx, Color col, const CachedMesh* meshList, uint32_t numMeshes)
 {
+	BX_UNUSED(col); // The color used when recording the mesh is stored in CachedMesh::m_Color.
 	const bool recordClipCommands = ctx->m_RecordClipCommands;
 
 	const State* state = getState(ctx);
 	const float* mtx = state->m_TransformMtx;
+	const float globalAlpha = state->m_GlobalAlpha;
 
 	if (recordClipCommands) {
 		for (uint32_t i = 0; i < numMeshes; ++i) {
 			const CachedMesh* mesh = &meshList[i];
 			const uint32_t numVertices = mesh->m_NumVertices;
-			float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
-			vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-			createDrawCommand_Clip(ctx, transformedVertices, numVertices, mesh->m_Indices, mesh->m_NumIndices);
+			createDrawCommand_Clip(ctx, mesh->m_Pos, numVertices, mesh->m_Indices, mesh->m_NumIndices, mtx);
 		}
 	} else {
 		for (uint32_t i = 0; i < numMeshes; ++i) {
 			const CachedMesh* mesh = &meshList[i];
 			const uint32_t numVertices = mesh->m_NumVertices;
-			float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
-			const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &col;
+			const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 			const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 			
-			vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-			createDrawCommand_VertexColor(ctx, transformedVertices, numVertices, colors, numColors, mesh->m_Indices, mesh->m_NumIndices);
+			createDrawCommand_VertexColor(ctx, mesh->m_Pos, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices, mtx);
 		}
 	}
 }
@@ -6273,17 +6377,15 @@ static void submitCachedMesh(Context* ctx, GradientHandle gradientHandle, const 
 	const State* state = getState(ctx);
 	const float* mtx = state->m_TransformMtx;
 
-	const uint32_t black = Colors::Black;
+	const float globalAlpha = state->m_GlobalAlpha;
+
 	for (uint32_t i = 0; i < numMeshes; ++i) {
 		const CachedMesh* mesh = &meshList[i];
 		const uint32_t numVertices = mesh->m_NumVertices;
-		float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
-		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &black;
+		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 		const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 
-		vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-		createDrawCommand_ColorGradient(ctx, gradientHandle, transformedVertices, numVertices, colors, numColors, mesh->m_Indices, mesh->m_NumIndices);
+		createDrawCommand_ColorGradient(ctx, gradientHandle, mesh->m_Pos, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices, mtx);
 	}
 }
 
@@ -6292,20 +6394,19 @@ static void submitCachedMesh(Context* ctx, ImagePatternHandle imgPattern, Color 
 	VG_CHECK(!ctx->m_RecordClipCommands, "Only submitCachedMesh(Color) is supported inside BeginClip()/EndClip()");
 	VG_CHECK(isValid(imgPattern), "Invalid image pattern handle");
 	VG_CHECK(!isLocal(imgPattern), "Invalid image pattern handle");
+	BX_UNUSED(col); // The color used when recording the mesh is stored in CachedMesh::m_Color.
 
 	const State* state = getState(ctx);
 	const float* mtx = state->m_TransformMtx;
+	const float globalAlpha = state->m_GlobalAlpha;
 
 	for (uint32_t i = 0; i < numMeshes; ++i) {
 		const CachedMesh* mesh = &meshList[i];
 		const uint32_t numVertices = mesh->m_NumVertices;
-		float* transformedVertices = allocTransformedVertices(ctx, numVertices);
-
-		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &col;
+		const uint32_t* colors = mesh->m_Colors ? mesh->m_Colors : &mesh->m_Color;
 		const uint32_t numColors = mesh->m_Colors ? numVertices : 1;
 
-		vgutil::batchTransformPositions(mesh->m_Pos, numVertices, transformedVertices, mtx);
-		createDrawCommand_ImagePattern(ctx, imgPattern, transformedVertices, numVertices, colors, numColors, mesh->m_Indices, mesh->m_NumIndices);
+		createDrawCommand_ImagePattern(ctx, imgPattern, mesh->m_Pos, numVertices, scaleColorsAlpha(ctx, colors, numColors, globalAlpha), numColors, mesh->m_Indices, mesh->m_NumIndices, mtx);
 	}
 }
 #endif // VG_CONFIG_ENABLE_SHAPE_CACHING
