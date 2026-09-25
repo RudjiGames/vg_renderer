@@ -2321,7 +2321,9 @@ inline static void resetGeometry(Stroker* stroker)
 
 static void reallocVB(Stroker* stroker, uint32_t n)
 {
-	stroker->m_VertexCapacity += n;
+	// Grow geometrically to avoid O(n^2) reallocations when stroking long paths.
+	const uint32_t minCapacity = stroker->m_NumVertices + n;
+	stroker->m_VertexCapacity = bx::max<uint32_t>(minCapacity, stroker->m_VertexCapacity + (stroker->m_VertexCapacity >> 1));
 	stroker->m_PosBuffer = (Vec2*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_PosBuffer, sizeof(Vec2) * stroker->m_VertexCapacity, 16);
 	stroker->m_ColorBuffer = (uint32_t*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_ColorBuffer, sizeof(uint32_t) * stroker->m_VertexCapacity, 16);
 }
@@ -2335,7 +2337,8 @@ static BX_FORCE_INLINE void expandVB(Stroker* stroker, uint32_t n)
 
 static void reallocIB(Stroker* stroker, uint32_t n)
 {
-	stroker->m_IndexCapacity += n;
+	const uint32_t minCapacity = stroker->m_NumIndices + n;
+	stroker->m_IndexCapacity = bx::max<uint32_t>(minCapacity, stroker->m_IndexCapacity + (stroker->m_IndexCapacity >> 1));
 	stroker->m_IndexBuffer = (uint16_t*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_IndexBuffer, sizeof(uint16_t) * stroker->m_IndexCapacity, 16);
 }
 

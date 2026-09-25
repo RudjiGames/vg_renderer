@@ -263,6 +263,7 @@ struct CachedMesh
 	uint16_t* m_Indices;
 	uint32_t m_NumVertices;
 	uint32_t m_NumIndices;
+	uint32_t m_DataOffset; // Offset of m_Pos in CommandListCache::m_Data
 };
 
 struct CachedCommand
@@ -276,8 +277,13 @@ struct CommandListCache
 {
 	CachedMesh* m_Meshes;
 	uint32_t m_NumMeshes;
+	uint32_t m_MeshCapacity;
 	CachedCommand* m_Commands;
 	uint32_t m_NumCommands;
+	uint32_t m_CommandCapacity;
+	uint8_t* m_Data; // Vertex/color/index data of all meshes
+	uint32_t m_DataSize;
+	uint32_t m_DataCapacity;
 	float m_AvgScale;
 };
 
@@ -4036,14 +4042,37 @@ static void ctxPopState(Context* ctx)
 	}
 }
 
+static bool scissorRectEqual(const uint16_t* cmdScissor, const float* stateScissor)
+{
+	return cmdScissor[0] == (uint16_t)stateScissor[0]
+		&& cmdScissor[1] == (uint16_t)stateScissor[1]
+		&& cmdScissor[2] == (uint16_t)stateScissor[2]
+		&& cmdScissor[3] == (uint16_t)stateScissor[3];
+}
+
+// Only break batching if the scissor rect actually differs from the one used by the last draw/clip command.
+static void onScissorRectChanged(Context* ctx)
+{
+	const float* stateScissor = &getState(ctx)->m_ScissorRect[0];
+
+	const uint32_t numDrawCommands = ctx->m_NumDrawCommands;
+	if (numDrawCommands != 0 && !scissorRectEqual(&ctx->m_DrawCommands[numDrawCommands - 1].m_ScissorRect[0], stateScissor)) {
+		ctx->m_ForceNewDrawCommand = true;
+	}
+
+	const uint32_t numClipCommands = ctx->m_NumClipCommands;
+	if (numClipCommands != 0 && !scissorRectEqual(&ctx->m_ClipCommands[numClipCommands - 1].m_ScissorRect[0], stateScissor)) {
+		ctx->m_ForceNewClipCommand = true;
+	}
+}
+
 static void ctxResetScissor(Context* ctx)
 {
 	State* state = getState(ctx);
 	state->m_ScissorRect[0] = state->m_ScissorRect[1] = 0.0f;
 	state->m_ScissorRect[2] = (float)ctx->m_CanvasWidth;
 	state->m_ScissorRect[3] = (float)ctx->m_CanvasHeight;
-	ctx->m_ForceNewDrawCommand = true;
-	ctx->m_ForceNewClipCommand = true;
+	onScissorRectChanged(ctx);
 }
 
 static void ctxSetScissor(Context* ctx, float x, float y, float w, float h)
@@ -4066,8 +4095,7 @@ static void ctxSetScissor(Context* ctx, float x, float y, float w, float h)
 	state->m_ScissorRect[1] = miny;
 	state->m_ScissorRect[2] = maxx - minx;
 	state->m_ScissorRect[3] = maxy - miny;
-	ctx->m_ForceNewDrawCommand = true;
-	ctx->m_ForceNewClipCommand = true;
+	onScissorRectChanged(ctx);
 }
 
 static bool ctxIntersectScissor(Context* ctx, float x, float y, float w, float h)
@@ -4093,8 +4121,7 @@ static bool ctxIntersectScissor(Context* ctx, float x, float y, float w, float h
 	state->m_ScissorRect[2] = newRectWidth;
 	state->m_ScissorRect[3] = newRectHeight;
 
-	ctx->m_ForceNewDrawCommand = true;
-	ctx->m_ForceNewClipCommand = true;
+	onScissorRectChanged(ctx);
 
 	return newRectWidth >= 1.0f && newRectHeight >= 1.0f;
 }
@@ -4129,7 +4156,7 @@ static void ctxTransformTranslate(Context* ctx, float x, float y)
 	state->m_TransformMtx[4] += state->m_TransformMtx[0] * x + state->m_TransformMtx[2] * y;
 	state->m_TransformMtx[5] += state->m_TransformMtx[1] * x + state->m_TransformMtx[3] * y;
 
-	updateState(state);
+	// NOTE: No need to call updateState() here; translation doesn't affect the scale.
 }
 
 static void ctxTransformRotate(Context* ctx, float ang_rad)
@@ -5017,9 +5044,14 @@ static void updateState(State* state)
 static float* allocTransformedVertices(Context* ctx, uint32_t numVertices)
 {
 	if (numVertices > ctx->m_TransformedVertexCapacity) {
+		// Previous contents are not needed, so free + alloc instead of realloc to avoid a useless copy.
 		bx::AllocatorI* allocator = ctx->m_Allocator;
-		ctx->m_TransformedVertices = (float*)bx::alignedRealloc(allocator, ctx->m_TransformedVertices, sizeof(float) * 2 * numVertices, 16);
-		ctx->m_TransformedVertexCapacity = numVertices;
+		const uint32_t newCapacity = bx::max<uint32_t>(numVertices, ctx->m_TransformedVertexCapacity + (ctx->m_TransformedVertexCapacity >> 1));
+		if (ctx->m_TransformedVertices) {
+			bx::alignedFree(allocator, ctx->m_TransformedVertices, 16);
+		}
+		ctx->m_TransformedVertices = (float*)bx::alignedAlloc(allocator, sizeof(float) * 2 * newCapacity, 16);
+		ctx->m_TransformedVertexCapacity = newCapacity;
 	}
 
 	return ctx->m_TransformedVertices;
@@ -5474,7 +5506,7 @@ static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_
 
 	// The new draw command cannot be combined with the previous one. Create a new one.
 	if (ctx->m_NumDrawCommands == ctx->m_DrawCommandCapacity) {
-		ctx->m_DrawCommandCapacity = ctx->m_DrawCommandCapacity + 32;
+		ctx->m_DrawCommandCapacity = bx::max<uint32_t>(ctx->m_DrawCommandCapacity + 32, ctx->m_DrawCommandCapacity + (ctx->m_DrawCommandCapacity >> 1));
 		ctx->m_DrawCommands = (DrawCommand*)bx::realloc(ctx->m_Allocator, ctx->m_DrawCommands, sizeof(DrawCommand) * ctx->m_DrawCommandCapacity);
 	}
 
@@ -5523,7 +5555,7 @@ static DrawCommand* allocClipCommand(Context* ctx, uint32_t numVertices, uint32_
 
 	// The new clip command cannot be combined with the previous one. Create a new one.
 	if (ctx->m_NumClipCommands == ctx->m_ClipCommandCapacity) {
-		ctx->m_ClipCommandCapacity = ctx->m_ClipCommandCapacity + 32;
+		ctx->m_ClipCommandCapacity = bx::max<uint32_t>(ctx->m_ClipCommandCapacity + 32, ctx->m_ClipCommandCapacity + (ctx->m_ClipCommandCapacity >> 1));
 		ctx->m_ClipCommands = (DrawCommand*)bx::realloc(ctx->m_Allocator, ctx->m_ClipCommands, sizeof(DrawCommand) * ctx->m_ClipCommandCapacity);
 	}
 
@@ -5731,18 +5763,27 @@ static void flushTextAtlas(Context* ctx)
 	int iw, ih;
 	const uint8_t* a8Data = fonsGetTextureData(fons, &iw, &ih);
 	VG_CHECK(iw > 0 && ih > 0, "Invalid font atlas dimensions");
+	BX_UNUSED(ih);
 
-	// TODO: Convert only the dirty part of the texture (it's the only part that will be uploaded to the backend)
-	uint32_t* rgbaData = (uint32_t*)bx::alloc(ctx->m_Allocator, sizeof(uint32_t) * iw * ih);
-	vgutil::convertA8_to_RGBA8(rgbaData, a8Data, (uint32_t)iw, (uint32_t)ih, 0x00FFFFFF);
+	const int x = dirty[0];
+	const int y = dirty[1];
+	const int w = dirty[2] - dirty[0];
+	const int h = dirty[3] - dirty[1];
+	if (w <= 0 || h <= 0) {
+		return;
+	}
 
-	int x = dirty[0];
-	int y = dirty[1];
-	int w = dirty[2] - dirty[0];
-	int h = dirty[3] - dirty[1];
-	updateImage(ctx, fontImage, (uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, (const uint8_t*)rgbaData);
+	const Image* tex = &ctx->m_Images[fontImage.idx];
+	VG_CHECK(bgfx::isValid(tex->m_bgfxHandle), "Invalid texture handle");
 
-	bx::free(ctx->m_Allocator, rgbaData);
+	// Convert only the dirty rect, directly into the memory block that will be uploaded.
+	const bgfx::Memory* mem = bgfx::alloc((uint32_t)(w * h) * sizeof(uint32_t));
+	uint32_t* rgbaData = (uint32_t*)mem->data;
+	for (int row = 0; row < h; ++row) {
+		vgutil::convertA8_to_RGBA8(&rgbaData[row * w], &a8Data[(y + row) * iw + x], (uint32_t)w, 1, 0x00FFFFFF);
+	}
+
+	bgfx::updateTexture2D(tex->m_bgfxHandle, 0, 0, (uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, mem, UINT16_MAX);
 }
 
 static CommandListHandle allocCommandList(Context* ctx)
@@ -5779,7 +5820,11 @@ static void freeCommandListCache(Context* ctx, CommandListCache* cache)
 {
 	bx::AllocatorI* allocator = ctx->m_Allocator;
 
-	clCacheReset(ctx, cache);
+	if (cache->m_Data) {
+		bx::alignedFree(allocator, cache->m_Data, 16);
+	}
+	bx::free(allocator, cache->m_Meshes);
+	bx::free(allocator, cache->m_Commands);
 	bx::free(allocator, cache);
 }
 #endif
@@ -5795,7 +5840,7 @@ static uint8_t* clAllocCommand(Context* ctx, CommandList* cl, CommandType::Enum 
 	VG_CHECK(isAligned(pos, VG_CONFIG_COMMAND_LIST_ALIGNMENT), "Unaligned command buffer position");
 
 	if (pos + totalSize > cl->m_CommandBufferCapacity) {
-		const uint32_t capacityDelta = bx::max<uint32_t>(totalSize, 256);
+		const uint32_t capacityDelta = bx::max<uint32_t>(bx::max<uint32_t>(totalSize, 256), cl->m_CommandBufferCapacity >> 1);
 		cl->m_CommandBufferCapacity += capacityDelta;
 		cl->m_CommandBuffer = (uint8_t*)bx::alignedRealloc(ctx->m_Allocator, cl->m_CommandBuffer, cl->m_CommandBufferCapacity, VG_CONFIG_COMMAND_LIST_ALIGNMENT);
 
@@ -5818,7 +5863,7 @@ static uint8_t* clAllocCommand(Context* ctx, CommandList* cl, CommandType::Enum 
 static uint32_t clStoreString(Context* ctx, CommandList* cl, const char* str, uint32_t len)
 {
 	if (cl->m_StringBufferPos + len > cl->m_StringBufferCapacity) {
-		cl->m_StringBufferCapacity += bx::max<uint32_t>(len, 128);
+		cl->m_StringBufferCapacity += bx::max<uint32_t>(bx::max<uint32_t>(len, 128), cl->m_StringBufferCapacity >> 1);
 		cl->m_StringBuffer = (char*)bx::realloc(ctx->m_Allocator, cl->m_StringBuffer, cl->m_StringBufferCapacity);
 	}
 
@@ -5870,8 +5915,11 @@ static void beginCachedCommand(Context* ctx)
 
 	bx::AllocatorI* allocator = ctx->m_Allocator;
 
+	if (cache->m_NumCommands == cache->m_CommandCapacity) {
+		cache->m_CommandCapacity = bx::max<uint32_t>(16, cache->m_CommandCapacity + (cache->m_CommandCapacity >> 1));
+		cache->m_Commands = (CachedCommand*)bx::realloc(allocator, cache->m_Commands, sizeof(CachedCommand) * cache->m_CommandCapacity);
+	}
 	cache->m_NumCommands++;
-	cache->m_Commands = (CachedCommand*)bx::realloc(allocator, cache->m_Commands, sizeof(CachedCommand) * cache->m_NumCommands);
 
 	CachedCommand* lastCmd = &cache->m_Commands[cache->m_NumCommands - 1];
 	lastCmd->m_FirstMeshID = (uint16_t)cache->m_NumMeshes;
@@ -5900,17 +5948,47 @@ static void addCachedCommand(Context* ctx, const float* pos, uint32_t numVertice
 
 	bx::AllocatorI* allocator = ctx->m_Allocator;
 
+	if (cache->m_NumMeshes == cache->m_MeshCapacity) {
+		cache->m_MeshCapacity = bx::max<uint32_t>(16, cache->m_MeshCapacity + (cache->m_MeshCapacity >> 1));
+		cache->m_Meshes = (CachedMesh*)bx::realloc(allocator, cache->m_Meshes, sizeof(CachedMesh) * cache->m_MeshCapacity);
+	}
 	cache->m_NumMeshes++;
-	cache->m_Meshes = (CachedMesh*)bx::realloc(allocator, cache->m_Meshes, sizeof(CachedMesh) * cache->m_NumMeshes);
-
-	CachedMesh* mesh = &cache->m_Meshes[cache->m_NumMeshes - 1];
 
 	const uint32_t totalMem = 0
 		+ alignSize(sizeof(float) * 2 * numVertices, 16)
 		+ ((numColors != 1) ? alignSize(sizeof(uint32_t) * numVertices, 16) : 0)
 		+ alignSize(sizeof(uint16_t) * numIndices, 16);
 
-	uint8_t* mem = (uint8_t*)bx::alignedAlloc(allocator, totalMem, 16);
+	// All mesh data lives in a single growable buffer. When it moves, rebase the pointers of the existing meshes.
+	if (cache->m_DataSize + totalMem > cache->m_DataCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(cache->m_DataSize + totalMem, cache->m_DataCapacity + (cache->m_DataCapacity >> 1));
+		uint8_t* newData = (uint8_t*)bx::alignedAlloc(allocator, newCapacity, 16);
+		if (cache->m_Data) {
+			bx::memCopy(newData, cache->m_Data, cache->m_DataSize);
+			bx::alignedFree(allocator, cache->m_Data, 16);
+		}
+		cache->m_Data = newData;
+		cache->m_DataCapacity = newCapacity;
+
+		const uint32_t numPrevMeshes = cache->m_NumMeshes - 1;
+		for (uint32_t i = 0; i < numPrevMeshes; ++i) {
+			CachedMesh* prevMesh = &cache->m_Meshes[i];
+			uint8_t* prevMem = newData + prevMesh->m_DataOffset;
+			prevMesh->m_Pos = (float*)prevMem;
+			prevMem += alignSize(sizeof(float) * 2 * prevMesh->m_NumVertices, 16);
+			if (prevMesh->m_Colors) {
+				prevMesh->m_Colors = (uint32_t*)prevMem;
+				prevMem += alignSize(sizeof(uint32_t) * prevMesh->m_NumVertices, 16);
+			}
+			prevMesh->m_Indices = (uint16_t*)prevMem;
+		}
+	}
+
+	CachedMesh* mesh = &cache->m_Meshes[cache->m_NumMeshes - 1];
+	mesh->m_DataOffset = cache->m_DataSize;
+
+	uint8_t* mem = cache->m_Data + cache->m_DataSize;
+	cache->m_DataSize += totalMem;
 	mesh->m_Pos = (float*)mem;
 	mem += alignSize(sizeof(float) * 2 * numVertices, 16);
 	
@@ -6218,19 +6296,14 @@ static void clCacheRender(Context* ctx, CommandList* cl)
 #endif
 }
 
+// Keeps the allocated buffers around so that rebuilding the cache (e.g. every frame while zooming) doesn't reallocate.
 static void clCacheReset(Context* ctx, CommandListCache* cache)
 {
-	bx::AllocatorI* allocator = ctx->m_Allocator;
-
-	const uint32_t numMeshes = cache->m_NumMeshes;
-	for (uint32_t i = 0; i < numMeshes; ++i) {
-		CachedMesh* mesh = &cache->m_Meshes[i];
-		bx::alignedFree(allocator, mesh->m_Pos, 16);
-	}
-	bx::free(allocator, cache->m_Meshes);
-	bx::free(allocator, cache->m_Commands);
-
-	bx::memSet(cache, 0, sizeof(CommandListCache));
+	BX_UNUSED(ctx);
+	cache->m_NumMeshes = 0;
+	cache->m_NumCommands = 0;
+	cache->m_DataSize = 0;
+	cache->m_AvgScale = 0.0f;
 }
 
 static void submitCachedMesh(Context* ctx, Color col, const CachedMesh* meshList, uint32_t numMeshes)

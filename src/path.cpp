@@ -64,7 +64,7 @@ void pathMoveTo(Path* path, float x, float y)
 	if (!path->m_CurSubPath || path->m_CurSubPath->m_NumVertices != 0) {
 		// Move on to the next sub path.
 		if (path->m_NumSubPaths + 1 > path->m_SubPathCapacity) {
-			path->m_SubPathCapacity += 16;
+			path->m_SubPathCapacity = bx::max<uint32_t>(path->m_SubPathCapacity + 16, path->m_SubPathCapacity + (path->m_SubPathCapacity >> 1));
 			path->m_SubPaths = (SubPath*)bx::realloc(path->m_Allocator, path->m_SubPaths, sizeof(SubPath) * path->m_SubPathCapacity);
 		}
 
