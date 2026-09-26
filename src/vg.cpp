@@ -3214,8 +3214,9 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 	const uint32_t numSubPaths = pathGetNumSubPaths(path);
 	const SubPath* subPaths = pathGetSubPaths(path);
 	// Skip generating geometry which will be completely scissored out. Cached command lists must
-	// record the full geometry.
-	if (!hasCache && isPathCulled(ctx, pathVertices, aa ? ctx->m_FringeWidth * kMaxExtrusionScale : 0.0f)) {
+	// record the full geometry. Clip shapes are never culled: if all shapes of a ClipRule::In region were
+	// culled, no clip mesh would be recorded and the region's content would be drawn unclipped.
+	if (!hasCache && !recordClipCommands && isPathCulled(ctx, pathVertices, aa ? ctx->m_FringeWidth * kMaxExtrusionScale : 0.0f)) {
 		return;
 	}
 
@@ -3604,8 +3605,9 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 	const uint32_t numSubPaths = pathGetNumSubPaths(path);
 	const SubPath* subPaths = pathGetSubPaths(path);
 	// Skip generating geometry which will be completely scissored out. Cached command lists must
-	// record the full geometry.
-	if (!hasCache && isPathCulled(ctx, pathVertices, (strokeWidth * 0.5f + ctx->m_FringeWidth) * kMaxExtrusionScale)) {
+	// record the full geometry. Clip shapes are never culled: if all shapes of a ClipRule::In region were
+	// culled, no clip mesh would be recorded and the region's content would be drawn unclipped.
+	if (!hasCache && !recordClipCommands && isPathCulled(ctx, pathVertices, (strokeWidth * 0.5f + ctx->m_FringeWidth) * kMaxExtrusionScale)) {
 		return;
 	}
 
