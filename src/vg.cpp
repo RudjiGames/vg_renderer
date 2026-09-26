@@ -516,10 +516,26 @@ static void releaseVertexBufferDataCallback_UV(void* ptr, void* userData);
 
 static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_t numIndices, DrawCommand::Type::Enum type, uint16_t handle);
 static DrawCommand* allocClipCommand(Context* ctx, uint32_t numVertices, uint32_t numIndices);
+static bool canAllocVertices(const Context* ctx, uint32_t numVertices);
 static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+
+// Makes the stroker write its geometry directly into the vertex/index buffers of a draw command, which is
+// equivalent to (but avoids the copies of) generating the mesh into the stroker's buffers and calling
+// createDrawCommand_VertexColor() (type Textured), createDrawCommand_ColorGradient() or createDrawCommand_Clip().
+// Only valid when no alpha scaling is needed (i.e. not for cached command lists).
+struct DrawCommandSink
+{
+	StrokerSink m_Sink;
+	Context* m_Context;
+	DrawCommand::Type::Enum m_Type;
+	uint16_t m_Handle;
+	Color m_Color;     // Vertex color used when the stroker doesn't generate colors (non-AA meshes)
+	bool m_FillColor;
+};
+static const StrokerSink* initDrawCommandSink(DrawCommandSink* sink, Context* ctx, DrawCommand::Type::Enum type, uint16_t handle, Color color, bool fillColor);
 
 static ImageHandle allocImage(Context* ctx);
 static void resetImage(Image* img);
@@ -3226,6 +3242,13 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 			uint32_t numColors = 1;
 
 			if (aa) {
+				if (!hasCache) {
+					// Generate the mesh directly into the vertex buffer.
+					DrawCommandSink sink;
+					strokerConvexFillAA(stroker, &mesh, vtx, numPathVertices, col, initDrawCommandSink(&sink, ctx, DrawCommand::Type::Textured, ctx->m_FontImages[0].idx, col, false));
+					continue;
+				}
+
 				strokerConvexFillAA(stroker, &mesh, vtx, numPathVertices, col);
 				colors = mesh.m_ColorBuffer;
 				numColors = mesh.m_NumVertices;
@@ -3353,6 +3376,13 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 			const uint32_t numPathVertices = subPath->m_NumVertices;
 
 			if (aa) {
+				if (!hasCache) {
+					// Generate the mesh directly into the vertex buffer.
+					DrawCommandSink sink;
+					strokerConvexFillAA(stroker, &mesh, vtx, numPathVertices, black, initDrawCommandSink(&sink, ctx, DrawCommand::Type::ColorGradient, gradientHandle.idx, black, false));
+					continue;
+				}
+
 				strokerConvexFillAA(stroker, &mesh, vtx, numPathVertices, black);
 				colors = mesh.m_ColorBuffer;
 				numColors = mesh.m_NumVertices;
@@ -3598,6 +3628,24 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 		const bool isClosed = subPath->m_IsClosed;
 
 		Mesh mesh;
+		if (!hasCache) {
+			// Generate the mesh directly into the vertex buffer (no alpha scaling is needed without a cache).
+			DrawCommandSink sinkData;
+			const StrokerSink* sink = recordClipCommands
+				? initDrawCommandSink(&sinkData, ctx, DrawCommand::Type::Clip, UINT16_MAX, col, false)
+				: initDrawCommandSink(&sinkData, ctx, DrawCommand::Type::Textured, ctx->m_FontImages[0].idx, col, !aa);
+			if (aa) {
+				if (isThin) {
+					strokerPolylineStrokeAAThin(stroker, &mesh, vtx, numPathVertices, isClosed, col, lineCap, lineJoin, sink);
+				} else {
+					strokerPolylineStrokeAA(stroker, &mesh, vtx, numPathVertices, isClosed, col, strokeWidth, lineCap, lineJoin, sink);
+				}
+			} else {
+				strokerPolylineStroke(stroker, &mesh, vtx, numPathVertices, isClosed, strokeWidth, lineCap, lineJoin, sink);
+			}
+			continue;
+		}
+
 		const uint32_t* colors = &col;
 		uint32_t numColors = 1;
 		if (aa) {
@@ -3695,6 +3743,23 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 
 		Mesh mesh;
 		const uint32_t black = colorSetAlpha(Colors::Black, (uint8_t)(0xff * (hasCache ? 1.0f : state->m_GlobalAlpha)));
+
+		if (!hasCache) {
+			// Generate the mesh directly into the vertex buffer (no alpha scaling is needed without a cache).
+			DrawCommandSink sinkData;
+			const StrokerSink* sink = initDrawCommandSink(&sinkData, ctx, DrawCommand::Type::ColorGradient, gradientHandle.idx, black, !aa);
+			if (aa) {
+				if (isThin) {
+					strokerPolylineStrokeAAThin(stroker, &mesh, vtx, numPathVertices, isClosed, black, lineCap, lineJoin, sink);
+				} else {
+					strokerPolylineStrokeAA(stroker, &mesh, vtx, numPathVertices, isClosed, black, strokeWidth, lineCap, lineJoin, sink);
+				}
+			} else {
+				strokerPolylineStroke(stroker, &mesh, vtx, numPathVertices, isClosed, strokeWidth, lineCap, lineJoin, sink);
+			}
+			continue;
+		}
+
 		const uint32_t* colors = &black;
 		uint32_t numColors = 1;
 
@@ -4318,6 +4383,10 @@ static void ctxIndexedTriList(Context* ctx, const float* pos, const uv_t* uv, ui
 
 	// Everything will be scissored out.
 	if (state->m_ScissorRect[2] < 1.0f || state->m_ScissorRect[3] < 1.0f) {
+		return;
+	}
+
+	if (!canAllocVertices(ctx, numVertices)) {
 		return;
 	}
 
@@ -5491,6 +5560,10 @@ static inline void writePositions(float* dstPos, const float* vtx, uint32_t numV
 
 static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
+	if (!canAllocVertices(ctx, numVertices)) {
+		return;
+	}
+
 	// Allocate the draw command
 	const ImageHandle fontImg = ctx->m_FontImages[0];
 	DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::Textured, fontImg.idx);
@@ -5570,6 +5643,10 @@ static bool canBakeImagePatternUVs(const ImagePattern* pattern, const float* vtx
 
 static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgPatternHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
+	if (!canAllocVertices(ctx, numVertices)) {
+		return;
+	}
+
 	const ImagePattern* pattern = &ctx->m_ImagePatterns[imgPatternHandle.idx];
 
 	// Calculate the pattern's UVs on the CPU and draw it as a regular textured mesh. This way
@@ -5642,6 +5719,10 @@ static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgP
 
 static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradientHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
+	if (!canAllocVertices(ctx, numVertices)) {
+		return;
+	}
+
 	DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::ColorGradient, gradientHandle.idx);
 
 	VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
@@ -5668,6 +5749,10 @@ static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle gradien
 
 static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
+	if (!canAllocVertices(ctx, numVertices)) {
+		return;
+	}
+
 	// Allocate the draw command
 	DrawCommand* cmd = allocClipCommand(ctx, numVertices, numIndices);
 
@@ -5687,11 +5772,79 @@ static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numV
 	cmd->m_NumIndices += numIndices;
 }
 
+static bool drawCommandSinkAlloc(void* userData, uint32_t numVertices, uint32_t numIndices, StrokerOutput* output)
+{
+	const DrawCommandSink* sink = (const DrawCommandSink*)userData;
+	Context* ctx = sink->m_Context;
+
+	// NOTE: Returning false makes the stroker use its internal buffers; the caller then skips the mesh.
+	if (!canAllocVertices(ctx, numVertices)) {
+		return false;
+	}
+
+	DrawCommand* cmd = sink->m_Type == DrawCommand::Type::Clip
+		? allocClipCommand(ctx, numVertices, numIndices)
+		: allocDrawCommand(ctx, numVertices, numIndices, sink->m_Type, sink->m_Handle);
+
+	VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
+	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
+	IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
+
+	output->m_PosBuffer = &vb->m_Pos[vbOffset << 1];
+	output->m_ColorBuffer = sink->m_Type == DrawCommand::Type::Clip ? nullptr : &vb->m_Color[vbOffset];
+	output->m_IndexBuffer = &ib->m_Indices[cmd->m_FirstIndexID + cmd->m_NumIndices];
+	output->m_BaseVertex = (uint16_t)cmd->m_NumVertices;
+
+	if (sink->m_Type == DrawCommand::Type::Textured) {
+		const uv_t* uv = getWhitePixelUV(ctx);
+		uv_t* dstUV = &vb->m_UV[vbOffset << 1];
+#if VG_CONFIG_UV_INT16
+		vgutil::memset32(dstUV, numVertices, &uv[0]);
+#else
+		vgutil::memset64(dstUV, numVertices, &uv[0]);
+#endif
+	}
+
+	if (sink->m_FillColor) {
+		vgutil::memset32(&vb->m_Color[vbOffset], numVertices, &sink->m_Color);
+	}
+
+	cmd->m_NumVertices += numVertices;
+	cmd->m_NumIndices += numIndices;
+
+	return true;
+}
+
+static const StrokerSink* initDrawCommandSink(DrawCommandSink* sink, Context* ctx, DrawCommand::Type::Enum type, uint16_t handle, Color color, bool fillColor)
+{
+	VG_CHECK(type != DrawCommand::Type::Clip || !fillColor, "Clip commands don't have colors");
+	sink->m_Sink.m_AllocFn = drawCommandSinkAlloc;
+	sink->m_Sink.m_UserData = sink;
+	sink->m_Context = ctx;
+	sink->m_Type = type;
+	sink->m_Handle = handle;
+	sink->m_Color = color;
+	sink->m_FillColor = fillColor;
+	return &sink->m_Sink;
+}
+
 // NOTE: Side effect: Resets m_ForceNewDrawCommand and m_ForceNewClipCommand if the current
 // vertex buffer cannot hold the specified amount of vertices.
+// A single mesh must fit in one vertex buffer (indices are uint16). Larger meshes are skipped instead of
+// overflowing the vertex buffer (previously only guarded by a VG_CHECK).
+static bool canAllocVertices(const Context* ctx, uint32_t numVertices)
+{
+	if (numVertices > ctx->m_Config.m_MaxVBVertices) {
+		VG_WARN(false, "A single mesh cannot have more than %u vertices (%u requested). Skipping it.", ctx->m_Config.m_MaxVBVertices, numVertices);
+		return false;
+	}
+
+	return true;
+}
+
 static uint32_t allocVertices(Context* ctx, uint32_t numVertices, uint32_t* vbID)
 {
-	VG_CHECK(numVertices < ctx->m_Config.m_MaxVBVertices, "A single draw call cannot have more than %d vertices", ctx->m_Config.m_MaxVBVertices);
+	VG_CHECK(numVertices <= ctx->m_Config.m_MaxVBVertices, "A single draw call cannot have more than %d vertices", ctx->m_Config.m_MaxVBVertices);
 
 	// Check if the current vertex buffer can hold the specified amount of vertices
 	VertexBuffer* vb = &ctx->m_VertexBuffers[ctx->m_NumVertexBuffers - 1];
@@ -5981,6 +6134,9 @@ static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQua
 
 	const uint32_t numDrawVertices = numQuads * 4;
 	const uint32_t numDrawIndices = numQuads * 6;
+	if (!canAllocVertices(ctx, numDrawVertices)) {
+		return;
+	}
 
 	DrawCommand* cmd = allocDrawCommand(ctx, numDrawVertices, numDrawIndices, DrawCommand::Type::Textured, ctx->m_FontImages[ctx->m_FontImageID].idx);
 

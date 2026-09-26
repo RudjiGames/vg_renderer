@@ -9,8 +9,13 @@ BX_PRAGMA_DIAGNOSTIC_IGNORED_MSVC(4127) // conditional expression is constant
 BX_PRAGMA_DIAGNOSTIC_IGNORED_MSVC(4456) // declaration of X hides previous local decleration
 BX_PRAGMA_DIAGNOSTIC_IGNORED_CLANG_GCC("-Wshadow")
 
-#define RSQRT_ALGORITHM 1
-#define RCP_ALGORITHM 1
+#ifndef RSQRT_ALGORITHM
+#	define RSQRT_ALGORITHM 1
+#endif
+
+#ifndef RCP_ALGORITHM
+#	define RCP_ALGORITHM 1
+#endif
 
 namespace vg
 {
@@ -57,15 +62,21 @@ inline Vec2 vec2Rotate(const Vec2& a, float ca, float sa)
 	return{ ca * a.x - sa * a.y, sa * a.x + ca * a.y };
 }
 
+// Minimum |cross(d12, d01)| for which the miter extrusion vector (d01 - d12) / cross is used. Below
+// that (almost collinear or almost reversed segments) the perpendicular of d01 is used instead. Since
+// |d01 - d12| <= 2, this limits the extrusion vector's length to 2 / 0.01 = 200 times the extrusion
+// distance, which vg.cpp relies on when culling paths against the scissor rect (kMaxExtrusionScale).
+// NOTE: All extrusion vector calculations (scalar and SIMD) must use the same threshold.
+static const float kMinExtrusionCross = 1.0f / 100.0f;
+
 inline Vec2 calcExtrusionVector(const Vec2& d01, const Vec2& d12)
 {
 	// v is the vector from the path point to the outline point, assuming a stroke width of 1.0.
 	// Equation obtained by solving the intersection of the 2 line segments. d01 and d12 are 
 	// assumed to be normalized.
-	static const float kMaxExtrusionScale = 1.0f / 100.0f;
 	Vec2 v = vec2PerpCCW(d01);
 	const float cross = vec2Cross(d12, d01);
-	if (bx::abs(cross) > kMaxExtrusionScale) {
+	if (bx::abs(cross) > kMinExtrusionCross) {
 		v = vec2Scale(vec2Sub(d01, d12), (1.0f / cross));
 	}
 
@@ -108,27 +119,30 @@ static inline __m128 xmm_vec2_dir(const __m128 a, const __m128 b)
 static inline __m128 xmm_calcExtrusionVector(const __m128 d01, const __m128 d12)
 {
 	const float cross = xmm_vec2_cross(d12, d01);
-#if 0
-	return (bx::abs(cross) > VG_EPSILON) ? _mm_mul_ps(_mm_sub_ps(d01, d12), _mm_set_ps1(rcp(cross))) : xmm_vec2_rotCCW90(d01);
-#else
-	return (bx::abs(cross) > VG_EPSILON) ? _mm_mul_ps(_mm_sub_ps(d01, d12), _mm_set_ps1(1.0f / cross)) : xmm_vec2_rotCCW90(d01);
-#endif
+	return (bx::abs(cross) > kMinExtrusionCross) ? _mm_mul_ps(_mm_sub_ps(d01, d12), _mm_set_ps1(1.0f / cross)) : xmm_vec2_rotCCW90(d01);
 }
 
+// Alternative implementations of the vector reciprocal (square root). 0 = exact (division),
+// 1 = hardware estimate (~12 bits), 2 = hardware estimate refined with one Newton-Raphson step (~22 bits).
 static inline __m128 xmm_rsqrt(__m128 a)
 {
 #if RSQRT_ALGORITHM == 0
+	const __m128 xmm_one = _mm_set1_ps(1.0f);
 	const __m128 res = _mm_div_ps(xmm_one, _mm_sqrt_ps(a));
 #elif RSQRT_ALGORITHM == 1
 	const __m128 res = _mm_rsqrt_ps(a);
 #elif RSQRT_ALGORITHM == 2
-	// Newton/Raphson
+	// Newton/Raphson: x1 = 0.5 * x0 * (3 - a * x0 * x0)
+	const __m128 xmm_half = _mm_set1_ps(0.5f);
+	const __m128 xmm_three = _mm_set1_ps(3.0f);
 	const __m128 rsqrtEst = _mm_rsqrt_ps(a);
 	const __m128 iter0 = _mm_mul_ps(a, rsqrtEst);
 	const __m128 iter1 = _mm_mul_ps(iter0, rsqrtEst);
 	const __m128 half_rsqrt = _mm_mul_ps(xmm_half, rsqrtEst);
 	const __m128 three_sub_iter1 = _mm_sub_ps(xmm_three, iter1);
 	const __m128 res = _mm_mul_ps(half_rsqrt, three_sub_iter1);
+#else
+#	error "Unknown RSQRT_ALGORITHM"
 #endif
 
 	return res;
@@ -137,11 +151,17 @@ static inline __m128 xmm_rsqrt(__m128 a)
 static inline __m128 xmm_rcp(__m128 a)
 {
 #if RCP_ALGORITHM == 0
+	const __m128 xmm_one = _mm_set1_ps(1.0f);
 	const __m128 inv_a = _mm_div_ps(xmm_one, a);
 #elif RCP_ALGORITHM == 1
 	const __m128 inv_a = _mm_rcp_ps(a);
 #elif RCP_ALGORITHM == 2
-	// TODO: 
+	// Newton/Raphson: x1 = x0 * (2 - a * x0)
+	const __m128 xmm_two = _mm_set1_ps(2.0f);
+	const __m128 rcpEst = _mm_rcp_ps(a);
+	const __m128 inv_a = _mm_mul_ps(rcpEst, _mm_sub_ps(xmm_two, _mm_mul_ps(a, rcpEst)));
+#else
+#	error "Unknown RCP_ALGORITHM"
 #endif
 
 	return inv_a;
@@ -208,6 +228,15 @@ static void libtess2Free(void* userData, void* ptr)
 	BX_UNUSED(userData, ptr);
 }
 
+// Arc of a round join (see calcRoundJoinArcs()).
+struct RoundJoinArc
+{
+	Vec2 m_ArcDir;           // Direction of the first arc point
+	float m_CosDa;           // cos/sin of the angle between successive arc points
+	float m_SinDa;
+	uint32_t m_NumArcPoints;
+};
+
 struct Stroker
 {
 	bx::AllocatorI* m_Allocator;
@@ -216,6 +245,18 @@ struct Stroker
 	uint16_t* m_IndexBuffer;
 	uint16_t* m_FanIndexBuffer;   // Triangle fan indices (0, i, i + 1) used by strokerConvexFill(). Grow-only.
 	uint32_t m_FanTriCapacity;    // Number of triangles in m_FanIndexBuffer
+	Vec2* m_SegmentBuffer;        // Per segment directions and per vertex extrusion vectors used by the polyline strokers. Grow-only.
+	uint32_t m_SegmentCapacity;   // Number of Vec2 in m_SegmentBuffer
+	RoundJoinArc* m_JoinBuffer;   // Per join arc parameters of round joins. Grow-only.
+	uint32_t m_JoinCapacity;      // Number of elements in m_JoinBuffer
+	uint32_t* m_VertexMap;        // Tesselator vertex -> output vertex map used by strokerConcaveFillEndAA(). Grow-only.
+	uint32_t m_VertexMapCapacity;
+	Vec2* m_ContourVertices;      // Copy of the contours added with strokerConcaveFillAddContour()
+	uint32_t m_NumContourVertices;
+	uint32_t m_ContourVertexCapacity;
+	uint32_t* m_ContourSizes;
+	uint32_t m_NumContours;
+	uint32_t m_ContourCapacity;
 	uint32_t m_NumVertices;
 	uint32_t m_NumIndices;
 	uint32_t m_VertexCapacity;
@@ -232,21 +273,14 @@ static void expandIB(Stroker* stroker, uint32_t n);
 static void expandVB(Stroker* stroker, uint32_t n);
 
 template<bool _Closed, LineCap::Enum _LineCap, LineJoin::Enum _LineJoin>
-static void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth);
+static void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth, const StrokerSink* sink);
 template<bool _Closed, LineCap::Enum _LineCap, LineJoin::Enum _LineJoin>
-static void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth, Color color);
+static void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth, Color color, const StrokerSink* sink);
 template<LineCap::Enum _LineCap, LineJoin::Enum _LineJoin>
-static void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, Color color, bool closed);
-
-template<uint32_t N>
-static void addPos(Stroker* stroker, const Vec2* srcPos);
-template<uint32_t N>
-static void addPosColor(Stroker* stroker, const Vec2* srcPos, const uint32_t* srcColor);
-template<uint32_t N>
-static void addIndices(Stroker* stroker, const uint16_t* src);
+static void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, Color color, bool closed, const StrokerSink* sink);
 
 // Helpers for writing geometry through local pointers. The caller is responsible for reserving
-// enough space (expandVB/expandIB) up front and for committing the final counts (strokerCommit).
+// enough space up front (see beginGeometry()).
 template<uint32_t N>
 static BX_FORCE_INLINE Vec2* copyPos(Vec2* dst, const Vec2* src)
 {
@@ -268,27 +302,273 @@ static BX_FORCE_INLINE uint16_t* copyIndices(uint16_t* dst, const uint16_t* src)
 	return dst + N;
 }
 
-static BX_FORCE_INLINE void strokerCommit(Stroker* stroker, const Vec2* dstPos, const uint16_t* dstIndex)
+// Destination of the geometry generated by a stroker function. Either the stroker's internal buffers or
+// the buffers returned by the caller's StrokerSink.
+struct GeometryOutput
 {
-	stroker->m_NumVertices = (uint32_t)(dstPos - stroker->m_PosBuffer);
-	stroker->m_NumIndices = (uint32_t)(dstIndex - stroker->m_IndexBuffer);
-}
+	Vec2* m_Pos;
+	uint32_t* m_Color;
+	uint16_t* m_Index;
+	uint32_t m_NumVertices; // Exact amount of geometry which will be generated
+	uint32_t m_NumIndices;
+	uint16_t m_BaseVertex;
+	bool m_External;
+};
 
-// Commits the geometry written through the local pointers, makes sure there's enough space for
-// numVertices/numIndices more elements and updates the local pointers (buffers might be reallocated).
-static BX_FORCE_INLINE void strokerReserve(Stroker* stroker, Vec2*& dstPos, uint16_t*& dstIndex, uint32_t numVertices, uint32_t numIndices)
+// Allocates space for exactly numVertices vertices and numIndices indices. The geometry is written through local
+// pointers starting at out->m_Pos/m_Color/m_Index, with indices relative to out->m_Pos. endGeometry() finishes it.
+static void beginGeometry(Stroker* stroker, const StrokerSink* sink, uint32_t numVertices, uint32_t numIndices, bool generatesColors, GeometryOutput* out)
 {
-	strokerCommit(stroker, dstPos, dstIndex);
+	out->m_NumVertices = numVertices;
+	out->m_NumIndices = numIndices;
+
+	if (sink) {
+		StrokerOutput so;
+		if (sink->m_AllocFn(sink->m_UserData, numVertices, numIndices, &so)) {
+			VG_CHECK(!generatesColors || so.m_ColorBuffer, "A color buffer is required");
+			BX_UNUSED(generatesColors);
+			out->m_Pos = (Vec2*)so.m_PosBuffer;
+			out->m_Color = so.m_ColorBuffer;
+			out->m_Index = so.m_IndexBuffer;
+			out->m_BaseVertex = so.m_BaseVertex;
+			out->m_External = true;
+			return;
+		}
+	}
+
+	resetGeometry(stroker);
 	expandVB(stroker, numVertices);
 	expandIB(stroker, numIndices);
-	dstPos = stroker->m_PosBuffer + stroker->m_NumVertices;
-	dstIndex = stroker->m_IndexBuffer + stroker->m_NumIndices;
+	out->m_Pos = stroker->m_PosBuffer;
+	out->m_Color = stroker->m_ColorBuffer;
+	out->m_Index = stroker->m_IndexBuffer;
+	out->m_BaseVertex = 0;
+	out->m_External = false;
 }
 
-static BX_FORCE_INLINE void strokerReserve(Stroker* stroker, Vec2*& dstPos, uint32_t*& dstColor, uint16_t*& dstIndex, uint32_t numVertices, uint32_t numIndices)
+// Adds base to n indices (in place).
+static void addIndexBase(uint16_t* idx, uint32_t n, uint16_t base)
 {
-	strokerReserve(stroker, dstPos, dstIndex, numVertices, numIndices);
-	dstColor = stroker->m_ColorBuffer + stroker->m_NumVertices;
+	if (base == 0) {
+		return;
+	}
+
+	uint32_t i = 0;
+#if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86
+	const __m128i xmm_base = _mm_set1_epi16((short)base);
+	for (; i + 8 <= n; i += 8) {
+		const __m128i v = _mm_loadu_si128((const __m128i*)&idx[i]);
+		_mm_storeu_si128((__m128i*)&idx[i], _mm_add_epi16(v, xmm_base));
+	}
+#endif
+	for (; i < n; ++i) {
+		idx[i] = (uint16_t)(idx[i] + base);
+	}
+}
+
+// Finishes the geometry started with beginGeometry(). dstPos/dstIndex point past the last written vertex/index.
+static void endGeometry(Stroker* stroker, const GeometryOutput* out, const Vec2* dstPos, const uint16_t* dstIndex, bool hasColors, Mesh* mesh)
+{
+	const uint32_t numVertices = (uint32_t)(dstPos - out->m_Pos);
+	const uint32_t numIndices = (uint32_t)(dstIndex - out->m_Index);
+	VG_CHECK(numVertices == out->m_NumVertices && numIndices == out->m_NumIndices, "Generated geometry (%u vertices, %u indices) doesn't match the reserved space (%u vertices, %u indices)", numVertices, numIndices, out->m_NumVertices, out->m_NumIndices);
+
+	if (out->m_External) {
+		addIndexBase(out->m_Index, numIndices, out->m_BaseVertex);
+	} else {
+		stroker->m_NumVertices = numVertices;
+		stroker->m_NumIndices = numIndices;
+	}
+
+	mesh->m_PosBuffer = &out->m_Pos[0].x;
+	mesh->m_ColorBuffer = hasColors ? out->m_Color : nullptr;
+	mesh->m_IndexBuffer = out->m_Index;
+	mesh->m_NumVertices = numVertices;
+	mesh->m_NumIndices = numIndices;
+}
+
+// Calculates the direction of each segment of the polyline: dirs[i] = vec2Dir(vtx[i], vtx[i + 1]) for
+// i in [0, numVertices - 1) and, for closed paths, the closing segment dirs[numVertices - 1] = vec2Dir(vtx[numVertices - 1], vtx[0]).
+// Also calculates the extrusion vector of each join: ext[i] = calcExtrusionVector(dirs[i - 1], dirs[i]) for
+// i in [1, numVertices - 1) and, for closed paths, ext[numVertices - 1] and ext[0] (using the closing segment).
+// The results are bit-identical to calling vec2Dir()/calcExtrusionVector() for each segment/join (the SIMD
+// version performs exactly the same IEEE operations, 4 segments at a time; bx::rsqrt() is 1.0f / sqrt() on SSE).
+// Both arrays point into the stroker's scratch buffer (valid until the next call).
+static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint32_t numVertices, bool closed, const Vec2** dirsOut, const Vec2** extOut)
+{
+	VG_CHECK(numVertices >= 2, "Invalid number of vertices");
+	const uint32_t numDirs = closed ? numVertices : numVertices - 1;
+
+	// Layout: [dirs[0 .. numDirs) + 4 padding] [ext[0 .. numDirs) + 4 padding]
+	// The padding allows the SIMD code to always write 4 elements at a time.
+	const uint32_t required = numDirs * 2 + 8;
+	if (required > stroker->m_SegmentCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(required, stroker->m_SegmentCapacity + (stroker->m_SegmentCapacity >> 1));
+		// The old contents aren't needed so free the old buffer first.
+		if (stroker->m_SegmentBuffer) {
+			bx::alignedFree(stroker->m_Allocator, stroker->m_SegmentBuffer, 16);
+		}
+		stroker->m_SegmentBuffer = (Vec2*)bx::alignedAlloc(stroker->m_Allocator, sizeof(Vec2) * newCapacity, 16);
+		stroker->m_SegmentCapacity = newCapacity;
+	}
+
+	Vec2* dirs = stroker->m_SegmentBuffer;
+	Vec2* ext = dirs + numDirs + 4;
+
+#if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86
+	const __m128 xmm_one = _mm_set1_ps(1.0f);
+	const __m128 xmm_epsilon = _mm_set1_ps(VG_EPSILON);
+	const __m128 xmm_minCross = _mm_set1_ps(kMinExtrusionCross);
+	const __m128 xmm_absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+	const __m128 xmm_signMask = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000));
+
+	// The direction of the previous segment is in the last lane of prevDirX/Y. For the first join of a
+	// closed path it's the closing segment.
+	const Vec2 closingDir = closed ? vec2Dir(vtx[numVertices - 1], vtx[0]) : Vec2{ 0.0f, 0.0f };
+	__m128 prevDirX = _mm_set1_ps(closingDir.x);
+	__m128 prevDirY = _mm_set1_ps(closingDir.y);
+
+	for (uint32_t i = 0; i < numDirs; i += 4) {
+		// Load the start (a) and end (b) points of the 4 segments (SoA).
+		__m128 ax, ay, bx_, by;
+		if (i + 4 < numVertices) {
+			const float* src = &vtx[i].x;
+			const __m128 a01 = _mm_loadu_ps(src);     // { p0.x, p0.y, p1.x, p1.y }
+			const __m128 a23 = _mm_loadu_ps(src + 4); // { p2.x, p2.y, p3.x, p3.y }
+			const __m128 b01 = _mm_loadu_ps(src + 2); // { p1.x, p1.y, p2.x, p2.y }
+			const __m128 b23 = _mm_loadu_ps(src + 6); // { p3.x, p3.y, p4.x, p4.y }
+			ax = _mm_shuffle_ps(a01, a23, _MM_SHUFFLE(2, 0, 2, 0));
+			ay = _mm_shuffle_ps(a01, a23, _MM_SHUFFLE(3, 1, 3, 1));
+			bx_ = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(2, 0, 2, 0));
+			by = _mm_shuffle_ps(b01, b23, _MM_SHUFFLE(3, 1, 3, 1));
+		} else {
+			// Last group. It might include the closing segment. Points past the end are replaced by
+			// the first point (the lanes of non-existing segments are ignored).
+			uint32_t id[5];
+			for (uint32_t k = 0; k < 5; ++k) {
+				id[k] = i + k < numVertices ? i + k : 0;
+			}
+			ax = _mm_setr_ps(vtx[id[0]].x, vtx[id[1]].x, vtx[id[2]].x, vtx[id[3]].x);
+			ay = _mm_setr_ps(vtx[id[0]].y, vtx[id[1]].y, vtx[id[2]].y, vtx[id[3]].y);
+			bx_ = _mm_setr_ps(vtx[id[1]].x, vtx[id[2]].x, vtx[id[3]].x, vtx[id[4]].x);
+			by = _mm_setr_ps(vtx[id[1]].y, vtx[id[2]].y, vtx[id[3]].y, vtx[id[4]].y);
+		}
+
+		// Segment directions (vec2Dir())
+		const __m128 dx = _mm_sub_ps(bx_, ax);
+		const __m128 dy = _mm_sub_ps(by, ay);
+		const __m128 lenSqr = _mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy));
+		const __m128 invLen = _mm_andnot_ps(_mm_cmplt_ps(lenSqr, xmm_epsilon), _mm_div_ps(xmm_one, _mm_sqrt_ps(lenSqr)));
+		const __m128 d12x = _mm_mul_ps(dx, invLen);
+		const __m128 d12y = _mm_mul_ps(dy, invLen);
+
+		// Directions of the previous segments: { prev[3], cur[0], cur[1], cur[2] }
+		const __m128 tx = _mm_shuffle_ps(prevDirX, d12x, _MM_SHUFFLE(0, 0, 3, 3));
+		const __m128 ty = _mm_shuffle_ps(prevDirY, d12y, _MM_SHUFFLE(0, 0, 3, 3));
+		const __m128 d01x = _mm_shuffle_ps(tx, d12x, _MM_SHUFFLE(2, 1, 2, 0));
+		const __m128 d01y = _mm_shuffle_ps(ty, d12y, _MM_SHUFFLE(2, 1, 2, 0));
+
+		// Extrusion vectors (calcExtrusionVector()). cross = vec2Cross(d12, d01)
+		const __m128 cross = _mm_sub_ps(_mm_mul_ps(d12x, d01y), _mm_mul_ps(d01x, d12y));
+		const __m128 useMiter = _mm_cmpgt_ps(_mm_and_ps(cross, xmm_absMask), xmm_minCross);
+		const __m128 invCross = _mm_div_ps(xmm_one, cross);
+		const __m128 miterX = _mm_mul_ps(_mm_sub_ps(d01x, d12x), invCross);
+		const __m128 miterY = _mm_mul_ps(_mm_sub_ps(d01y, d12y), invCross);
+
+		// Fallback: vec2PerpCCW(d01) = { -d01.y, d01.x }
+		const __m128 vx = _mm_or_ps(_mm_and_ps(useMiter, miterX), _mm_andnot_ps(useMiter, _mm_xor_ps(d01y, xmm_signMask)));
+		const __m128 vy = _mm_or_ps(_mm_and_ps(useMiter, miterY), _mm_andnot_ps(useMiter, d01x));
+
+		float* dstDir = &dirs[i].x;
+		_mm_storeu_ps(dstDir, _mm_unpacklo_ps(d12x, d12y));
+		_mm_storeu_ps(dstDir + 4, _mm_unpackhi_ps(d12x, d12y));
+
+		float* dstExt = &ext[i].x;
+		_mm_storeu_ps(dstExt, _mm_unpacklo_ps(vx, vy));
+		_mm_storeu_ps(dstExt + 4, _mm_unpackhi_ps(vx, vy));
+
+		prevDirX = d12x;
+		prevDirY = d12y;
+	}
+#else
+	for (uint32_t i = 0; i < numDirs; ++i) {
+		dirs[i] = vec2Dir(vtx[i], vtx[i + 1 < numVertices ? i + 1 : 0]);
+	}
+
+	if (closed) {
+		ext[0] = calcExtrusionVector(dirs[numDirs - 1], dirs[0]);
+	}
+
+	for (uint32_t i = 1; i < numDirs; ++i) {
+		ext[i] = calcExtrusionVector(dirs[i - 1], dirs[i]);
+	}
+#endif
+
+	*dirsOut = dirs;
+	*extOut = ext;
+}
+
+// Calculates the arc of each round join in [firstJoin, lastJoin) (the calculations the join loops used to perform
+// for each join) so that the exact amount of geometry is known before generating it. projScale is the scale
+// of the extrusion vector used to determine the inner corner (hsw or hsw_aa, see the join loops). Returns the
+// arcs (indexed by join/segment ID) and the total number of arc points.
+static const RoundJoinArc* calcRoundJoinArcs(Stroker* stroker, const Vec2* dirs, const Vec2* ext, uint32_t numDirs, uint32_t firstJoin, uint32_t lastJoin, float projScale, float da, uint32_t* totalArcPoints)
+{
+	if (lastJoin > stroker->m_JoinCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(lastJoin, stroker->m_JoinCapacity + (stroker->m_JoinCapacity >> 1));
+		if (stroker->m_JoinBuffer) {
+			bx::alignedFree(stroker->m_Allocator, stroker->m_JoinBuffer, 16);
+		}
+		stroker->m_JoinBuffer = (RoundJoinArc*)bx::alignedAlloc(stroker->m_Allocator, sizeof(RoundJoinArc) * newCapacity, 16);
+		stroker->m_JoinCapacity = newCapacity;
+	}
+
+	RoundJoinArc* arcs = stroker->m_JoinBuffer;
+	uint32_t total = 0;
+	for (uint32_t iJoin = firstJoin; iJoin < lastJoin; ++iJoin) {
+		const Vec2 d01 = dirs[iJoin == 0 ? numDirs - 1 : iJoin - 1];
+		const Vec2 d12 = dirs[iJoin];
+		const Vec2 v_s = vec2Scale(ext[iJoin], projScale);
+
+		RoundJoinArc* arc = &arcs[iJoin];
+		const float leftPointProjDist = d12.x * v_s.x + d12.y * v_s.y;
+		if (leftPointProjDist >= 0.0f) {
+			// The left point is the inner corner. CCW angle from r01 to r12 in [0, 2*Pi)
+			const Vec2 arcDir = vec2ArcDir(vec2PerpCW(d01));
+			const Vec2 arcEndDir = vec2ArcDir(vec2PerpCW(d12));
+			float arcAngle = bx::atan2(vec2Cross(arcDir, arcEndDir), vec2Dot(arcDir, arcEndDir));
+			if (arcAngle < 0.0f) {
+				arcAngle += bx::kPi2;
+			}
+
+			const uint32_t numArcPoints = bx::max(2u, (uint32_t)(arcAngle / da));
+			const float arcDa = arcAngle / (float)numArcPoints;
+			arc->m_ArcDir = arcDir;
+			arc->m_CosDa = bx::cos(arcDa);
+			arc->m_SinDa = bx::sin(arcDa);
+			arc->m_NumArcPoints = numArcPoints;
+		} else {
+			// The right point is the inner corner. CW angle from l01 to l12 in (-2*Pi, 0]
+			const Vec2 arcDir = vec2ArcDir(vec2PerpCCW(d01));
+			const Vec2 arcEndDir = vec2ArcDir(vec2PerpCCW(d12));
+			float arcAngle = bx::atan2(vec2Cross(arcDir, arcEndDir), vec2Dot(arcDir, arcEndDir));
+			if (arcAngle > 0.0f) {
+				arcAngle -= bx::kPi2;
+			}
+
+			const uint32_t numArcPoints = bx::max(2u, (uint32_t)(-arcAngle / da));
+			const float arcDa = arcAngle / (float)numArcPoints;
+			arc->m_ArcDir = arcDir;
+			arc->m_CosDa = bx::cos(arcDa);
+			arc->m_SinDa = bx::sin(arcDa);
+			arc->m_NumArcPoints = numArcPoints;
+		}
+
+		total += arc->m_NumArcPoints;
+	}
+
+	*totalArcPoints = total;
+	return arcs;
 }
 
 Stroker* createStroker(bx::AllocatorI* allocator)
@@ -322,6 +602,26 @@ void destroyStroker(Stroker* stroker)
 		bx::alignedFree(allocator, stroker->m_FanIndexBuffer, 16);
 	}
 
+	if (stroker->m_SegmentBuffer) {
+		bx::alignedFree(allocator, stroker->m_SegmentBuffer, 16);
+	}
+
+	if (stroker->m_JoinBuffer) {
+		bx::alignedFree(allocator, stroker->m_JoinBuffer, 16);
+	}
+
+	if (stroker->m_VertexMap) {
+		bx::alignedFree(allocator, stroker->m_VertexMap, 16);
+	}
+
+	if (stroker->m_ContourVertices) {
+		bx::alignedFree(allocator, stroker->m_ContourVertices, 16);
+	}
+
+	if (stroker->m_ContourSizes) {
+		bx::alignedFree(allocator, stroker->m_ContourSizes, 16);
+	}
+
 	if (stroker->m_Tesselator) {
 		tessDeleteTess(stroker->m_Tesselator);
 	}
@@ -340,7 +640,7 @@ void strokerReset(Stroker* stroker, float scale, float tesselationTolerance, flo
 	stroker->m_FringeWidth = fringeWidth;
 }
 
-void strokerPolylineStroke(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numPathVertices, bool isClosed, float strokeWidth, LineCap::Enum lineCap, LineJoin::Enum lineJoin)
+void strokerPolylineStroke(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numPathVertices, bool isClosed, float strokeWidth, LineCap::Enum lineCap, LineJoin::Enum lineJoin, const StrokerSink* sink)
 {
 	const uint8_t perm = (((uint8_t)lineCap) << 1)
 		| (((uint8_t)lineJoin) << 3)
@@ -349,26 +649,26 @@ void strokerPolylineStroke(Stroker* stroker, Mesh* mesh, const float* vertexList
 	const Vec2* vtx = (const Vec2*)vertexList;
 
 	switch (perm) {
-	case  0: polylineStroke<false, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth);   break;
-	case  1: polylineStroke<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
-	case  2: polylineStroke<false, LineCap::Round, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth);  break;
-	case  3: polylineStroke<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
-	case  4: polylineStroke<false, LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth); break;
-	case  5: polylineStroke<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
+	case  0: polylineStroke<false, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);   break;
+	case  1: polylineStroke<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
+	case  2: polylineStroke<false, LineCap::Round, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);  break;
+	case  3: polylineStroke<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
+	case  4: polylineStroke<false, LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink); break;
+	case  5: polylineStroke<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
 		// 6 to 7 == invalid line cap type
-	case  8: polylineStroke<false, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth);   break;
-	case  9: polylineStroke<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
-	case 10: polylineStroke<false, LineCap::Round, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth);  break;
-	case 11: polylineStroke<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
-	case 12: polylineStroke<false, LineCap::Square, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth); break;
-	case 13: polylineStroke<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
+	case  8: polylineStroke<false, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);   break;
+	case  9: polylineStroke<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
+	case 10: polylineStroke<false, LineCap::Round, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);  break;
+	case 11: polylineStroke<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
+	case 12: polylineStroke<false, LineCap::Square, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink); break;
+	case 13: polylineStroke<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
 		// 14 to 15 == invalid line cap type
-	case 16: polylineStroke<false, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth);   break;
-	case 17: polylineStroke<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
-	case 18: polylineStroke<false, LineCap::Round, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth);  break;
-	case 19: polylineStroke<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
-	case 20: polylineStroke<false, LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth); break;
-	case 21: polylineStroke<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth);    break;
+	case 16: polylineStroke<false, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);   break;
+	case 17: polylineStroke<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
+	case 18: polylineStroke<false, LineCap::Round, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);  break;
+	case 19: polylineStroke<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
+	case 20: polylineStroke<false, LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink); break;
+	case 21: polylineStroke<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, sink);    break;
 		// 22 to 32 == invalid line join type
 	default:
 		VG_WARN(false, "Invalid stroke configuration");
@@ -376,7 +676,7 @@ void strokerPolylineStroke(Stroker* stroker, Mesh* mesh, const float* vertexList
 	}
 }
 
-void strokerPolylineStrokeAA(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numPathVertices, bool isClosed, Color color, float strokeWidth, LineCap::Enum lineCap, LineJoin::Enum lineJoin)
+void strokerPolylineStrokeAA(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numPathVertices, bool isClosed, Color color, float strokeWidth, LineCap::Enum lineCap, LineJoin::Enum lineJoin, const StrokerSink* sink)
 {
 	const uint8_t perm = (((uint8_t)lineCap) << 1)
 		| (((uint8_t)lineJoin) << 3)
@@ -385,26 +685,26 @@ void strokerPolylineStrokeAA(Stroker* stroker, Mesh* mesh, const float* vertexLi
 	const Vec2* vtx = (const Vec2*)vertexList;
 
 	switch (perm) {
-	case  0: polylineStrokeAA<false, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);   break;
-	case  1: polylineStrokeAA<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
-	case  2: polylineStrokeAA<false, LineCap::Round, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);  break;
-	case  3: polylineStrokeAA<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
-	case  4: polylineStrokeAA<false, LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color); break;
-	case  5: polylineStrokeAA<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
+	case  0: polylineStrokeAA<false, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);   break;
+	case  1: polylineStrokeAA<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
+	case  2: polylineStrokeAA<false, LineCap::Round, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);  break;
+	case  3: polylineStrokeAA<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
+	case  4: polylineStrokeAA<false, LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink); break;
+	case  5: polylineStrokeAA<true, LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
 		// 6 to 7 == invalid line cap type
-	case  8: polylineStrokeAA<false, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);   break;
-	case  9: polylineStrokeAA<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
-	case 10: polylineStrokeAA<false, LineCap::Round, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);  break;
-	case 11: polylineStrokeAA<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
-	case 12: polylineStrokeAA<false, LineCap::Square, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color); break;
-	case 13: polylineStrokeAA<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
+	case  8: polylineStrokeAA<false, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);   break;
+	case  9: polylineStrokeAA<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
+	case 10: polylineStrokeAA<false, LineCap::Round, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);  break;
+	case 11: polylineStrokeAA<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
+	case 12: polylineStrokeAA<false, LineCap::Square, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink); break;
+	case 13: polylineStrokeAA<true, LineCap::Butt, LineJoin::Round>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
 		// 14 to 15 == invalid line cap type
-	case 16: polylineStrokeAA<false, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);   break;
-	case 17: polylineStrokeAA<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
-	case 18: polylineStrokeAA<false, LineCap::Round, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);  break;
-	case 19: polylineStrokeAA<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
-	case 20: polylineStrokeAA<false, LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color); break;
-	case 21: polylineStrokeAA<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color);    break;
+	case 16: polylineStrokeAA<false, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);   break;
+	case 17: polylineStrokeAA<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
+	case 18: polylineStrokeAA<false, LineCap::Round, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);  break;
+	case 19: polylineStrokeAA<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
+	case 20: polylineStrokeAA<false, LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink); break;
+	case 21: polylineStrokeAA<true, LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, strokeWidth, color, sink);    break;
 		// 22 to 32 == invalid line join type
 	default:
 		VG_WARN(false, "Invalid stroke configuration");
@@ -412,7 +712,7 @@ void strokerPolylineStrokeAA(Stroker* stroker, Mesh* mesh, const float* vertexLi
 	}
 }
 
-void strokerPolylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numPathVertices, bool isClosed, Color color, LineCap::Enum lineCap, LineJoin::Enum lineJoin)
+void strokerPolylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numPathVertices, bool isClosed, Color color, LineCap::Enum lineCap, LineJoin::Enum lineJoin, const StrokerSink* sink)
 {
 	// TODO: Why is isClosed passed as argument instead of template param?
 	const uint8_t perm = ((uint8_t)lineCap) | (((uint8_t)lineJoin) << 2);
@@ -420,15 +720,15 @@ void strokerPolylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const float* vert
 	const Vec2* vtx = (const Vec2*)vertexList;
 
 	switch (perm) {
-	case  0: polylineStrokeAAThin<LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case  1: polylineStrokeAAThin<LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case  2: polylineStrokeAAThin<LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case  4: polylineStrokeAAThin<LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case  5: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case  6: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case  8: polylineStrokeAAThin<LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case  9: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
-	case 10: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed);   break;
+	case  0: polylineStrokeAAThin<LineCap::Butt, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case  1: polylineStrokeAAThin<LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case  2: polylineStrokeAAThin<LineCap::Square, LineJoin::Miter>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case  4: polylineStrokeAAThin<LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case  5: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case  6: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case  8: polylineStrokeAAThin<LineCap::Butt, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case  9: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
+	case 10: polylineStrokeAAThin<LineCap::Square, LineJoin::Bevel>(stroker, mesh, vtx, numPathVertices, color, isClosed, sink);   break;
 	default:
 		VG_WARN(false, "Invalid stroke configuration");
 		break;
@@ -469,7 +769,7 @@ void strokerConvexFill(Stroker* stroker, Mesh* mesh, const float* vertexList, ui
 }
 
 #if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86
-void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numVertices, uint32_t color)
+void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numVertices, uint32_t color, const StrokerSink* sink)
 {
 	VG_CHECK(numVertices >= 3, "Invalid number of vertices");
 
@@ -491,20 +791,20 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 	const uint32_t numDrawVertices = numVertices * 2; // original polygon point + AA fringe point.
 	const uint32_t numDrawIndices = numTris * 3;
 
-	resetGeometry(stroker);
+	GeometryOutput out;
+	beginGeometry(stroker, sink, numDrawVertices, numDrawIndices, true, &out);
 
 	// Vertex buffer
 	{
-		expandVB(stroker, numDrawVertices);
-
 		const __m128 vtxLast = _mm_loadl_pi(_mm_setzero_ps(), (const __m64*)(vertexList + (lastVertexID << 1)));
 		__m128 d01 = xmm_vec2_dir(vtxLast, vtx0);
 		__m128 p1 = vtx0;
 
 		const float* srcPos = vertexList + 2;
-		float* dstPos = &stroker->m_PosBuffer->x;
+		float* dstPos = &out.m_Pos->x;
 
 		const __m128 xmm_epsilon = _mm_set_ps1(VG_EPSILON);
+		const __m128 xmm_minExtrusionCross = _mm_set_ps1(kMinExtrusionCross);
 		const __m128 xmm_absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
 		const __m128 vec2x2_perpCCW_xorMask = _mm_castsi128_ps(_mm_set_epi32(0, 0x80000000, 0, 0x80000000));
 
@@ -544,7 +844,7 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 			const __m128 d34_45 = _mm_mul_ps(d34_45_unorm, invLen34_45_masked);
 
 			// Calculate the 4 extrusion vectors for the 4 points based on the equ
-			// abs(cross(d12, d01) > epsilon ? ((d01 - d12) / cross(d12, d01)) : rot90CCW(d01)
+			// abs(cross(d12, d01)) > kMinExtrusionCross ? ((d01 - d12) / cross(d12, d01)) : rot90CCW(d01)
 			const __m128 v012_123_fake = _mm_xor_ps(_mm_shuffle_ps(d01, d12_23, _MM_SHUFFLE(0, 1, 0, 1)), vec2x2_perpCCW_xorMask);
 			const __m128 v234_345_fake = _mm_xor_ps(_mm_shuffle_ps(d12_23, d34_45, _MM_SHUFFLE(0, 1, 2, 3)), vec2x2_perpCCW_xorMask);
 
@@ -569,7 +869,7 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 
 			const __m128 inv_cross012_123_234_345 = xmm_rcp(cross012_123_234_345);
 
-			const __m128 cross_gt_eps012_123_234_345 = _mm_cmpgt_ps(_mm_and_ps(cross012_123_234_345, xmm_absMask), xmm_epsilon);
+			const __m128 cross_gt_eps012_123_234_345 = _mm_cmpgt_ps(_mm_and_ps(cross012_123_234_345, xmm_absMask), xmm_minExtrusionCross);
 
 			const __m128 inv_cross012_123 = _mm_shuffle_ps(inv_cross012_123_234_345, inv_cross012_123_234_345, _MM_SHUFFLE(1, 1, 0, 0));
 			const __m128 inv_cross234_345 = _mm_shuffle_ps(inv_cross012_123_234_345, inv_cross012_123_234_345, _MM_SHUFFLE(3, 3, 2, 2));
@@ -607,10 +907,10 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 			const __m128 p4_in_out = _mm_shuffle_ps(posEdge34, negEdge34, _MM_SHUFFLE(3, 2, 3, 2));
 
 			// Store the fringe points
-			_mm_store_ps(dstPos + 0, p1_in_out);
-			_mm_store_ps(dstPos + 4, p2_in_out);
-			_mm_store_ps(dstPos + 8, p3_in_out);
-			_mm_store_ps(dstPos + 12, p4_in_out);
+			_mm_storeu_ps(dstPos + 0, p1_in_out);
+			_mm_storeu_ps(dstPos + 4, p2_in_out);
+			_mm_storeu_ps(dstPos + 8, p3_in_out);
+			_mm_storeu_ps(dstPos + 12, p4_in_out);
 
 			// Move on to the next iteration.
 			d01 = _mm_movehl_ps(d34_45, d34_45);
@@ -662,7 +962,7 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 			const __m128 d012xy_d123xy = _mm_sub_ps(d01xy_d12xy, d12xy_d23xy);
 			const __m128 v012_123_true = _mm_mul_ps(d012xy_d123xy, inv_cross012_123);
 
-			const __m128 cross_gt_eps = _mm_cmpgt_ps(_mm_and_ps(cross012_123, xmm_absMask), xmm_epsilon);
+			const __m128 cross_gt_eps = _mm_cmpgt_ps(_mm_and_ps(cross012_123, xmm_absMask), xmm_minExtrusionCross);
 			const __m128 v012_123_true_masked = _mm_and_ps(cross_gt_eps, v012_123_true);
 			const __m128 v012_123_fake_masked = _mm_andnot_ps(cross_gt_eps, v012_123_fake);
 			const __m128 v012_123 = _mm_or_ps(v012_123_true_masked, v012_123_fake_masked);
@@ -675,8 +975,8 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 			const __m128 packed0 = _mm_shuffle_ps(posEdge, negEdge, _MM_SHUFFLE(1, 0, 1, 0));
 			const __m128 packed1 = _mm_shuffle_ps(posEdge, negEdge, _MM_SHUFFLE(3, 2, 3, 2));
 
-			_mm_store_ps(dstPos, packed0);
-			_mm_store_ps(dstPos + 4, packed1);
+			_mm_storeu_ps(dstPos, packed0);
+			_mm_storeu_ps(dstPos + 4, packed1);
 
 			dstPos += 8;
 			srcPos += 4;
@@ -691,7 +991,7 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 			const __m128 d12 = xmm_vec2_dir(p1, p2);
 			const __m128 v_aa = _mm_mul_ps(xmm_calcExtrusionVector(d01, d12), xmm_aa);
 			const __m128 packed = _mm_movelh_ps(_mm_add_ps(p1, v_aa), _mm_sub_ps(p1, v_aa));
-			_mm_store_ps(dstPos, packed);
+			_mm_storeu_ps(dstPos, packed);
 
 			dstPos += 4;
 			srcPos += 2;
@@ -703,20 +1003,17 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 		{
 			const __m128 v_aa = _mm_mul_ps(xmm_calcExtrusionVector(d01, xmm_vec2_dir(p1, vtx0)), xmm_aa);
 			const __m128 packed = _mm_movelh_ps(_mm_add_ps(p1, v_aa), _mm_sub_ps(p1, v_aa));
-			_mm_store_ps(dstPos, packed);
+			_mm_storeu_ps(dstPos, packed);
 		}
 
 		const uint32_t colors[2] = { color, c0 };
-		vgutil::memset64(stroker->m_ColorBuffer, numVertices, &colors[0]);
+		vgutil::memset64(out.m_Color, numVertices, &colors[0]);
 
-		stroker->m_NumVertices += numDrawVertices;
 	}
 
 	// Index buffer
 	{
-		expandIB(stroker, numDrawIndices);
-
-		uint16_t* dstIndex = stroker->m_IndexBuffer;
+		uint16_t* dstIndex = out.m_Index;
 
 		// First fringe quad
 		dstIndex[0] = 0; dstIndex[1] = 1; dstIndex[2] = 3;
@@ -805,17 +1102,12 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 		dstIndex[4] = 1;
 		dstIndex[5] = 0;
 
-		stroker->m_NumIndices += numDrawIndices;
 	}
 
-	mesh->m_PosBuffer = &stroker->m_PosBuffer[0].x;
-	mesh->m_ColorBuffer = stroker->m_ColorBuffer;
-	mesh->m_IndexBuffer = stroker->m_IndexBuffer;
-	mesh->m_NumVertices = stroker->m_NumVertices;
-	mesh->m_NumIndices = stroker->m_NumIndices;
+	endGeometry(stroker, &out, out.m_Pos + numDrawVertices, out.m_Index + numDrawIndices, true, mesh);
 }
 #else
-void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numVertices, uint32_t color)
+void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, uint32_t numVertices, uint32_t color, const StrokerSink* sink)
 {
 	// Determine path orientation by checking the normal of the first triangle
 	// WARNING: Might not work in all cases.
@@ -834,15 +1126,14 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 	const uint32_t numDrawVertices = numVertices * 2; // original polygon point + AA fringe point.
 	const uint32_t numDrawIndices = numTris * 3;
 
-	resetGeometry(stroker);
+	GeometryOutput out;
+	beginGeometry(stroker, sink, numDrawVertices, numDrawIndices, true, &out);
 
 	// Vertex buffer
 	{
-		expandVB(stroker, numDrawVertices);
-
 		Vec2 d01 = vec2Dir(vtx[numVertices - 1], vtx[0]);
 
-		Vec2* dstPos = stroker->m_PosBuffer;
+		Vec2* dstPos = out.m_Pos;
 		for (uint32_t iSegment = 0; iSegment < numVertices; ++iSegment) {
 			const Vec2& p1 = vtx[iSegment];
 			const Vec2& p2 = vtx[iSegment == numVertices - 1 ? 0 : iSegment + 1];
@@ -859,16 +1150,13 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 		}
 
 		const uint32_t colors[2] = { color, c0 };
-		vgutil::memset64(stroker->m_ColorBuffer, numVertices, &colors[0]);
+		vgutil::memset64(out.m_Color, numVertices, &colors[0]);
 
-		stroker->m_NumVertices += numDrawVertices;
 	}
 
 	// Index buffer
 	{
-		expandIB(stroker, numDrawIndices);
-
-		uint16_t* dstIndex = stroker->m_IndexBuffer;
+		uint16_t* dstIndex = out.m_Index;
 
 		// Generate the triangle fan (original polygon)
 		const uint32_t numFanTris = numVertices - 2;
@@ -900,18 +1188,14 @@ void strokerConvexFillAA(Stroker* stroker, Mesh* mesh, const float* vertexList, 
 		*dstIndex++ = 1;
 		*dstIndex++ = 0;
 
-		stroker->m_NumIndices += numDrawIndices;
 	}
 
-	mesh->m_PosBuffer = &stroker->m_PosBuffer[0].x;
-	mesh->m_ColorBuffer = stroker->m_ColorBuffer;
-	mesh->m_IndexBuffer = stroker->m_IndexBuffer;
-	mesh->m_NumVertices = stroker->m_NumVertices;
-	mesh->m_NumIndices = stroker->m_NumIndices;
+	endGeometry(stroker, &out, out.m_Pos + numDrawVertices, out.m_Index + numDrawIndices, true, mesh);
 }
 #endif
 
-bool strokerConcaveFillBegin(Stroker* stroker)
+// (Re)creates the tesselator and resets the scratch memory.
+static void resetTesselator(Stroker* stroker)
 {
 	// Delete old tesselator
 	if (stroker->m_Tesselator) {
@@ -945,13 +1229,35 @@ bool strokerConcaveFillBegin(Stroker* stroker)
 #else
 	stroker->m_Tesselator = tessNewTess(nullptr);
 #endif
+}
 
+bool strokerConcaveFillBegin(Stroker* stroker)
+{
+	resetTesselator(stroker);
+	stroker->m_NumContourVertices = 0;
+	stroker->m_NumContours = 0;
 	return true;
 }
 
 void strokerConcaveFillAddContour(Stroker* stroker, const float* vertexList, uint32_t numVertices)
 {
 	tessAddContour(stroker->m_Tesselator, 2, vertexList, sizeof(float) * 2, numVertices);
+
+	// Keep a copy of the contours in case strokerConcaveFillEndAA() has to tesselate them again.
+	if (stroker->m_NumContourVertices + numVertices > stroker->m_ContourVertexCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(stroker->m_NumContourVertices + numVertices, stroker->m_ContourVertexCapacity + (stroker->m_ContourVertexCapacity >> 1));
+		stroker->m_ContourVertices = (Vec2*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_ContourVertices, sizeof(Vec2) * newCapacity, 16);
+		stroker->m_ContourVertexCapacity = newCapacity;
+	}
+	if (stroker->m_NumContours + 1 > stroker->m_ContourCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(16, stroker->m_ContourCapacity * 2);
+		stroker->m_ContourSizes = (uint32_t*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_ContourSizes, sizeof(uint32_t) * newCapacity, 16);
+		stroker->m_ContourCapacity = newCapacity;
+	}
+
+	bx::memCopy(&stroker->m_ContourVertices[stroker->m_NumContourVertices], vertexList, sizeof(Vec2) * numVertices);
+	stroker->m_NumContourVertices += numVertices;
+	stroker->m_ContourSizes[stroker->m_NumContours++] = numVertices;
 }
 
 bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule)
@@ -977,140 +1283,283 @@ bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule
 	return true;
 }
 
-bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillRule::Enum fillRule)
+// Generates the AA fringes of the boundary contours of a tesselated area (with the interior on their left side):
+// 2 vertices per contour vertex (inner, outer) and a quad (6 indices) per contour segment. Contour i consists of
+// contours[i * 2 + 1] vertices; its j-th vertex is vertices[indices[contours[i * 2] + j]] (indices can be null for
+// sequential contour vertices).
+// NOTE: Compared to the previous implementation of strokerConcaveFillEndAA(), the fringe is also generated when the
+// first vertex of a contour is collinear with its neighbors (bx::sign(cross) == 0 used to disable AA for the whole
+// contour) and the direction of the closing segment is calculated from the original first vertex (instead of the
+// already inset one).
+static void generateFringes(Vec2* dstPos, Color* dstColor, uint16_t* dstIndex, const Vec2* vertices, const TESSindex* contours, uint32_t numContours, const TESSindex* indices, float fringeWidth, Color color)
 {
-	const int windingRule = fillRule == vg::FillRule::NonZero ? TESS_WINDING_NONZERO : TESS_WINDING_ODD;
+	// The inner vertex is p + v * aa (the interior is on the left side of the contour).
+	const float aa = fringeWidth * 0.5f;
 	const Color c0 = colorSetAlpha(color, 0);
+	for (uint32_t iContour = 0; iContour < numContours; ++iContour) {
+		const uint32_t first = contours[iContour * 2 + 0];
+		const uint32_t numContourVertices = contours[iContour * 2 + 1];
 
-	uint32_t nextVertexID = 0;
-	uint32_t nextIndexID = 0;
+		Vec2 d01 = vec2Dir(vertices[indices ? indices[first + numContourVertices - 1] : first + numContourVertices - 1], vertices[indices ? indices[first] : first]);
+		for (uint32_t i = 0; i < numContourVertices; ++i) {
+			const uint32_t i2 = i + 1 == numContourVertices ? 0 : i + 1;
+			const Vec2& p1 = vertices[indices ? indices[first + i] : first + i];
+			const Vec2& p2 = vertices[indices ? indices[first + i2] : first + i2];
 
-	resetGeometry(stroker);
+			const Vec2 d12 = vec2Dir(p1, p2);
+			const Vec2 v_aa = vec2Scale(calcExtrusionVector(d01, d12), aa);
 
-	// Generate fringes
+			dstPos[0] = vec2Add(p1, v_aa);
+			dstPos[1] = vec2Sub(p1, v_aa);
+			dstColor[0] = color;
+			dstColor[1] = c0;
+			dstPos += 2;
+			dstColor += 2;
+
+			d01 = d12;
+		}
+
+		const uint16_t firstID = (uint16_t)(first * 2);
+		const uint32_t numSegments = numContourVertices - 1;
+		for (uint32_t iSegment = 0; iSegment < numSegments; ++iSegment) {
+			const uint16_t id0 = (uint16_t)(firstID + iSegment * 2);
+			dstIndex[0] = id0;
+			dstIndex[1] = (uint16_t)(id0 + 2);
+			dstIndex[2] = (uint16_t)(id0 + 1);
+			dstIndex[3] = (uint16_t)(id0 + 2);
+			dstIndex[4] = (uint16_t)(id0 + 3);
+			dstIndex[5] = (uint16_t)(id0 + 1);
+			dstIndex += 6;
+		}
+
+		// Last (closing) segment
+		{
+			const uint16_t id0 = (uint16_t)(firstID + numSegments * 2);
+			dstIndex[0] = id0;
+			dstIndex[1] = firstID;
+			dstIndex[2] = (uint16_t)(id0 + 1);
+			dstIndex[3] = firstID;
+			dstIndex[4] = (uint16_t)(firstID + 1);
+			dstIndex[5] = (uint16_t)(id0 + 1);
+			dstIndex += 6;
+		}
+	}
+}
+
+// Tesselates the inset boundary contours (the inner fringe vertices generated by generateFringes() into the stroker's
+// buffers, 'numFringeVertices' vertices and 'numFringeIndices' indices) and appends the triangles to the stroker's
+// buffers. NOTE: Invalidates the current output of the tesselator.
+static bool tesselateInsetContours(Stroker* stroker, const TESSindex* contours, uint32_t numContours, uint32_t numFringeVertices, uint32_t numFringeIndices, int windingRule, Color color)
+{
+	TESStesselator* tess = stroker->m_Tesselator;
+	for (uint32_t iContour = 0; iContour < numContours; ++iContour) {
+		const uint32_t first = contours[iContour * 2 + 0];
+		const uint32_t numContourVertices = contours[iContour * 2 + 1];
+		tessAddContour(tess, 2, &stroker->m_PosBuffer[first * 2], sizeof(Vec2) * 2, (int)numContourVertices);
+	}
+
 	const float normal[3] = { 0.0f, 0.0f, 1.0f };
-	if (!tessTesselate(stroker->m_Tesselator, windingRule, TESS_BOUNDARY_CONTOURS, 1, 2, &normal[0])) {
-		return false;
-	}
-	
-	const float* contourVerts = tessGetVertices(stroker->m_Tesselator);
-	const TESSindex* contourData = tessGetElements(stroker->m_Tesselator);
-	const int numContours = tessGetElementCount(stroker->m_Tesselator);
-
-	for (int i = 0; i < numContours; ++i) {
-		const TESSindex firstContourVertexID = contourData[i * 2];
-		const TESSindex numContourVertices = contourData[i * 2 + 1];
-
-		// Vertices
-		expandVB(stroker, numContourVertices * 2);
-		{
-			Vec2* vtx = (Vec2*)&contourVerts[firstContourVertexID * 2];
-			Vec2 d01 = vec2Dir(vtx[numContourVertices - 1], vtx[0]);
-			const float crossSign = bx::sign(vec2Cross(d01, vec2Dir(vtx[0], vtx[1])));
-			const float aa = stroker->m_FringeWidth * 0.5f * crossSign;
-			const uint32_t inner = crossSign < 0 ? 0 : 1;
-
-			Vec2* dstPos = &stroker->m_PosBuffer[nextVertexID];
-			Color* dstColor = &stroker->m_ColorBuffer[nextVertexID];
-			for (uint32_t iSegment = 0; iSegment < numContourVertices; ++iSegment) {
-				const Vec2& p1 = vtx[iSegment];
-				const Vec2& p2 = vtx[iSegment == (uint32_t)(numContourVertices - 1) ? 0 : iSegment + 1];
-
-				const Vec2 d12 = vec2Dir(p1, p2);
-				const Vec2 v = calcExtrusionVector(d01, d12);
-				const Vec2 v_aa = vec2Scale(v, aa);
-
-				const Vec2 p[2] = {
-					vec2Sub(p1, v_aa),
-					vec2Add(p1, v_aa)
-				};
-
-				// Fringe vertices
-				*dstPos++ = p[inner];
-				*dstPos++ = p[1 - inner];
-				*dstColor++ = color;
-				*dstColor++ = c0;
-
-				// Update contour vertex
-				vtx[iSegment] = p[inner];
-
-				d01 = d12;
-			}
-
-			stroker->m_NumVertices += numContourVertices * 2;
-		}
-
-		// Indices
-		expandIB(stroker, numContourVertices * 6);
-		{
-			uint16_t* dstIndex = &stroker->m_IndexBuffer[nextIndexID];
-
-			const uint32_t numSegments = numContourVertices - 1;
-			for (uint32_t iSegment = 0; iSegment < numSegments; ++iSegment) {
-				const uint16_t id0 = (uint16_t)(nextVertexID + iSegment * 2 + 0);
-				const uint16_t id1 = (uint16_t)(nextVertexID + iSegment * 2 + 1);
-				const uint16_t id2 = (uint16_t)(nextVertexID + iSegment * 2 + 2);
-				const uint16_t id3 = (uint16_t)(nextVertexID + iSegment * 2 + 3);
-
-				dstIndex[0] = id0;
-				dstIndex[1] = id2;
-				dstIndex[2] = id1;
-				dstIndex[3] = id2;
-				dstIndex[4] = id3;
-				dstIndex[5] = id1;
-				dstIndex += 6;
-			}
-
-			// Last (closing) segment
-			{
-				const uint16_t id0 = (uint16_t)(nextVertexID + numSegments * 2 + 0);
-				const uint16_t id1 = (uint16_t)(nextVertexID + numSegments * 2 + 1);
-				const uint16_t id2 = (uint16_t)(nextVertexID + 0);
-				const uint16_t id3 = (uint16_t)(nextVertexID + 1);
-
-				dstIndex[0] = id0;
-				dstIndex[1] = id2;
-				dstIndex[2] = id1;
-				dstIndex[3] = id2;
-				dstIndex[4] = id3;
-				dstIndex[5] = id1;
-			}
-
-			stroker->m_NumIndices += numContourVertices * 6;
-		}
-
-		tessAddContour(stroker->m_Tesselator, 2, &contourVerts[firstContourVertexID * 2], sizeof(float) * 2, numContourVertices);
-
-		nextIndexID += numContourVertices * 6;
-		nextVertexID += numContourVertices * 2;
-	}
-
-	// Generate interior
-	if (!tessTesselate(stroker->m_Tesselator, windingRule, TESS_POLYGONS, 3, 2, &normal[0])) {
+	if (!tessTesselate(tess, windingRule, TESS_POLYGONS, 3, 2, &normal[0])) {
 		return false;
 	}
 
-	const uint32_t numTessVertices = (uint32_t)tessGetVertexCount(stroker->m_Tesselator);
-	expandVB(stroker, numTessVertices);
-	{
-		const float* tessVertices = tessGetVertices(stroker->m_Tesselator);
-		bx::memCopy(&stroker->m_PosBuffer[nextVertexID], tessVertices, sizeof(Vec2) * numTessVertices);
-		vgutil::memset32(&stroker->m_ColorBuffer[nextVertexID], numTessVertices, &color);
-		stroker->m_NumVertices += numTessVertices;
+	stroker->m_NumVertices = numFringeVertices;
+	stroker->m_NumIndices = numFringeIndices;
+
+	const uint32_t numInsetVertices = (uint32_t)tessGetVertexCount(tess);
+	expandVB(stroker, numInsetVertices);
+	bx::memCopy(&stroker->m_PosBuffer[numFringeVertices], tessGetVertices(tess), sizeof(Vec2) * numInsetVertices);
+	vgutil::memset32(&stroker->m_ColorBuffer[numFringeVertices], numInsetVertices, &color);
+	stroker->m_NumVertices += numInsetVertices;
+
+	const uint32_t numInsetIndices = (uint32_t)tessGetElementCount(tess) * 3;
+	expandIB(stroker, numInsetIndices);
+	vgutil::batchTransformDrawIndices(tessGetElements(tess), numInsetIndices, &stroker->m_IndexBuffer[numFringeIndices], (uint16_t)numFringeVertices);
+	stroker->m_NumIndices += numInsetIndices;
+
+	return true;
+}
+
+// Returns a copy of the tesselator's boundary contour ranges (needed by tesselateInsetContours() after the tesselator's
+// output has been freed). The copy is stored in the stroker's vertex map buffer.
+static const TESSindex* copyContours(Stroker* stroker, const TESSindex* contours, uint32_t numContours)
+{
+	if (numContours > stroker->m_VertexMapCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(numContours, stroker->m_VertexMapCapacity + (stroker->m_VertexMapCapacity >> 1));
+		if (stroker->m_VertexMap) {
+			bx::alignedFree(stroker->m_Allocator, stroker->m_VertexMap, 16);
+		}
+		stroker->m_VertexMap = (uint32_t*)bx::alignedAlloc(stroker->m_Allocator, sizeof(uint32_t) * newCapacity, 16);
+		stroker->m_VertexMapCapacity = newCapacity;
 	}
 
-	const uint32_t numTessIndices = tessGetElementCount(stroker->m_Tesselator) * 3;
-	expandIB(stroker, numTessIndices);
-	{
-		vgutil::batchTransformDrawIndices(tessGetElements(stroker->m_Tesselator), numTessIndices, &stroker->m_IndexBuffer[nextIndexID], (uint16_t)nextVertexID);
-		stroker->m_NumIndices += numTessIndices;
-	}
+	TESSindex* copy = (TESSindex*)stroker->m_VertexMap;
+	bx::memCopy(copy, contours, sizeof(TESSindex) * 2 * numContours);
+	return copy;
+}
 
+static void setMeshFromStrokerBuffers(Stroker* stroker, Mesh* mesh)
+{
 	mesh->m_PosBuffer = &stroker->m_PosBuffer[0].x;
 	mesh->m_ColorBuffer = stroker->m_ColorBuffer;
 	mesh->m_IndexBuffer = stroker->m_IndexBuffer;
 	mesh->m_NumVertices = stroker->m_NumVertices;
 	mesh->m_NumIndices = stroker->m_NumIndices;
+}
+
+// The original 2 sweep algorithm: tesselate the boundary contours, generate the fringes and tesselate the inset
+// contours. Used when the single sweep version fails (e.g. it requires more memory).
+static bool concaveFillEndAATwoSweeps(Stroker* stroker, Mesh* mesh, uint32_t color, int windingRule)
+{
+	// The tesselator's mesh has been consumed. Tesselate the contours again.
+	resetTesselator(stroker);
+	TESStesselator* tess = stroker->m_Tesselator;
+	const Vec2* contourVertices = stroker->m_ContourVertices;
+	for (uint32_t i = 0; i < stroker->m_NumContours; ++i) {
+		tessAddContour(tess, 2, contourVertices, sizeof(Vec2), (int)stroker->m_ContourSizes[i]);
+		contourVertices += stroker->m_ContourSizes[i];
+	}
+
+	const float normal[3] = { 0.0f, 0.0f, 1.0f };
+	if (!tessTesselate(tess, windingRule, TESS_BOUNDARY_CONTOURS, 1, 2, &normal[0])) {
+		return false;
+	}
+
+	const uint32_t numContours = (uint32_t)tessGetElementCount(tess);
+	if (numContours == 0) {
+		return false;
+	}
+
+	const uint32_t numBoundaryVertices = (uint32_t)tessGetVertexCount(tess);
+	const uint32_t numFringeVertices = numBoundaryVertices * 2;
+	const uint32_t numFringeIndices = numBoundaryVertices * 6;
+
+	resetGeometry(stroker);
+	expandVB(stroker, numFringeVertices);
+	expandIB(stroker, numFringeIndices);
+	const TESSindex* contours = tessGetElements(tess);
+	generateFringes(stroker->m_PosBuffer, stroker->m_ColorBuffer, stroker->m_IndexBuffer, (const Vec2*)tessGetVertices(tess), contours, numContours, nullptr, stroker->m_FringeWidth, color);
+
+	if (!tesselateInsetContours(stroker, copyContours(stroker, contours, numContours), numContours, numFringeVertices, numFringeIndices, windingRule, color)) {
+		return false;
+	}
+
+	setMeshFromStrokerBuffers(stroker, mesh);
+	return true;
+}
+
+bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillRule::Enum fillRule)
+{
+	const int windingRule = fillRule == vg::FillRule::NonZero ? TESS_WINDING_NONZERO : TESS_WINDING_ODD;
+
+	// Tesselate the interior and get its boundary contours from the same sweep. The AA fringe is generated
+	// around the boundary contours ([-fringeWidth/2, +fringeWidth/2] around each contour) and the interior
+	// triangles use the inner fringe vertices instead of the boundary vertices, i.e. the interior is inset by
+	// half the fringe width (the same area the tesselation of the inset boundary contours covers).
+	const float normal[3] = { 0.0f, 0.0f, 1.0f };
+	TESStesselator* tess = stroker->m_Tesselator;
+	if (!tessTesselate(tess, windingRule, TESS_POLYGONS_AND_BOUNDARY, 3, 2, &normal[0])) {
+		// Triangulating the interior requires more memory than extracting the boundary contours. Try the 2 sweep
+		// version.
+		return concaveFillEndAATwoSweeps(stroker, mesh, color, windingRule);
+	}
+
+	const uint32_t numContours = (uint32_t)tessGetBoundaryContourCount(tess);
+	if (numContours == 0) {
+		return false;
+	}
+
+	const Vec2* tessVertices = (const Vec2*)tessGetVertices(tess);
+	const uint32_t numTessVertices = (uint32_t)tessGetVertexCount(tess);
+	const TESSindex* triangles = tessGetElements(tess);
+	const uint32_t numTriangleIndices = (uint32_t)tessGetElementCount(tess) * 3;
+	const TESSindex* corners = tessGetElementCorners(tess);
+	const TESSindex* contours = tessGetBoundaryContours(tess);
+	const TESSindex* boundaryVertices = tessGetBoundaryVertices(tess);
+	const uint32_t numBoundaryVertices = (uint32_t)tessGetBoundaryVertexCount(tess);
+
+	// Output vertices: 2 fringe vertices (inner, outer) for each boundary vertex occurrence (in contour order),
+	// followed by the interior vertices (tesselator vertices which aren't on the boundary).
+	if (numTessVertices > stroker->m_VertexMapCapacity) {
+		const uint32_t newCapacity = bx::max<uint32_t>(numTessVertices, stroker->m_VertexMapCapacity + (stroker->m_VertexMapCapacity >> 1));
+		if (stroker->m_VertexMap) {
+			bx::alignedFree(stroker->m_Allocator, stroker->m_VertexMap, 16);
+		}
+		stroker->m_VertexMap = (uint32_t*)bx::alignedAlloc(stroker->m_Allocator, sizeof(uint32_t) * newCapacity, 16);
+		stroker->m_VertexMapCapacity = newCapacity;
+	}
+
+	static const uint32_t kUnused = UINT32_MAX;
+	static const uint32_t kBoundary = UINT32_MAX - 1;
+	uint32_t* vertexMap = stroker->m_VertexMap;
+	for (uint32_t i = 0; i < numTessVertices; ++i) {
+		vertexMap[i] = kUnused;
+	}
+	for (uint32_t i = 0; i < numBoundaryVertices; ++i) {
+		vertexMap[boundaryVertices[i]] = kBoundary;
+	}
+
+	const uint32_t numFringeVertices = numBoundaryVertices * 2;
+	const uint32_t numFringeIndices = numBoundaryVertices * 6;
+	uint32_t numVertices = numFringeVertices;
+	for (uint32_t i = 0; i < numTriangleIndices; ++i) {
+		if (corners[i] == TESS_UNDEF) {
+			// Not on the boundary (or, which shouldn't happen, a boundary vertex without an occurrence; keep it as is).
+			uint32_t* id = &vertexMap[triangles[i]];
+			if (*id >= kBoundary) {
+				*id = numVertices++;
+			}
+		}
+	}
+
+	resetGeometry(stroker);
+	expandVB(stroker, numVertices);
+	expandIB(stroker, numFringeIndices + numTriangleIndices);
+	generateFringes(stroker->m_PosBuffer, stroker->m_ColorBuffer, stroker->m_IndexBuffer, tessVertices, contours, numContours, boundaryVertices, stroker->m_FringeWidth, color);
+
+	// The interior triangles are valid only if moving their boundary vertices to the inner fringe vertices doesn't
+	// flip any of them. This isn't the case if the fringe is wider than the local feature size (e.g. thin spikes,
+	// where the inset contours intersect) or with skinny triangles. In that case tesselate the inset contours
+	// instead (a second sweep, which resolves their intersections using the fill rule).
+	const Vec2* fringePos = stroker->m_PosBuffer;
+	for (uint32_t i = 0; i < numTriangleIndices; i += 3) {
+		Vec2 p[3];
+		for (uint32_t j = 0; j < 3; ++j) {
+			const TESSindex corner = corners[i + j];
+			p[j] = corner != TESS_UNDEF ? fringePos[corner * 2] : tessVertices[triangles[i + j]];
+		}
+
+		const float area = (p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[2].x - p[0].x) * (p[1].y - p[0].y);
+		if (!(area > 0.0f)) {
+			if (!tesselateInsetContours(stroker, copyContours(stroker, contours, numContours), numContours, numFringeVertices, numFringeIndices, windingRule, color)) {
+				return false;
+			}
+
+			setMeshFromStrokerBuffers(stroker, mesh);
+			return true;
+		}
+	}
+
+	// Interior vertices
+	Vec2* dstPos = &stroker->m_PosBuffer[numFringeVertices];
+	for (uint32_t i = 0; i < numTessVertices; ++i) {
+		const uint32_t id = vertexMap[i];
+		if (id < kBoundary) {
+			dstPos[id - numFringeVertices] = tessVertices[i];
+		}
+	}
+	vgutil::memset32(&stroker->m_ColorBuffer[numFringeVertices], numVertices - numFringeVertices, &color);
+
+	// Interior triangles
+	uint16_t* dstIndex = &stroker->m_IndexBuffer[numFringeIndices];
+	for (uint32_t i = 0; i < numTriangleIndices; ++i) {
+		const TESSindex corner = corners[i];
+		dstIndex[i] = (uint16_t)(corner != TESS_UNDEF ? corner * 2 : vertexMap[triangles[i]]);
+	}
+
+	stroker->m_NumVertices = numVertices;
+	stroker->m_NumIndices = numFringeIndices + numTriangleIndices;
+	setMeshFromStrokerBuffers(stroker, mesh);
 
 	return true;
 }
@@ -1119,7 +1568,7 @@ bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillR
 // Templates
 //
 template<bool _Closed, LineCap::Enum _LineCap, LineJoin::Enum _LineJoin>
-void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth)
+void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth, const StrokerSink* sink)
 {
 	const uint32_t numSegments = numPathVertices - (_Closed ? 0 : 1);
 	const float hsw = strokeWidth * 0.5f;
@@ -1134,7 +1583,54 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 		sinCapDa = bx::sin(capDa);
 	}
 
-	resetGeometry(stroker);
+	// Precalculate all segment directions and join extrusion vectors.
+	const Vec2* segmentDirs;
+	const Vec2* extrusionVecs;
+	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, &segmentDirs, &extrusionVecs);
+
+	const uint32_t firstSegmentID = _Closed ? 0 : 1;
+	const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
+
+	// Precalculate the arcs of round joins.
+	const RoundJoinArc* roundJoinArcs = nullptr;
+	uint32_t totalArcPoints = 0;
+	if (_LineJoin == LineJoin::Round) {
+		roundJoinArcs = calcRoundJoinArcs(stroker, segmentDirs, extrusionVecs, _Closed ? numPathVertices : numPathVertices - 1, firstSegmentID, numSegments, hsw, da, &totalArcPoints);
+	}
+
+	// Calculate the exact amount of geometry and reserve space for it.
+	// Joins: miter: 2 vertices + 6 indices, bevel: 3 vertices + 6 + 3 indices, round: numArcPoints + 2 vertices + 6 + numArcPoints * 3 indices.
+	// The 6 indices connect each join to the previous segment. The first join of a closed path is connected by the
+	// closing quad instead, so closed paths need no extra indices. Open paths need space for the 2 caps.
+	uint32_t numVertices = 0;
+	uint32_t numIndices = 0;
+	if (_LineJoin == LineJoin::Miter) {
+		numVertices = numJoins * 2;
+		numIndices = numJoins * 6;
+	} else if (_LineJoin == LineJoin::Bevel) {
+		numVertices = numJoins * 3;
+		numIndices = numJoins * 9;
+	} else {
+		numVertices = numJoins * 2 + totalArcPoints;
+		numIndices = numJoins * 6 + totalArcPoints * 3;
+	}
+
+	if (!_Closed) {
+		if (_LineCap == LineCap::Round) {
+			numVertices += numPointsHalfCircle * 2;
+			numIndices += (numPointsHalfCircle - 2) * 6 + 6;
+		} else {
+			numVertices += 4;
+			numIndices += 6;
+		}
+	}
+
+	GeometryOutput out;
+	beginGeometry(stroker, sink, numVertices, numIndices, false, &out);
+
+	const Vec2* posStart = out.m_Pos;
+	Vec2* dstPos = out.m_Pos;
+	uint16_t* dstIndex = out.m_Index;
 
 	Vec2 d01;
 	uint16_t prevSegmentLeftID = 0xFFFF;
@@ -1144,22 +1640,17 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 	if (!_Closed) {
 		// First segment of an open path
 		const Vec2& p0 = vtx[0];
-		const Vec2& p1 = vtx[1];
 
-		d01 = vec2Dir(p0, p1);
+		d01 = segmentDirs[0];
 
 		const Vec2 l01 = vec2PerpCCW(d01);
 
 		if (_LineCap == LineCap::Butt) {
 			const Vec2 l01_hsw = vec2Scale(l01, hsw);
 
-			Vec2 p[2] = {
-				vec2Add(p0, l01_hsw),
-				vec2Sub(p0, l01_hsw)
-			};
-
-			expandVB(stroker, 2);
-			addPos<2>(stroker, &p[0]);
+			dstPos[0] = vec2Add(p0, l01_hsw);
+			dstPos[1] = vec2Sub(p0, l01_hsw);
+			dstPos += 2;
 
 			prevSegmentLeftID = 0;
 			prevSegmentRightID = 1;
@@ -1167,32 +1658,25 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 			const Vec2 l01_hsw = vec2Scale(l01, hsw);
 			const Vec2 d01_hsw = vec2Scale(d01, hsw);
 
-			Vec2 p[2] = {
-				vec2Add(p0, vec2Sub(l01_hsw, d01_hsw)),
-				vec2Sub(p0, vec2Add(l01_hsw, d01_hsw))
-			};
-
-			expandVB(stroker, 2);
-			addPos<2>(stroker, &p[0]);
+			dstPos[0] = vec2Add(p0, vec2Sub(l01_hsw, d01_hsw));
+			dstPos[1] = vec2Sub(p0, vec2Add(l01_hsw, d01_hsw));
+			dstPos += 2;
 
 			prevSegmentLeftID = 0;
 			prevSegmentRightID = 1;
 		} else if (_LineCap == LineCap::Round) {
-			expandVB(stroker, numPointsHalfCircle);
-
 			Vec2 capDir = vec2ArcDir(l01);
 			for (uint32_t i = 0; i < numPointsHalfCircle; ++i) {
-				Vec2 p = { p0.x + capDir.x * hsw, p0.y + capDir.y * hsw };
-
-				addPos<1>(stroker, &p);
+				*dstPos++ = { p0.x + capDir.x * hsw, p0.y + capDir.y * hsw };
 
 				capDir = vec2Rotate(capDir, cosCapDa, sinCapDa);
 			}
 
-			expandIB(stroker, (numPointsHalfCircle - 2) * 3);
 			for (uint32_t i = 0; i < numPointsHalfCircle - 2; ++i) {
-				uint16_t id[3] = { 0, (uint16_t)(i + 1), (uint16_t)(i + 2) };
-				addIndices<3>(stroker, &id[0]);
+				dstIndex[0] = 0;
+				dstIndex[1] = (uint16_t)(i + 1);
+				dstIndex[2] = (uint16_t)(i + 2);
+				dstIndex += 3;
 			}
 
 			prevSegmentLeftID = 0;
@@ -1201,30 +1685,13 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 			VG_CHECK(false, "Unknown line cap type");
 		}
 	} else {
-		d01 = vec2Dir(vtx[numPathVertices - 1], vtx[0]);
+		d01 = segmentDirs[numPathVertices - 1];
 	}
-
-	const uint32_t firstSegmentID = _Closed ? 0 : 1;
-
-	// Miter and bevel joins generate a fixed amount of geometry per segment so reserve space for all
-	// of them once (miter: 2 vertices + 6 indices, bevel: 3 vertices + 6 + 3 indices). Round joins
-	// reserve space for each join separately.
-	if (_LineJoin != LineJoin::Round) {
-		const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
-		expandVB(stroker, numJoins * (_LineJoin == LineJoin::Miter ? 2 : 3));
-		expandIB(stroker, numJoins * (_LineJoin == LineJoin::Miter ? 6 : 9));
-	}
-
-	Vec2* dstPos = stroker->m_PosBuffer + stroker->m_NumVertices;
-	uint16_t* dstIndex = stroker->m_IndexBuffer + stroker->m_NumIndices;
 
 	for (uint32_t iSegment = firstSegmentID; iSegment < numSegments; ++iSegment) {
 		const Vec2& p1 = vtx[iSegment];
-		const Vec2& p2 = vtx[iSegment == numPathVertices - 1 ? 0 : iSegment + 1];
-
-		const Vec2 d12 = vec2Dir(p1, p2);
-
-		const Vec2 v = calcExtrusionVector(d01, d12);
+		const Vec2 d12 = segmentDirs[iSegment];
+		const Vec2 v = extrusionVecs[iSegment];
 		const Vec2 v_hsw = vec2Scale(v, hsw);
 
 		// Check which one of the points is the inner corner.
@@ -1234,7 +1701,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 			const Vec2 innerCorner = vec2Add(p1, v_hsw);
 
 			if (_LineJoin == LineJoin::Miter) {
-				const uint16_t firstVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
 					innerCorner,
@@ -1268,20 +1735,11 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 				float cosArcDa = 1.0f, sinArcDa = 0.0f;
 				uint32_t numArcPoints = 1;
 				if (_LineJoin == LineJoin::Round) {
-					// CCW angle from r01 to r12 in [0, 2*Pi)
-					arcDir = vec2ArcDir(r01);
-					const Vec2 arcEndDir = vec2ArcDir(r12);
-					float arcAngle = bx::atan2(vec2Cross(arcDir, arcEndDir), vec2Dot(arcDir, arcEndDir));
-					if (arcAngle < 0.0f) {
-						arcAngle += bx::kPi2;
-					}
-
-					numArcPoints = bx::max(2u, (uint32_t)(arcAngle / da));
-					const float arcDa = arcAngle / (float)numArcPoints;
-					cosArcDa = bx::cos(arcDa);
-					sinArcDa = bx::sin(arcDa);
-
-					strokerReserve(stroker, dstPos, dstIndex, numArcPoints + 2, 6 + numArcPoints * 3);
+					const RoundJoinArc& arc = roundJoinArcs[iSegment];
+					arcDir = arc.m_ArcDir;
+					cosArcDa = arc.m_CosDa;
+					sinArcDa = arc.m_SinDa;
+					numArcPoints = arc.m_NumArcPoints;
 				}
 
 				Vec2 p[3] = {
@@ -1290,7 +1748,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 					vec2Add(p1, vec2Scale(r12, hsw))
 				};
 
-				uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 				dstPos = copyPos<2>(dstPos, &p[0]);
 				for (uint32_t iArcPoint = 1; iArcPoint < numArcPoints; ++iArcPoint) {
 					arcDir = vec2Rotate(arcDir, cosArcDa, sinArcDa);
@@ -1330,7 +1788,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 			const Vec2 innerCorner = vec2Sub(p1, v_hsw);
 
 			if (_LineJoin == LineJoin::Miter) {
-				const uint16_t firstVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
 					innerCorner,
@@ -1364,20 +1822,11 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 				float cosArcDa = 1.0f, sinArcDa = 0.0f;
 				uint32_t numArcPoints = 1;
 				if (_LineJoin == LineJoin::Round) {
-					// CW angle from l01 to l12 in (-2*Pi, 0]
-					arcDir = vec2ArcDir(l01);
-					const Vec2 arcEndDir = vec2ArcDir(l12);
-					float arcAngle = bx::atan2(vec2Cross(arcDir, arcEndDir), vec2Dot(arcDir, arcEndDir));
-					if (arcAngle > 0.0f) {
-						arcAngle -= bx::kPi2;
-					}
-
-					numArcPoints = bx::max(2u, (uint32_t)(-arcAngle / da));
-					const float arcDa = arcAngle / (float)numArcPoints;
-					cosArcDa = bx::cos(arcDa);
-					sinArcDa = bx::sin(arcDa);
-
-					strokerReserve(stroker, dstPos, dstIndex, numArcPoints + 2, 6 + numArcPoints * 3);
+					const RoundJoinArc& arc = roundJoinArcs[iSegment];
+					arcDir = arc.m_ArcDir;
+					cosArcDa = arc.m_CosDa;
+					sinArcDa = arc.m_SinDa;
+					numArcPoints = arc.m_NumArcPoints;
 				}
 
 				Vec2 p[3] = {
@@ -1386,7 +1835,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 					vec2Add(p1, vec2Scale(l12, hsw))
 				};
 
-				uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 				dstPos = copyPos<2>(dstPos, &p[0]);
 				for (uint32_t iArcPoint = 1; iArcPoint < numArcPoints; ++iArcPoint) {
 					arcDir = vec2Rotate(arcDir, cosArcDa, sinArcDa);
@@ -1423,101 +1872,74 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 		d01 = d12;
 	}
 
-	strokerCommit(stroker, dstPos, dstIndex);
-
 	if (!_Closed) {
 		// Last segment of an open path
 		const Vec2& p1 = vtx[numPathVertices - 1];
 
 		const Vec2 l01 = vec2PerpCCW(d01);
 
-		if (_LineCap == LineCap::Butt) {
-			const uint16_t curSegmentLeftID = (uint16_t)stroker->m_NumVertices;
+		if (_LineCap == LineCap::Butt || _LineCap == LineCap::Square) {
+			const uint16_t curSegmentLeftID = (uint16_t)(dstPos - posStart);
 			const Vec2 l01_hsw = vec2Scale(l01, hsw);
 
-			Vec2 p[2] = {
-				vec2Add(p1, l01_hsw),
-				vec2Sub(p1, l01_hsw)
-			};
+			if (_LineCap == LineCap::Butt) {
+				dstPos[0] = vec2Add(p1, l01_hsw);
+				dstPos[1] = vec2Sub(p1, l01_hsw);
+			} else {
+				const Vec2 d01_hsw = vec2Scale(d01, hsw);
+				dstPos[0] = vec2Add(p1, vec2Add(l01_hsw, d01_hsw));
+				dstPos[1] = vec2Sub(p1, vec2Sub(l01_hsw, d01_hsw));
+			}
+			dstPos += 2;
 
-			expandVB(stroker, 2);
-			addPos<2>(stroker, &p[0]);
-
-			uint16_t id[6] = {
-				prevSegmentLeftID, prevSegmentRightID, (uint16_t)(curSegmentLeftID + 1),
-				prevSegmentLeftID, (uint16_t)(curSegmentLeftID + 1), curSegmentLeftID
-			};
-
-			expandIB(stroker, 6);
-			addIndices<6>(stroker, &id[0]);
-		} else if (_LineCap == LineCap::Square) {
-			const uint16_t curSegmentLeftID = (uint16_t)stroker->m_NumVertices;
-			const Vec2 l01_hsw = vec2Scale(l01, hsw);
-			const Vec2 d01_hsw = vec2Scale(d01, hsw);
-
-			Vec2 p[2] = {
-				vec2Add(p1, vec2Add(l01_hsw, d01_hsw)),
-				vec2Sub(p1, vec2Sub(l01_hsw, d01_hsw))
-			};
-
-			expandVB(stroker, 2);
-			addPos<2>(stroker, &p[0]);
-
-			uint16_t id[6] = {
-				prevSegmentLeftID, prevSegmentRightID, (uint16_t)(curSegmentLeftID + 1),
-				prevSegmentLeftID, (uint16_t)(curSegmentLeftID + 1), curSegmentLeftID
-			};
-
-			expandIB(stroker, 6);
-			addIndices<6>(stroker, &id[0]);
+			dstIndex[0] = prevSegmentLeftID;
+			dstIndex[1] = prevSegmentRightID;
+			dstIndex[2] = (uint16_t)(curSegmentLeftID + 1);
+			dstIndex[3] = prevSegmentLeftID;
+			dstIndex[4] = (uint16_t)(curSegmentLeftID + 1);
+			dstIndex[5] = curSegmentLeftID;
+			dstIndex += 6;
 		} else if (_LineCap == LineCap::Round) {
-			expandVB(stroker, numPointsHalfCircle);
-
-			const uint16_t curSegmentLeftID = (uint16_t)stroker->m_NumVertices;
+			const uint16_t curSegmentLeftID = (uint16_t)(dstPos - posStart);
 			Vec2 capDir = vec2ArcDir(l01);
 			for (uint32_t i = 0; i < numPointsHalfCircle; ++i) {
-				Vec2 p = { p1.x + capDir.x * hsw, p1.y + capDir.y * hsw };
-
-				addPos<1>(stroker, &p);
+				*dstPos++ = { p1.x + capDir.x * hsw, p1.y + capDir.y * hsw };
 
 				capDir = vec2Rotate(capDir, cosCapDa, -sinCapDa);
 			}
 
-			uint16_t id[6] = {
-				prevSegmentLeftID, prevSegmentRightID, (uint16_t)(curSegmentLeftID + (numPointsHalfCircle - 1)),
-				prevSegmentLeftID, (uint16_t)(curSegmentLeftID + (numPointsHalfCircle - 1)), curSegmentLeftID
-			};
+			dstIndex[0] = prevSegmentLeftID;
+			dstIndex[1] = prevSegmentRightID;
+			dstIndex[2] = (uint16_t)(curSegmentLeftID + (numPointsHalfCircle - 1));
+			dstIndex[3] = prevSegmentLeftID;
+			dstIndex[4] = (uint16_t)(curSegmentLeftID + (numPointsHalfCircle - 1));
+			dstIndex[5] = curSegmentLeftID;
+			dstIndex += 6;
 
-			expandIB(stroker, 6 + (numPointsHalfCircle - 2) * 3);
-			addIndices<6>(stroker, &id[0]);
 			for (uint32_t i = 0; i < numPointsHalfCircle - 2; ++i) {
 				const uint16_t idBase = curSegmentLeftID + (uint16_t)i;
-				uint16_t id[3] = {
-					curSegmentLeftID, (uint16_t)(idBase + 2), (uint16_t)(idBase + 1)
-				};
-				addIndices<3>(stroker, &id[0]);
+				dstIndex[0] = curSegmentLeftID;
+				dstIndex[1] = (uint16_t)(idBase + 2);
+				dstIndex[2] = (uint16_t)(idBase + 1);
+				dstIndex += 3;
 			}
 		}
 	} else {
-		// Generate the first segment quad. 
-		uint16_t id[6] = {
-			prevSegmentLeftID, prevSegmentRightID, firstSegmentRightID,
-			prevSegmentLeftID, firstSegmentRightID, firstSegmentLeftID
-		};
-
-		expandIB(stroker, 6);
-		addIndices<6>(stroker, &id[0]);
+		// Generate the first segment quad.
+		dstIndex[0] = prevSegmentLeftID;
+		dstIndex[1] = prevSegmentRightID;
+		dstIndex[2] = firstSegmentRightID;
+		dstIndex[3] = prevSegmentLeftID;
+		dstIndex[4] = firstSegmentRightID;
+		dstIndex[5] = firstSegmentLeftID;
+		dstIndex += 6;
 	}
 
-	mesh->m_PosBuffer = &stroker->m_PosBuffer[0].x;
-	mesh->m_ColorBuffer = nullptr;
-	mesh->m_IndexBuffer = stroker->m_IndexBuffer;
-	mesh->m_NumVertices = stroker->m_NumVertices;
-	mesh->m_NumIndices = stroker->m_NumIndices;
+	endGeometry(stroker, &out, dstPos, dstIndex, false, mesh);
 }
 
 template<bool _Closed, LineCap::Enum _LineCap, LineJoin::Enum _LineJoin>
-void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth, Color color)
+void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, float strokeWidth, Color color, const StrokerSink* sink)
 {
 	const uint32_t numSegments = numPathVertices - (_Closed ? 0 : 1);
 	const uint32_t c0 = colorSetAlpha(color, 0);
@@ -1535,7 +1957,58 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 		sinCapDa = bx::sin(capDa);
 	}
 
-	resetGeometry(stroker);
+	// Precalculate all segment directions and join extrusion vectors.
+	const Vec2* segmentDirs;
+	const Vec2* extrusionVecs;
+	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, &segmentDirs, &extrusionVecs);
+
+	const uint32_t firstSegmentID = _Closed ? 0 : 1;
+	const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
+
+	// Round cap geometry: numPointsHalfCircle * 2 vertices, fan + AA quads indices (+ 18 connecting the last segment).
+	const uint32_t numRoundCapIndices = (numPointsHalfCircle - 2) * 3 + (numPointsHalfCircle - 1) * 6;
+
+	// Precalculate the arcs of round joins.
+	const RoundJoinArc* roundJoinArcs = nullptr;
+	uint32_t totalArcPoints = 0;
+	if (_LineJoin == LineJoin::Round) {
+		roundJoinArcs = calcRoundJoinArcs(stroker, segmentDirs, extrusionVecs, _Closed ? numPathVertices : numPathVertices - 1, firstSegmentID, numSegments, hsw_aa, da, &totalArcPoints);
+	}
+
+	// Calculate the exact amount of geometry and reserve space for it.
+	// Joins: miter: 4 vertices + 18 indices, bevel: 6 vertices + 18 + 9 indices, round: numArcPoints * 2 + 4 vertices + 18 + numArcPoints * 9 indices.
+	// The 18 indices connect each join to the previous segment. The first join of a closed path is connected by the
+	// closing quads instead, so closed paths need no extra indices. Open paths need space for the 2 caps.
+	uint32_t numVertices = 0;
+	uint32_t numIndices = 0;
+	if (_LineJoin == LineJoin::Miter) {
+		numVertices = numJoins * 4;
+		numIndices = numJoins * 18;
+	} else if (_LineJoin == LineJoin::Bevel) {
+		numVertices = numJoins * 6;
+		numIndices = numJoins * 27;
+	} else {
+		numVertices = numJoins * 4 + totalArcPoints * 2;
+		numIndices = numJoins * 18 + totalArcPoints * 9;
+	}
+
+	if (!_Closed) {
+		if (_LineCap == LineCap::Round) {
+			numVertices += numPointsHalfCircle * 4;
+			numIndices += numRoundCapIndices * 2 + 18;
+		} else {
+			numVertices += 8;
+			numIndices += 6 + 24;
+		}
+	}
+
+	GeometryOutput out;
+	beginGeometry(stroker, sink, numVertices, numIndices, true, &out);
+
+	const Vec2* posStart = out.m_Pos;
+	Vec2* dstPos = out.m_Pos;
+	uint32_t* dstColor = out.m_Color;
+	uint16_t* dstIndex = out.m_Index;
 
 	Vec2 d01;
 	uint16_t prevSegmentLeftID = 0xFFFF;
@@ -1550,60 +2023,41 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 	if (!_Closed) {
 		// First segment of an open path
 		const Vec2& p0 = vtx[0];
-		const Vec2& p1 = vtx[1];
 
-		d01 = vec2Dir(p0, p1);
+		d01 = segmentDirs[0];
 
 		const Vec2 l01 = vec2PerpCCW(d01);
 
-		if (_LineCap == LineCap::Butt) {
+		if (_LineCap == LineCap::Butt || _LineCap == LineCap::Square) {
 			const Vec2 l01_hsw = vec2Scale(l01, hsw);
 			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
-			const Vec2 d01_aa = vec2Scale(d01, stroker->m_FringeWidth);
 
-			Vec2 p[4] = {
-				vec2Add(p0, vec2Sub(l01_hsw_aa, d01_aa)),
-				vec2Add(p0, l01_hsw),
-				vec2Sub(p0, l01_hsw),
-				vec2Sub(p0, vec2Add(l01_hsw_aa, d01_aa))
-			};
+			if (_LineCap == LineCap::Butt) {
+				const Vec2 d01_aa = vec2Scale(d01, stroker->m_FringeWidth);
 
-			expandVB(stroker, 4);
-			addPosColor<4>(stroker, &p[0], &c0_c_c_c0[0]);
+				dstPos[0] = vec2Add(p0, vec2Sub(l01_hsw_aa, d01_aa));
+				dstPos[1] = vec2Add(p0, l01_hsw);
+				dstPos[2] = vec2Sub(p0, l01_hsw);
+				dstPos[3] = vec2Sub(p0, vec2Add(l01_hsw_aa, d01_aa));
+			} else {
+				const Vec2 d01_hsw = vec2Scale(d01, hsw);
+				const Vec2 d01_hsw_aa = vec2Scale(d01, hsw_aa);
 
-			uint16_t id[6] = {
-				0, 2, 1,
-				0, 3, 2
-			};
-			expandIB(stroker, 6);
-			addIndices<6>(stroker, &id[0]);
+				dstPos[0] = vec2Add(p0, vec2Sub(l01_hsw_aa, d01_hsw_aa));
+				dstPos[1] = vec2Add(p0, vec2Sub(l01_hsw, d01_hsw));
+				dstPos[2] = vec2Sub(p0, vec2Add(l01_hsw, d01_hsw));
+				dstPos[3] = vec2Sub(p0, vec2Add(l01_hsw_aa, d01_hsw_aa));
+			}
+			dstPos += 4;
+			dstColor = copyColor<4>(dstColor, &c0_c_c_c0[0]);
 
-			prevSegmentLeftAAID = 0;
-			prevSegmentLeftID = 1;
-			prevSegmentRightID = 2;
-			prevSegmentRightAAID = 3;
-		} else if (_LineCap == LineCap::Square) {
-			const Vec2 l01_hsw = vec2Scale(l01, hsw);
-			const Vec2 d01_hsw = vec2Scale(d01, hsw);
-			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
-			const Vec2 d01_hsw_aa = vec2Scale(d01, hsw_aa);
-
-			Vec2 p[4] = {
-				vec2Add(p0, vec2Sub(l01_hsw_aa, d01_hsw_aa)),
-				vec2Add(p0, vec2Sub(l01_hsw, d01_hsw)),
-				vec2Sub(p0, vec2Add(l01_hsw, d01_hsw)),
-				vec2Sub(p0, vec2Add(l01_hsw_aa, d01_hsw_aa))
-			};
-
-			expandVB(stroker, 4);
-			addPosColor<4>(stroker, &p[0], &c0_c_c_c0[0]);
-
-			uint16_t id[6] = {
-				0, 2, 1,
-				0, 3, 2
-			};
-			expandIB(stroker, 6);
-			addIndices<6>(stroker, &id[0]);
+			dstIndex[0] = 0;
+			dstIndex[1] = 2;
+			dstIndex[2] = 1;
+			dstIndex[3] = 0;
+			dstIndex[4] = 3;
+			dstIndex[5] = 2;
+			dstIndex += 6;
 
 			prevSegmentLeftAAID = 0;
 			prevSegmentLeftID = 1;
@@ -1611,37 +2065,33 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			prevSegmentRightAAID = 3;
 		} else if (_LineCap == LineCap::Round) {
 			Vec2 capDir = vec2ArcDir(l01);
-			expandVB(stroker, numPointsHalfCircle << 1);
 			for (uint32_t i = 0; i < numPointsHalfCircle; ++i) {
-				Vec2 p[2] = {
-					{ p0.x + capDir.x * hsw, p0.y + capDir.y * hsw },
-					{ p0.x + capDir.x * hsw_aa, p0.y + capDir.y * hsw_aa }
-				};
-
-				addPosColor<2>(stroker, &p[0], &c0_c_c_c0[2]);
+				dstPos[0] = { p0.x + capDir.x * hsw, p0.y + capDir.y * hsw };
+				dstPos[1] = { p0.x + capDir.x * hsw_aa, p0.y + capDir.y * hsw_aa };
+				dstPos += 2;
+				dstColor = copyColor<2>(dstColor, &c0_c_c_c0[2]);
 
 				capDir = vec2Rotate(capDir, cosCapDa, sinCapDa);
 			}
 
 			// Generate indices for the triangle fan
-			expandIB(stroker, numPointsHalfCircle * 9 - 12);
 			for (uint32_t i = 0; i < numPointsHalfCircle - 2; ++i) {
-				uint16_t id[3] = {
-					0,
-					(uint16_t)((i << 1) + 2),
-					(uint16_t)((i << 1) + 4)
-				};
-				addIndices<3>(stroker, &id[0]);
+				dstIndex[0] = 0;
+				dstIndex[1] = (uint16_t)((i << 1) + 2);
+				dstIndex[2] = (uint16_t)((i << 1) + 4);
+				dstIndex += 3;
 			}
 
 			// Generate indices for the AA quads
 			for (uint32_t i = 0; i < numPointsHalfCircle - 1; ++i) {
 				const uint16_t idBase = (uint16_t)(i << 1);
-				uint16_t id[6] = {
-					idBase, (uint16_t)(idBase + 1), (uint16_t)(idBase + 3),
-					idBase, (uint16_t)(idBase + 3), (uint16_t)(idBase + 2)
-				};
-				addIndices<6>(stroker, &id[0]);
+				dstIndex[0] = idBase;
+				dstIndex[1] = (uint16_t)(idBase + 1);
+				dstIndex[2] = (uint16_t)(idBase + 3);
+				dstIndex[3] = idBase;
+				dstIndex[4] = (uint16_t)(idBase + 3);
+				dstIndex[5] = (uint16_t)(idBase + 2);
+				dstIndex += 6;
 			}
 
 			prevSegmentLeftAAID = 1;
@@ -1652,31 +2102,13 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			VG_CHECK(false, "Unknown line cap type");
 		}
 	} else {
-		d01	= vec2Dir(vtx[numPathVertices - 1], vtx[0]);
+		d01 = segmentDirs[numPathVertices - 1];
 	}
-
-	const uint32_t firstSegmentID = _Closed ? 0 : 1;
-
-	// Miter and bevel joins generate a fixed amount of geometry per segment so reserve space for all
-	// of them once (miter: 4 vertices + 18 indices, bevel: 6 vertices + 18 + 9 indices). Round joins
-	// reserve space for each join separately.
-	if (_LineJoin != LineJoin::Round) {
-		const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
-		expandVB(stroker, numJoins * (_LineJoin == LineJoin::Miter ? 4 : 6));
-		expandIB(stroker, numJoins * (_LineJoin == LineJoin::Miter ? 18 : 27));
-	}
-
-	Vec2* dstPos = stroker->m_PosBuffer + stroker->m_NumVertices;
-	uint32_t* dstColor = stroker->m_ColorBuffer + stroker->m_NumVertices;
-	uint16_t* dstIndex = stroker->m_IndexBuffer + stroker->m_NumIndices;
 
 	for (uint32_t iSegment = firstSegmentID; iSegment < numSegments; ++iSegment) {
 		const Vec2& p1 = vtx[iSegment];
-		const Vec2& p2 = vtx[iSegment == numPathVertices - 1 ? 0 : iSegment + 1];
-
-		const Vec2 d12 = vec2Dir(p1, p2);
-
-		const Vec2 v = calcExtrusionVector(d01, d12);
+		const Vec2 d12 = segmentDirs[iSegment];
+		const Vec2 v = extrusionVecs[iSegment];
 		const Vec2 v_hsw_aa = vec2Scale(v, hsw_aa);
 
 		// Check which one of the points is the inner corner.
@@ -1688,7 +2120,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			const Vec2 innerCorner = vec2Add(p1, v_hsw);
 
 			if (_LineJoin == LineJoin::Miter) {
-				const uint16_t firstVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[4] = {
 					innerCornerAA,
@@ -1734,23 +2166,14 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 				float cosArcDa = 1.0f, sinArcDa = 0.0f;
 				uint32_t numArcPoints = 1;
 				if (_LineJoin == LineJoin::Round) {
-					// CCW angle from r01 to r12 in [0, 2*Pi)
-					arcDir = vec2ArcDir(r01);
-					const Vec2 arcEndDir = vec2ArcDir(r12);
-					float arcAngle = bx::atan2(vec2Cross(arcDir, arcEndDir), vec2Dot(arcDir, arcEndDir));
-					if (arcAngle < 0.0f) {
-						arcAngle += bx::kPi2;
-					}
-
-					numArcPoints = bx::max(2u, (uint32_t)(arcAngle / da));
-					const float arcDa = arcAngle / (float)numArcPoints;
-					cosArcDa = bx::cos(arcDa);
-					sinArcDa = bx::sin(arcDa);
-
-					strokerReserve(stroker, dstPos, dstColor, dstIndex, numArcPoints * 2 + 4, 18 + numArcPoints * 9);
+					const RoundJoinArc& arc = roundJoinArcs[iSegment];
+					arcDir = arc.m_ArcDir;
+					cosArcDa = arc.m_CosDa;
+					sinArcDa = arc.m_SinDa;
+					numArcPoints = arc.m_NumArcPoints;
 				}
 
-				const uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
 					innerCornerAA,
@@ -1850,7 +2273,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			const Vec2 innerCorner = vec2Sub(p1, v_hsw);
 
 			if (_LineJoin == LineJoin::Miter) {
-				const uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[4] = {
 					innerCornerAA,
@@ -1895,23 +2318,14 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 				float cosArcDa = 1.0f, sinArcDa = 0.0f;
 				uint32_t numArcPoints = 1;
 				if (_LineJoin == LineJoin::Round) {
-					// CW angle from l01 to l12 in (-2*Pi, 0]
-					arcDir = vec2ArcDir(l01);
-					const Vec2 arcEndDir = vec2ArcDir(l12);
-					float arcAngle = bx::atan2(vec2Cross(arcDir, arcEndDir), vec2Dot(arcDir, arcEndDir));
-					if (arcAngle > 0.0f) {
-						arcAngle -= bx::kPi2;
-					}
-
-					numArcPoints = bx::max(2u, (uint32_t)(-arcAngle / da));
-					const float arcDa = arcAngle / (float)numArcPoints;
-					cosArcDa = bx::cos(arcDa);
-					sinArcDa = bx::sin(arcDa);
-
-					strokerReserve(stroker, dstPos, dstColor, dstIndex, numArcPoints * 2 + 4, 18 + numArcPoints * 9);
+					const RoundJoinArc& arc = roundJoinArcs[iSegment];
+					arcDir = arc.m_ArcDir;
+					cosArcDa = arc.m_CosDa;
+					sinArcDa = arc.m_SinDa;
+					numArcPoints = arc.m_NumArcPoints;
 				}
 
-				const uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
 					innerCornerAA,
@@ -2008,29 +2422,35 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 		d01 = d12;
 	}
 
-	strokerCommit(stroker, dstPos, dstIndex);
-
 	if (!_Closed) {
 		// Last segment of an open path
 		const Vec2& p1 = vtx[numPathVertices - 1];
 
 		const Vec2 l01 = vec2PerpCCW(d01);
 
-		if (_LineCap == LineCap::Butt) {
-			const uint16_t curSegmentLeftAAID = (uint16_t)stroker->m_NumVertices;
+		if (_LineCap == LineCap::Butt || _LineCap == LineCap::Square) {
+			const uint16_t curSegmentLeftAAID = (uint16_t)(dstPos - posStart);
 			const Vec2 l01_hsw = vec2Scale(l01, hsw);
 			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
-			const Vec2 d01_aa = vec2Scale(d01, stroker->m_FringeWidth);
 
-			Vec2 p[4] = {
-				vec2Add(p1, vec2Add(l01_hsw_aa, d01_aa)),
-				vec2Add(p1, l01_hsw),
-				vec2Sub(p1, l01_hsw),
-				vec2Sub(p1, vec2Sub(l01_hsw_aa, d01_aa))
-			};
+			if (_LineCap == LineCap::Butt) {
+				const Vec2 d01_aa = vec2Scale(d01, stroker->m_FringeWidth);
 
-			expandVB(stroker, 4);
-			addPosColor<4>(stroker, &p[0], &c0_c_c_c0[0]);
+				dstPos[0] = vec2Add(p1, vec2Add(l01_hsw_aa, d01_aa));
+				dstPos[1] = vec2Add(p1, l01_hsw);
+				dstPos[2] = vec2Sub(p1, l01_hsw);
+				dstPos[3] = vec2Sub(p1, vec2Sub(l01_hsw_aa, d01_aa));
+			} else {
+				const Vec2 d01_hsw = vec2Scale(d01, hsw);
+				const Vec2 d01_hsw_aa = vec2Scale(d01, hsw_aa);
+
+				dstPos[0] = vec2Add(p1, vec2Add(l01_hsw_aa, d01_hsw_aa));
+				dstPos[1] = vec2Add(p1, vec2Add(l01_hsw, d01_hsw));
+				dstPos[2] = vec2Sub(p1, vec2Sub(l01_hsw, d01_hsw));
+				dstPos[3] = vec2Sub(p1, vec2Sub(l01_hsw_aa, d01_hsw_aa));
+			}
+			dstPos += 4;
+			dstColor = copyColor<4>(dstColor, &c0_c_c_c0[0]);
 
 			uint16_t id[24] = {
 				prevSegmentLeftAAID, prevSegmentLeftID, (uint16_t)(curSegmentLeftAAID + 1),
@@ -2042,51 +2462,16 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 				curSegmentLeftAAID, (uint16_t)(curSegmentLeftAAID + 1), (uint16_t)(curSegmentLeftAAID + 2),
 				curSegmentLeftAAID, (uint16_t)(curSegmentLeftAAID + 2), (uint16_t)(curSegmentLeftAAID + 3)
 			};
-
-			expandIB(stroker, 24);
-			addIndices<24>(stroker, &id[0]);
-		} else if (_LineCap == LineCap::Square) {
-			const uint16_t curSegmentLeftAAID = (uint16_t)stroker->m_NumVertices;
-			const Vec2 l01_hsw = vec2Scale(l01, hsw);
-			const Vec2 d01_hsw = vec2Scale(d01, hsw);
-			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
-			const Vec2 d01_hsw_aa = vec2Scale(d01, hsw_aa);
-
-			Vec2 p[4] = {
-				vec2Add(p1, vec2Add(l01_hsw_aa, d01_hsw_aa)),
-				vec2Add(p1, vec2Add(l01_hsw, d01_hsw)),
-				vec2Sub(p1, vec2Sub(l01_hsw, d01_hsw)),
-				vec2Sub(p1, vec2Sub(l01_hsw_aa, d01_hsw_aa))
-			};
-
-			expandVB(stroker, 4);
-			addPosColor<4>(stroker, &p[0], &c0_c_c_c0[0]);
-
-			uint16_t id[24] = {
-				prevSegmentLeftAAID, prevSegmentLeftID, (uint16_t)(curSegmentLeftAAID + 1),
-				prevSegmentLeftAAID, (uint16_t)(curSegmentLeftAAID + 1), curSegmentLeftAAID,
-				prevSegmentLeftID, prevSegmentRightID, (uint16_t)(curSegmentLeftAAID + 2),
-				prevSegmentLeftID, (uint16_t)(curSegmentLeftAAID + 2), (uint16_t)(curSegmentLeftAAID + 1),
-				prevSegmentRightID, prevSegmentRightAAID, (uint16_t)(curSegmentLeftAAID + 3),
-				prevSegmentRightID, (uint16_t)(curSegmentLeftAAID + 3), (uint16_t)(curSegmentLeftAAID + 2),
-				curSegmentLeftAAID, (uint16_t)(curSegmentLeftAAID + 1), (uint16_t)(curSegmentLeftAAID + 2),
-				curSegmentLeftAAID, (uint16_t)(curSegmentLeftAAID + 2), (uint16_t)(curSegmentLeftAAID + 3)
-			};
-
-			expandIB(stroker, 24);
-			addIndices<24>(stroker, &id[0]);
+			dstIndex = copyIndices<24>(dstIndex, &id[0]);
 		} else if (_LineCap == LineCap::Round) {
-			const uint16_t curSegmentLeftID = (uint16_t)stroker->m_NumVertices;
+			const uint16_t curSegmentLeftID = (uint16_t)(dstPos - posStart);
 			Vec2 capDir = vec2ArcDir(l01);
 
-			expandVB(stroker, numPointsHalfCircle * 2);
 			for (uint32_t i = 0; i < numPointsHalfCircle; ++i) {
-				Vec2 p[2] = {
-					{ p1.x + capDir.x * hsw, p1.y + capDir.y * hsw },
-					{ p1.x + capDir.x * hsw_aa, p1.y + capDir.y * hsw_aa }
-				};
-
-				addPosColor<2>(stroker, &p[0], &c0_c_c_c0[2]);
+				dstPos[0] = { p1.x + capDir.x * hsw, p1.y + capDir.y * hsw };
+				dstPos[1] = { p1.x + capDir.x * hsw_aa, p1.y + capDir.y * hsw_aa };
+				dstPos += 2;
+				dstColor = copyColor<2>(dstColor, &c0_c_c_c0[2]);
 
 				capDir = vec2Rotate(capDir, cosCapDa, -sinCapDa);
 			}
@@ -2099,31 +2484,27 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 				prevSegmentRightID, prevSegmentRightAAID, (uint16_t)(curSegmentLeftID + (numPointsHalfCircle - 1) * 2 + 1),
 				prevSegmentRightID, (uint16_t)(curSegmentLeftID + (numPointsHalfCircle - 1) * 2 + 1), (uint16_t)(curSegmentLeftID + (numPointsHalfCircle - 1) * 2)
 			};
-
-			expandIB(stroker, 18);
-			addIndices<18>(stroker, &id[0]);
+			dstIndex = copyIndices<18>(dstIndex, &id[0]);
 
 			// Generate indices for the triangle fan
-			expandIB(stroker, (numPointsHalfCircle - 2) * 3);
 			for (uint32_t i = 0; i < numPointsHalfCircle - 2; ++i) {
 				const uint16_t idBase = curSegmentLeftID + (uint16_t)(i << 1);
-				uint16_t id[3] = {
-					curSegmentLeftID,
-					(uint16_t)(idBase + 4),
-					(uint16_t)(idBase + 2)
-				};
-				addIndices<3>(stroker, &id[0]);
+				dstIndex[0] = curSegmentLeftID;
+				dstIndex[1] = (uint16_t)(idBase + 4);
+				dstIndex[2] = (uint16_t)(idBase + 2);
+				dstIndex += 3;
 			}
 
 			// Generate indices for the AA quads
-			expandIB(stroker, (numPointsHalfCircle - 1) * 6);
 			for (uint32_t i = 0; i < numPointsHalfCircle - 1; ++i) {
 				const uint16_t idBase = curSegmentLeftID + (uint16_t)(i << 1);
-				uint16_t id[6] = {
-					idBase, (uint16_t)(idBase + 3), (uint16_t)(idBase + 1),
-					idBase, (uint16_t)(idBase + 2), (uint16_t)(idBase + 3)
-				};
-				addIndices<6>(stroker, &id[0]);
+				dstIndex[0] = idBase;
+				dstIndex[1] = (uint16_t)(idBase + 3);
+				dstIndex[2] = (uint16_t)(idBase + 1);
+				dstIndex[3] = idBase;
+				dstIndex[4] = (uint16_t)(idBase + 2);
+				dstIndex[5] = (uint16_t)(idBase + 3);
+				dstIndex += 6;
 			}
 		}
 	} else {
@@ -2137,27 +2518,49 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			prevSegmentRightID, prevSegmentRightAAID, firstSegmentRightAAID,
 			prevSegmentRightID, firstSegmentRightAAID, firstSegmentRightID
 		};
-
-		expandIB(stroker, 18);
-		addIndices<18>(stroker, &id[0]);
+		dstIndex = copyIndices<18>(dstIndex, &id[0]);
 	}
 
-	mesh->m_PosBuffer = &stroker->m_PosBuffer[0].x;
-	mesh->m_ColorBuffer = stroker->m_ColorBuffer;
-	mesh->m_IndexBuffer = stroker->m_IndexBuffer;
-	mesh->m_NumVertices = stroker->m_NumVertices;
-	mesh->m_NumIndices = stroker->m_NumIndices;
+	endGeometry(stroker, &out, dstPos, dstIndex, true, mesh);
 }
 
 template<LineCap::Enum _LineCap, LineJoin::Enum _LineJoin>
-void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, Color color, bool closed)
+void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numPathVertices, Color color, bool closed, const StrokerSink* sink)
 {
 	const uint32_t numSegments = numPathVertices - (closed ? 0 : 1);
 	const uint32_t c0 = colorSetAlpha(color, 0);
 	const uint32_t c0_c_c0_c0[4] = { c0, color, c0, c0 };
 	const float hsw_aa = stroker->m_FringeWidth;
 
-	resetGeometry(stroker);
+	// Precalculate all segment directions and join extrusion vectors.
+	const Vec2* segmentDirs;
+	const Vec2* extrusionVecs;
+	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, closed, &segmentDirs, &extrusionVecs);
+
+	const uint32_t firstSegmentID = closed ? 0 : 1;
+
+	// Every join generates a fixed amount of geometry (miter: 3 vertices + 12 indices, bevel: 4 vertices + 12 + 3 indices).
+	// The 12 indices connect each join to the previous segment. The first join of a closed path is connected by the
+	// closing quads instead, so closed paths need no extra indices. Open paths need space for the 2 caps.
+	uint32_t numVertices = 0;
+	uint32_t numIndices = 0;
+	{
+		const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
+		numVertices = numJoins * (_LineJoin == LineJoin::Miter ? 3 : 4);
+		numIndices = numJoins * (_LineJoin == LineJoin::Miter ? 12 : 15);
+		if (!closed) {
+			numVertices += 6;
+			numIndices += 12;
+		}
+	}
+
+	GeometryOutput out;
+	beginGeometry(stroker, sink, numVertices, numIndices, true, &out);
+
+	const Vec2* posStart = out.m_Pos;
+	Vec2* dstPos = out.m_Pos;
+	uint32_t* dstColor = out.m_Color;
+	uint16_t* dstIndex = out.m_Index;
 
 	Vec2 d01;
 	uint16_t prevSegmentLeftAAID = 0xFFFF;
@@ -2171,39 +2574,27 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 	if (!closed) {
 		// First segment of an open path
 		const Vec2& p0 = vtx[0];
-		const Vec2& p1 = vtx[1];
 
-		d01 = vec2Dir(p0, p1);
+		d01 = segmentDirs[0];
 
 		const Vec2 l01 = vec2PerpCCW(d01);
 
-		if (_LineCap == LineCap::Butt) {
+		if (_LineCap == LineCap::Butt || _LineCap == LineCap::Square) {
 			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
 
-			Vec2 p[3] = {
-				vec2Add(p0, l01_hsw_aa),
-				p0,
-				vec2Sub(p0, l01_hsw_aa)
-			};
+			if (_LineCap == LineCap::Butt) {
+				dstPos[0] = vec2Add(p0, l01_hsw_aa);
+				dstPos[1] = p0;
+				dstPos[2] = vec2Sub(p0, l01_hsw_aa);
+			} else {
+				const Vec2 d01_hsw_aa = vec2Scale(d01, hsw_aa);
 
-			expandVB(stroker, 3);
-			addPosColor<3>(stroker, &p[0], &c0_c_c0_c0[0]);
-
-			prevSegmentLeftAAID = 0;
-			prevSegmentMiddleID = 1;
-			prevSegmentRightAAID = 2;
-		} else if (_LineCap == LineCap::Square) {
-			const Vec2 d01_hsw_aa = vec2Scale(d01, hsw_aa);
-			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
-
-			Vec2 p[4] = {
-				vec2Add(p0, vec2Sub(l01_hsw_aa, d01_hsw_aa)),
-				p0,
-				vec2Sub(p0, vec2Add(l01_hsw_aa, d01_hsw_aa))
-			};
-
-			expandVB(stroker, 3);
-			addPosColor<3>(stroker, &p[0], &c0_c_c0_c0[0]);
+				dstPos[0] = vec2Add(p0, vec2Sub(l01_hsw_aa, d01_hsw_aa));
+				dstPos[1] = p0;
+				dstPos[2] = vec2Sub(p0, vec2Add(l01_hsw_aa, d01_hsw_aa));
+			}
+			dstPos += 3;
+			dstColor = copyColor<3>(dstColor, &c0_c_c0_c0[0]);
 
 			prevSegmentLeftAAID = 0;
 			prevSegmentMiddleID = 1;
@@ -2214,30 +2605,13 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 			VG_CHECK(false, "Unknown line cap type");
 		}
 	} else {
-		d01 = vec2Dir(vtx[numPathVertices - 1], vtx[0]);
+		d01 = segmentDirs[numPathVertices - 1];
 	}
-
-	const uint32_t firstSegmentID = closed ? 0 : 1;
-
-	// Every join generates a fixed amount of geometry so reserve space for all of them once
-	// (miter: 3 vertices + 12 indices, bevel: 4 vertices + 12 + 3 indices).
-	{
-		const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
-		expandVB(stroker, numJoins * (_LineJoin == LineJoin::Miter ? 3 : 4));
-		expandIB(stroker, numJoins * (_LineJoin == LineJoin::Miter ? 12 : 15));
-	}
-
-	Vec2* dstPos = stroker->m_PosBuffer + stroker->m_NumVertices;
-	uint32_t* dstColor = stroker->m_ColorBuffer + stroker->m_NumVertices;
-	uint16_t* dstIndex = stroker->m_IndexBuffer + stroker->m_NumIndices;
 
 	for (uint32_t iSegment = firstSegmentID; iSegment < numSegments; ++iSegment) {
 		const Vec2& p1 = vtx[iSegment];
-		const Vec2& p2 = vtx[iSegment == numPathVertices - 1 ? 0 : iSegment + 1];
-
-		const Vec2 d12 = vec2Dir(p1, p2);
-
-		const Vec2 v = calcExtrusionVector(d01, d12);
+		const Vec2 d12 = segmentDirs[iSegment];
+		const Vec2 v = extrusionVecs[iSegment];
 		const Vec2 v_hsw_aa = vec2Scale(v, hsw_aa);
 
 		// Check which one of the points is the inner corner.
@@ -2247,7 +2621,7 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 			const Vec2 innerCorner = vec2Add(p1, v_hsw_aa);
 
 			if (_LineJoin == LineJoin::Miter) {
-				const uint16_t firstVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[3] = {
 					innerCorner,
@@ -2291,7 +2665,7 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 					vec2Add(p1, vec2Scale(r12, hsw_aa))
 				};
 
-				const uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 				dstPos = copyPos<4>(dstPos, &p[0]);
 				dstColor = copyColor<4>(dstColor, &c0_c_c0_c0[0]);
 
@@ -2327,7 +2701,7 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 			const Vec2 innerCorner = vec2Sub(p1, v_hsw_aa);
 
 			if (_LineJoin == LineJoin::Miter) {
-				const uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[3] = {
 					innerCorner,
@@ -2369,7 +2743,7 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 					vec2Add(p1, vec2Scale(l12, hsw_aa))
 				};
 
-				const uint16_t firstFanVertexID = (uint16_t)(dstPos - stroker->m_PosBuffer);
+				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 				dstPos = copyPos<4>(dstPos, &p[0]);
 				dstColor = copyColor<4>(dstColor, &c0_c_c0_c0[0]);
 
@@ -2404,26 +2778,29 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 		d01 = d12;
 	}
 
-	strokerCommit(stroker, dstPos, dstIndex);
-
 	if (!closed) {
 		// Last segment of an open path
 		const Vec2& p1 = vtx[numPathVertices - 1];
 
 		const Vec2 l01 = vec2PerpCCW(d01);
 
-		if (_LineCap == LineCap::Butt) {
-			const uint16_t curSegmentLeftAAID = (uint16_t)stroker->m_NumVertices;
+		if (_LineCap == LineCap::Butt || _LineCap == LineCap::Square) {
+			const uint16_t curSegmentLeftAAID = (uint16_t)(dstPos - posStart);
 			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
 
-			Vec2 p[3] = {
-				vec2Add(p1, l01_hsw_aa),
-				p1,
-				vec2Sub(p1, l01_hsw_aa)
-			};
+			if (_LineCap == LineCap::Butt) {
+				dstPos[0] = vec2Add(p1, l01_hsw_aa);
+				dstPos[1] = p1;
+				dstPos[2] = vec2Sub(p1, l01_hsw_aa);
+			} else {
+				const Vec2 d01_hsw = vec2Scale(d01, hsw_aa);
 
-			expandVB(stroker, 3);
-			addPosColor<3>(stroker, &p[0], &c0_c_c0_c0[0]);
+				dstPos[0] = vec2Add(p1, vec2Add(l01_hsw_aa, d01_hsw));
+				dstPos[1] = p1;
+				dstPos[2] = vec2Sub(p1, vec2Sub(l01_hsw_aa, d01_hsw));
+			}
+			dstPos += 3;
+			dstColor = copyColor<3>(dstColor, &c0_c_c0_c0[0]);
 
 			uint16_t id[12] = {
 				prevSegmentLeftAAID, prevSegmentMiddleID, (uint16_t)(curSegmentLeftAAID + 1),
@@ -2431,32 +2808,7 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 				prevSegmentMiddleID, prevSegmentRightAAID, (uint16_t)(curSegmentLeftAAID + 2),
 				prevSegmentMiddleID, (uint16_t)(curSegmentLeftAAID + 2), (uint16_t)(curSegmentLeftAAID + 1)
 			};
-
-			expandIB(stroker, 12);
-			addIndices<12>(stroker, id);
-		} else if (_LineCap == LineCap::Square) {
-			const uint16_t curSegmentLeftAAID = (uint16_t)stroker->m_NumVertices;
-			const Vec2 d01_hsw = vec2Scale(d01, hsw_aa);
-			const Vec2 l01_hsw_aa = vec2Scale(l01, hsw_aa);
-
-			Vec2 p[3] = {
-				vec2Add(p1, vec2Add(l01_hsw_aa, d01_hsw)),
-				p1,
-				vec2Sub(p1, vec2Sub(l01_hsw_aa, d01_hsw))
-			};
-
-			expandVB(stroker, 3);
-			addPosColor<3>(stroker, &p[0], &c0_c_c0_c0[0]);
-
-			uint16_t id[12] = {
-				prevSegmentLeftAAID, prevSegmentMiddleID, (uint16_t)(curSegmentLeftAAID + 1),
-				prevSegmentLeftAAID, (uint16_t)(curSegmentLeftAAID + 1), curSegmentLeftAAID,
-				prevSegmentMiddleID, prevSegmentRightAAID, (uint16_t)(curSegmentLeftAAID + 2),
-				prevSegmentMiddleID, (uint16_t)(curSegmentLeftAAID + 2), (uint16_t)(curSegmentLeftAAID + 1)
-			};
-
-			expandIB(stroker, 12);
-			addIndices<12>(stroker, id);
+			dstIndex = copyIndices<12>(dstIndex, id);
 		} else if (_LineCap == LineCap::Round) {
 			VG_CHECK(false, "Round caps not implemented for thin strokes.");
 		}
@@ -2469,16 +2821,10 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 			prevSegmentMiddleID, prevSegmentRightAAID, firstSegmentRightAAID,
 			prevSegmentMiddleID, firstSegmentRightAAID, firstSegmentMiddleID
 		};
-
-		expandIB(stroker, 12);
-		addIndices<12>(stroker, id);
+		dstIndex = copyIndices<12>(dstIndex, id);
 	}
 
-	mesh->m_PosBuffer = &stroker->m_PosBuffer[0].x;
-	mesh->m_ColorBuffer = stroker->m_ColorBuffer;
-	mesh->m_IndexBuffer = stroker->m_IndexBuffer;
-	mesh->m_NumVertices = stroker->m_NumVertices;
-	mesh->m_NumIndices = stroker->m_NumIndices;
+	endGeometry(stroker, &out, dstPos, dstIndex, true, mesh);
 }
 
 inline static void resetGeometry(Stroker* stroker)
@@ -2515,41 +2861,5 @@ static BX_FORCE_INLINE void expandIB(Stroker* stroker, uint32_t n)
 	if (stroker->m_NumIndices + n > stroker->m_IndexCapacity) {
 		reallocIB(stroker, n);
 	}
-}
-
-template<uint32_t N>
-static void addPos(Stroker* stroker, const Vec2* srcPos)
-{
-	VG_CHECK(stroker->m_NumVertices + N <= stroker->m_VertexCapacity, "Not enough free space for temporary geometry");
-
-	float* dstPos = &stroker->m_PosBuffer[stroker->m_NumVertices].x;
-	memcpy(dstPos, srcPos, sizeof(Vec2) * N);
-
-	stroker->m_NumVertices += N;
-}
-
-template<uint32_t N>
-static void addPosColor(Stroker* stroker, const Vec2* srcPos, const uint32_t* srcColor)
-{
-	VG_CHECK(stroker->m_NumVertices + N <= stroker->m_VertexCapacity, "Not enough free space for temporary geometry");
-
-	float* dstPos = &stroker->m_PosBuffer[stroker->m_NumVertices].x;
-	memcpy(dstPos, srcPos, sizeof(Vec2) * N);
-
-	uint32_t* dstColor = &stroker->m_ColorBuffer[stroker->m_NumVertices];
-	memcpy(dstColor, srcColor, sizeof(uint32_t) * N);
-
-	stroker->m_NumVertices += N;
-}
-
-template<uint32_t N>
-static void addIndices(Stroker* stroker, const uint16_t* src)
-{
-	VG_CHECK(stroker->m_NumIndices + N <= stroker->m_IndexCapacity, "Not enough free space for temporary geometry");
-
-	uint16_t* dst = &stroker->m_IndexBuffer[stroker->m_NumIndices];
-	memcpy(dst, src, sizeof(uint16_t) * N);
-
-	stroker->m_NumIndices += N;
 }
 }

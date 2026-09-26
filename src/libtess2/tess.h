@@ -81,6 +81,13 @@ struct TESStesselator {
 	TESSindex *elements;
 	int elementCount;
 
+	/* TESS_POLYGONS_AND_BOUNDARY */
+	TESSindex *boundaryContours;
+	int boundaryContourCount;
+	TESSindex *boundaryVertices;
+	int boundaryVertexCount;
+	TESSindex *elementCorners;
+
 	TESSalloc alloc;
 
 	jmp_buf env;			/* place to jump to when memAllocs fail */
