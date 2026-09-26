@@ -153,6 +153,7 @@ struct libtess2Allocator
 	uint8_t* m_Buffer;
 	uint32_t m_Capacity;
 	uint32_t m_Size;
+	uint32_t m_LastOffset; // Offset of the most recent allocation (it can be resized in place)
 };
 
 static void* libtess2Alloc(void* userData, uint32_t size)
@@ -160,12 +161,44 @@ static void* libtess2Alloc(void* userData, uint32_t size)
 	libtess2Allocator* alloc = (libtess2Allocator*)userData;
 	// Align all allocations to 16 bytes
 	uint32_t offset = (alloc->m_Size & ~0x0F) + ((alloc->m_Size & 0x0F) != 0 ? 0x10 : 0);
-	if (offset + size > alloc->m_Capacity) {
+	if ((uint64_t)offset + size > alloc->m_Capacity) {
 		return nullptr;
 	}
 
 	uint8_t* mem = &alloc->m_Buffer[offset];
 	alloc->m_Size = offset + size;
+	alloc->m_LastOffset = offset;
+	return mem;
+}
+
+static void* libtess2Realloc(void* userData, void* ptr, uint32_t size)
+{
+	if (!ptr) {
+		return libtess2Alloc(userData, size);
+	}
+
+	libtess2Allocator* alloc = (libtess2Allocator*)userData;
+	const uint32_t offset = (uint32_t)((uint8_t*)ptr - alloc->m_Buffer);
+
+	// The last allocation can be resized in place.
+	if (offset == alloc->m_LastOffset) {
+		if ((uint64_t)offset + size > alloc->m_Capacity) {
+			return nullptr;
+		}
+
+		alloc->m_Size = offset + size;
+		return ptr;
+	}
+
+	// Otherwise allocate a new block and copy the old contents. The old block's size isn't stored, but
+	// it ends before m_Size, so copying up to there (or up to the new size) covers all of it. The source
+	// range is inside the used part of the buffer and the destination is past it, so they can't overlap.
+	const uint32_t maxOldSize = alloc->m_Size - offset;
+	void* mem = libtess2Alloc(userData, size);
+	if (mem) {
+		bx::memCopy(mem, ptr, bx::min<uint32_t>(size, maxOldSize));
+	}
+
 	return mem;
 }
 
@@ -181,6 +214,8 @@ struct Stroker
 	Vec2* m_PosBuffer;
 	uint32_t* m_ColorBuffer;
 	uint16_t* m_IndexBuffer;
+	uint16_t* m_FanIndexBuffer;   // Triangle fan indices (0, i, i + 1) used by strokerConvexFill(). Grow-only.
+	uint32_t m_FanTriCapacity;    // Number of triangles in m_FanIndexBuffer
 	uint32_t m_NumVertices;
 	uint32_t m_NumIndices;
 	uint32_t m_VertexCapacity;
@@ -282,6 +317,10 @@ void destroyStroker(Stroker* stroker)
     if (stroker->m_IndexBuffer) {
         bx::alignedFree(allocator, stroker->m_IndexBuffer, 16);
     }
+
+	if (stroker->m_FanIndexBuffer) {
+		bx::alignedFree(allocator, stroker->m_FanIndexBuffer, 16);
+	}
 
 	if (stroker->m_Tesselator) {
 		tessDeleteTess(stroker->m_Tesselator);
@@ -403,30 +442,30 @@ void strokerConvexFill(Stroker* stroker, Mesh* mesh, const float* vertexList, ui
 
 	resetGeometry(stroker);
 
-	// Index Buffer
-	{
-		expandIB(stroker, numIndices);
+	// The fan indices only depend on the number of vertices, so they are kept in a separate grow-only
+	// buffer and only the missing triangles are generated when a bigger polygon than before shows up.
+	if (numTris > stroker->m_FanTriCapacity) {
+		const uint32_t oldCapacity = stroker->m_FanTriCapacity;
+		const uint32_t newCapacity = bx::max<uint32_t>(numTris, oldCapacity + (oldCapacity >> 1));
+		stroker->m_FanIndexBuffer = (uint16_t*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_FanIndexBuffer, sizeof(uint16_t) * 3 * newCapacity, 16);
+		stroker->m_FanTriCapacity = newCapacity;
 
-		uint16_t* dstIndex = stroker->m_IndexBuffer;
-		uint16_t nextID = 1;
-
-		uint32_t n = numTris;
-		while (n-- > 0) {
+		uint16_t* dstIndex = &stroker->m_FanIndexBuffer[oldCapacity * 3];
+		uint16_t nextID = (uint16_t)(oldCapacity + 1);
+		for (uint32_t i = oldCapacity; i < newCapacity; ++i) {
 			*dstIndex++ = 0;
 			*dstIndex++ = nextID;
 			*dstIndex++ = nextID + 1;
 
 			++nextID;
 		}
-
-		stroker->m_NumIndices += numIndices;
 	}
 
 	mesh->m_PosBuffer = vertexList;
 	mesh->m_ColorBuffer = nullptr;
-	mesh->m_IndexBuffer = stroker->m_IndexBuffer;
+	mesh->m_IndexBuffer = stroker->m_FanIndexBuffer;
 	mesh->m_NumVertices = numVertices;
-	mesh->m_NumIndices = stroker->m_NumIndices;
+	mesh->m_NumIndices = numIndices;
 }
 
 #if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86
@@ -888,6 +927,7 @@ bool strokerConcaveFillBegin(Stroker* stroker)
 
 	// Reset the allocator.
 	stroker->m_libTessAllocator.m_Size = 0;
+	stroker->m_libTessAllocator.m_LastOffset = UINT32_MAX;
 
 	// Initialize the tesselator
 	TESSalloc allocator;
@@ -900,7 +940,7 @@ bool strokerConcaveFillBegin(Stroker* stroker)
 	allocator.userData = &stroker->m_libTessAllocator;
 	allocator.memalloc = libtess2Alloc;
 	allocator.memfree = libtess2Free;
-	allocator.memrealloc = nullptr;
+	allocator.memrealloc = libtess2Realloc;
 	stroker->m_Tesselator = tessNewTess(&allocator);
 #else
 	stroker->m_Tesselator = tessNewTess(nullptr);
