@@ -607,6 +607,11 @@ static const RoundJoinArc* calcRoundJoinArcs(Stroker* stroker, const Vec2* dirs,
 		stroker->m_JoinCapacity = newCapacity;
 	}
 
+	// Joins which turn by at most da are generated as miter joins (m_NumArcPoints = 0): the miter point is at most
+	// r / cos(da / 2) - r = tesselation tolerance away from the arc (see the calculation of da), and a miter join has
+	// half the geometry of the smallest round join. This is the common case for flattened curves.
+	const float cosDa = bx::cos(da);
+
 	RoundJoinArc* arcs = stroker->m_JoinBuffer;
 	uint32_t total = 0;
 	for (uint32_t iJoin = firstJoin; iJoin < lastJoin; ++iJoin) {
@@ -615,6 +620,10 @@ static const RoundJoinArc* calcRoundJoinArcs(Stroker* stroker, const Vec2* dirs,
 		const Vec2 v_s = vec2Scale(ext[iJoin], projScale);
 
 		RoundJoinArc* arc = &arcs[iJoin];
+		if (vec2Dot(d01, d12) >= cosDa) {
+			arc->m_NumArcPoints = 0;
+			continue;
+		}
 		const float leftPointProjDist = d12.x * v_s.x + d12.y * v_s.y;
 		if (leftPointProjDist >= 0.0f) {
 			// The left point is the inner corner. CCW angle from r01 to r12 in [0, 2*Pi)
@@ -2316,7 +2325,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 			// The left point is the inner corner.
 			const Vec2 innerCorner = vec2Add(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
@@ -2403,7 +2412,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 			// The right point is the inner corner.
 			const Vec2 innerCorner = vec2Sub(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
@@ -2735,7 +2744,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			const Vec2 innerCornerAA = vec2Add(p1, v_hsw_aa);
 			const Vec2 innerCorner = vec2Add(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[4] = {
@@ -2888,7 +2897,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			const Vec2 innerCornerAA = vec2Sub(p1, v_hsw_aa);
 			const Vec2 innerCorner = vec2Sub(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[4] = {
