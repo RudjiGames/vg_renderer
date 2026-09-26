@@ -60,16 +60,36 @@ void dictDelete( Dict *dict, DictNode *node );
 
 /*** Private data structures ***/
 
+/* The dictionary is a sorted doubly-linked list (level 0: next/prev) with a skip list index on top of it, so that
+* dictSearch() is O(log n) instead of O(n). About 1 in 4 nodes has a tower with links on levels
+* 1..height-1 (level L links all the nodes whose height is greater than L). All the users of the dictionary only
+* see the level 0 list.
+*/
+#define DICT_MAX_LEVELS 16
+
+typedef struct DictTower DictTower;
+
+struct DictTower {
+	int height;
+	DictNode *next[DICT_MAX_LEVELS]; /* [0] is unused (level 0 links are in DictNode) */
+	DictNode *prev[DICT_MAX_LEVELS];
+};
+
 struct DictNode {
 	ActiveRegion *key;
 	DictNode *next;
 	DictNode *prev;
+	DictTower *tower; /* NULL if the node is only on level 0 */
 };
 
 struct Dict {
 	DictNode head;
+	DictTower headTower;
+	int maxHeight;
+	unsigned int rng;
 	void *frame;
 	struct BucketAlloc *nodePool;
+	struct BucketAlloc *towerPool;
 	int (*leq)(TESStesselator *frame, ActiveRegion *key1, ActiveRegion *key2);
 };
 

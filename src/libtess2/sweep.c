@@ -960,6 +960,12 @@ static void ConnectLeftDegenerate( TESStesselator *tess,
 }
 
 
+/* Twice the signed area of triangle (u, v, w), > 0 if w is to the left of u -> v. */
+static TESSreal VertOrient( TESSvertex *u, TESSvertex *v, TESSvertex *w )
+{
+	return (v->s - u->s) * (w->t - u->t) - (v->t - u->t) * (w->s - u->s);
+}
+
 static void ConnectLeftVertex( TESStesselator *tess, TESSvertex *vEvent )
 /*
 * Purpose: connect a "left" vertex (one where both edges go right)
@@ -1007,11 +1013,28 @@ static void ConnectLeftVertex( TESStesselator *tess, TESSvertex *vEvent )
 	reg = VertLeq( eLo->Dst, eUp->Dst ) ? regUp : regLo;
 
 	if( regUp->inside || reg->fixUpperEdge) {
+		/* Choose which of vEvent's edges the new edge is connected next to, so that the edges around vEvent
+		* end up in the dictionary order (CCW: upper right-going edge, the new left-going edge, lower right-going
+		* edge). Otherwise AddRightEdges() has to relink them, and each relink joins and splits face loops, which
+		* costs time proportional to the size of the loops (O(n^2) in total e.g. for star shapes with many spikes).
+		* This is done only if vEvent has exactly 2 edges (the usual case), otherwise vEvent->anEdge is used.
+		*/
+		TESShalfEdge *eUpper = vEvent->anEdge;
+		TESShalfEdge *eLower = vEvent->anEdge;
+		if( eUpper->Onext != eUpper && eUpper->Onext->Onext == eUpper ) {
+			eLower = eUpper->Onext;
+			if( VertOrient( vEvent, eUpper->Dst, eLower->Dst ) > 0 ) {
+				/* eLower->Dst is to the left of (above) eUpper */
+				eLower = eUpper;
+				eUpper = eUpper->Onext;
+			}
+		}
+
 		if( reg == regUp ) {
-			eNew = tessMeshConnect( tess->mesh, vEvent->anEdge->Sym, eUp->Lnext );
+			eNew = tessMeshConnect( tess->mesh, eLower->Sym, eUp->Lnext );
 			if (eNew == NULL) longjmp(tess->env,1);
 		} else {
-			TESShalfEdge *tempHalfEdge= tessMeshConnect( tess->mesh, eLo->Dnext, vEvent->anEdge);
+			TESShalfEdge *tempHalfEdge= tessMeshConnect( tess->mesh, eLo->Dnext, eUpper);
 			if (tempHalfEdge == NULL) longjmp(tess->env,1);
 
 			eNew = tempHalfEdge->Sym;

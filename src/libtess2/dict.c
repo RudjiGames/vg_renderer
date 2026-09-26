@@ -40,6 +40,7 @@ Dict *dictNewDict( TESSalloc* alloc, void *frame, int (*leq)(TESStesselator *fra
 {
 	Dict *dict = (Dict *)alloc->memalloc( alloc->userData, sizeof( Dict ));
 	DictNode *head;
+	int i;
 
 	if (dict == NULL) return NULL;
 
@@ -48,6 +49,14 @@ Dict *dictNewDict( TESSalloc* alloc, void *frame, int (*leq)(TESStesselator *fra
 	head->key = NULL;
 	head->next = head;
 	head->prev = head;
+	head->tower = &dict->headTower;
+	dict->headTower.height = DICT_MAX_LEVELS;
+	for( i = 0; i < DICT_MAX_LEVELS; ++i ) {
+		dict->headTower.next[i] = head;
+		dict->headTower.prev[i] = head;
+	}
+	dict->maxHeight = 1;
+	dict->rng = 0x9E3779B9u; /* Fixed seed, the output must be deterministic */
 
 	dict->frame = frame;
 	dict->leq = leq;
@@ -57,6 +66,13 @@ Dict *dictNewDict( TESSalloc* alloc, void *frame, int (*leq)(TESStesselator *fra
 	if (alloc->dictNodeBucketSize > 4096)
 		alloc->dictNodeBucketSize = 4096;
 	dict->nodePool = createBucketAlloc( alloc, "Dict", sizeof(DictNode), alloc->dictNodeBucketSize );
+	dict->towerPool = createBucketAlloc( alloc, "DictTower", sizeof(DictTower), alloc->dictNodeBucketSize / 4 < 16 ? 16 : alloc->dictNodeBucketSize / 4 );
+	if (dict->nodePool == NULL || dict->towerPool == NULL) {
+		if (dict->nodePool) deleteBucketAlloc( dict->nodePool );
+		if (dict->towerPool) deleteBucketAlloc( dict->towerPool );
+		alloc->memfree( alloc->userData, dict );
+		return NULL;
+	}
 
 	return dict;
 }
@@ -64,14 +80,43 @@ Dict *dictNewDict( TESSalloc* alloc, void *frame, int (*leq)(TESStesselator *fra
 /* really tessDictListDeleteDict */
 void dictDeleteDict( TESSalloc* alloc, Dict *dict )
 {
+	deleteBucketAlloc( dict->towerPool );
 	deleteBucketAlloc( dict->nodePool );
 	alloc->memfree( alloc->userData, dict );
+}
+
+/* Previous node on the given level (the node must be on that level). */
+static DictNode *dictPrevAt( DictNode *node, int level )
+{
+	return level == 0 ? node->prev : node->tower->prev[level];
+}
+
+/* Random height (1 + number of levels above 0): P(height > h) = 4^-(h-1). */
+static int dictRandomHeight( Dict *dict )
+{
+	int height = 1;
+	unsigned int r;
+
+	/* xorshift32 */
+	r = dict->rng;
+	r ^= r << 13;
+	r ^= r >> 17;
+	r ^= r << 5;
+	dict->rng = r;
+
+	while( height < DICT_MAX_LEVELS && (r & 3) == 0 ) {
+		++height;
+		r >>= 2;
+	}
+	return height;
 }
 
 /* really tessDictListInsertBefore */
 DictNode *dictInsertBefore( Dict *dict, DictNode *node, ActiveRegion *key )
 {
 	DictNode *newNode;
+	DictTower *tower;
+	int height, level;
 
 	do {
 		node = node->prev;
@@ -85,6 +130,35 @@ DictNode *dictInsertBefore( Dict *dict, DictNode *node, ActiveRegion *key )
 	node->next->prev = newNode;
 	newNode->prev = node;
 	node->next = newNode;
+	newNode->tower = NULL;
+
+	/* Promote the node to the upper levels of the skip list. If the tower can't be allocated, the node just stays
+	* on level 0 (the dictionary is still valid, only searching is slower).
+	*/
+	height = dictRandomHeight( dict );
+	if( height == 1 ) return newNode;
+
+	tower = (DictTower *)bucketAlloc( dict->towerPool );
+	if (tower == NULL) return newNode;
+
+	tower->height = height;
+	newNode->tower = tower;
+	if( height > dict->maxHeight ) dict->maxHeight = height;
+
+	/* The predecessor on level L is the closest node before the new node whose height is greater than L. It's found
+	* by walking back on level L-1 from the predecessor on that level (expected O(1) steps per level; the head is on
+	* all levels).
+	*/
+	for( level = 1; level < height; ++level ) {
+		while( node->tower == NULL || node->tower->height <= level ) {
+			node = dictPrevAt( node, level - 1 );
+		}
+
+		tower->prev[level] = node;
+		tower->next[level] = node->tower->next[level];
+		tower->next[level]->tower->prev[level] = newNode;
+		node->tower->next[level] = newNode;
+	}
 
 	return newNode;
 }
@@ -92,15 +166,40 @@ DictNode *dictInsertBefore( Dict *dict, DictNode *node, ActiveRegion *key )
 /* really tessDictListDelete */
 void dictDelete( Dict *dict, DictNode *node ) /*ARGSUSED*/
 {
+	DictTower *tower = node->tower;
+	int level;
+
 	node->next->prev = node->prev;
 	node->prev->next = node->next;
+
+	if( tower != NULL ) {
+		for( level = 1; level < tower->height; ++level ) {
+			tower->prev[level]->tower->next[level] = tower->next[level];
+			tower->next[level]->tower->prev[level] = tower->prev[level];
+		}
+		bucketFree( dict->towerPool, tower );
+	}
+
 	bucketFree( dict->nodePool, node );
 }
 
-/* really tessDictListSearch */
+/* really tessDictListSearch
+* Returns the first node (in the list order) whose key is >= the given key (i.e. leq(key, node->key)), or the head
+* if there's no such node. The upper levels of the skip list are used to skip the nodes whose key is < the given key.
+*/
 DictNode *dictSearch( Dict *dict, ActiveRegion *key )
 {
 	DictNode *node = &dict->head;
+	DictNode *next;
+	int level;
+
+	for( level = dict->maxHeight - 1; level > 0; --level ) {
+		for( ;; ) {
+			next = node->tower->next[level];
+			if( next->key == NULL || (*dict->leq)(dict->frame, key, next->key) ) break;
+			node = next;
+		}
+	}
 
 	do {
 		node = node->next;
