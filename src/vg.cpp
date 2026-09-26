@@ -162,10 +162,12 @@ struct GPUIndexBuffer
 
 struct VertexBuffer
 {
-	float* m_Pos;
+	float* m_Pos;         // nullptr until the first vertices are allocated (see allocVertexBufferStorage())
 	uv_t* m_UV;
 	uint32_t* m_Color;
 	uint32_t m_Count;
+	uint32_t m_Capacity;
+	bool m_Transient;     // The data points directly into the bgfx transient vertex buffers (GPUVertexBuffer).
 };
 
 struct IndexBuffer
@@ -398,6 +400,8 @@ struct Context
 	uint32_t m_NumVertexBuffers;
 	uint32_t m_VertexBufferCapacity;
 	uint32_t m_FirstVertexBufferID;
+	uint32_t m_NumFrameVertices;     // Number of vertices generated between the last begin()/end() pair
+	uint32_t m_PredictedVertices;    // Expected number of vertices still to be generated in this frame
 
 	IndexBuffer* m_IndexBuffers;
 #if !VG_CONFIG_USE_TRANSIENT_BUFFERS
@@ -497,6 +501,8 @@ static bool isPathCulled(Context* ctx, const float* pathVertices, float margin);
 static const float kMaxExtrusionScale = 200.0f;
 
 static VertexBuffer* allocVertexBuffer(Context* ctx);
+static void allocVertexBufferStorage(Context* ctx, VertexBuffer* vb, uint32_t minVertices);
+static void releaseVertexBufferStorage(Context* ctx, VertexBuffer* vb);
 static float* allocVertexBufferData_Vec2(Context* ctx);
 static uint32_t* allocVertexBufferData_Uint32(Context* ctx);
 static void releaseVertexBufferData_Vec2(Context* ctx, float* data);
@@ -1121,6 +1127,7 @@ void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasH
 	transformIdentity(ctx);
 
 	ctx->m_FirstVertexBufferID = ctx->m_NumVertexBuffers;
+	ctx->m_PredictedVertices = ctx->m_NumFrameVertices + ctx->m_NumFrameVertices / 8 + 1024;
 	allocVertexBuffer(ctx);
 
 	ctx->m_ActiveIndexBufferID = allocIndexBuffer(ctx);
@@ -1147,17 +1154,17 @@ void end(Context* ctx)
 #endif
 
 	const uint32_t numDrawCommands = ctx->m_NumDrawCommands;
-	if (numDrawCommands == 0) {
-		// Release the vertex buffer allocated in beginFrame()
-		VertexBuffer* vb = &ctx->m_VertexBuffers[ctx->m_FirstVertexBufferID];
-		releaseVertexBufferData_Vec2(ctx, vb->m_Pos);
-		releaseVertexBufferData_Uint32(ctx, vb->m_Color);
+	const uint32_t numVertexBuffers = ctx->m_NumVertexBuffers;
+	ctx->m_NumFrameVertices = 0;
+	for (uint32_t iVB = ctx->m_FirstVertexBufferID; iVB < numVertexBuffers; ++iVB) {
+		ctx->m_NumFrameVertices += ctx->m_VertexBuffers[iVB].m_Count;
+	}
 
-#if VG_CONFIG_UV_INT16
-		releaseVertexBufferData_UV(ctx, vb->m_UV);
-#else
-		releaseVertexBufferData_Vec2(ctx, vb->m_UV);
-#endif
+	if (numDrawCommands == 0) {
+		// Release the vertex buffers allocated in this frame
+		for (uint32_t iVB = ctx->m_FirstVertexBufferID; iVB < numVertexBuffers; ++iVB) {
+			releaseVertexBufferStorage(ctx, &ctx->m_VertexBuffers[iVB]);
+		}
 
 		return;
 	}
@@ -1165,12 +1172,22 @@ void end(Context* ctx)
 	flushTextAtlas(ctx);
 
 	// Update bgfx vertex buffers...
-	const uint32_t numVertexBuffers = ctx->m_NumVertexBuffers;
 	for (uint32_t iVB = ctx->m_FirstVertexBufferID; iVB < numVertexBuffers; ++iVB) {
 		VertexBuffer* vb = &ctx->m_VertexBuffers[iVB];
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[iVB];
-		
+		if (!vb->m_Pos) {
+			continue; // No vertices
+		}
+
 #if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		if (vb->m_Transient) {
+			// The vertices have been written directly into the transient buffers.
+			vb->m_Pos = nullptr;
+			vb->m_UV = nullptr;
+			vb->m_Color = nullptr;
+			continue;
+		}
+
 		bgfx::allocTransientVertexBuffer(&gpuvb->m_PosBufferHandle, vb->m_Count, ctx->m_PosVertexDecl);
 		bx::memCopy(gpuvb->m_PosBufferHandle.data, vb->m_Pos, sizeof(float) * 2 * vb->m_Count);
 		releaseVertexBufferData_Vec2(ctx, vb->m_Pos);
@@ -5331,7 +5348,58 @@ static VertexBuffer* allocVertexBuffer(Context* ctx)
 #endif
 	}
 
+	// The data is allocated when the first vertices are allocated (see allocVertices()), so that empty frames
+	// don't reserve any memory.
 	VertexBuffer* vb = &ctx->m_VertexBuffers[ctx->m_NumVertexBuffers++];
+	vb->m_Pos = nullptr;
+	vb->m_UV = nullptr;
+	vb->m_Color = nullptr;
+	vb->m_Count = 0;
+	vb->m_Capacity = 0;
+	vb->m_Transient = false;
+
+	return vb;
+}
+
+// With transient buffers, the vertices are written directly into bgfx transient vertex buffers, so end() doesn't
+// have to copy them. Transient buffer memory can't be released, so instead of always reserving
+// m_MaxVBVertices vertices, the capacity is based on the number of vertices of the previous frame. If the frame needs
+// more, another vertex buffer is allocated (just like when a vertex buffer is full). If there isn't enough transient
+// memory, the data is allocated from the pools and copied into transient buffers in end().
+static void allocVertexBufferStorage(Context* ctx, VertexBuffer* vb, uint32_t minVertices)
+{
+	const uint32_t maxVertices = ctx->m_Config.m_MaxVBVertices;
+	VG_CHECK(minVertices <= maxVertices, "Too many vertices");
+
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+	{
+		const uint32_t capacity = bx::min(maxVertices, bx::max(minVertices, bx::max(ctx->m_PredictedVertices, maxVertices / 8)));
+
+		// All 3 streams are allocated from the same pool. Each allocation is aligned to its stride, so leave some
+		// slack for that.
+		const uint32_t posStride = ctx->m_PosVertexDecl.getStride();
+		const uint32_t totalBytes = capacity * (posStride + ctx->m_UVVertexDecl.getStride() + ctx->m_ColorVertexDecl.getStride()) + 64;
+		const uint32_t numPosVertices = (totalBytes + posStride - 1) / posStride;
+		if (bgfx::getAvailTransientVertexBuffer(numPosVertices, ctx->m_PosVertexDecl) == numPosVertices) {
+			GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[vb - ctx->m_VertexBuffers];
+			bgfx::allocTransientVertexBuffer(&gpuvb->m_PosBufferHandle, capacity, ctx->m_PosVertexDecl);
+			bgfx::allocTransientVertexBuffer(&gpuvb->m_UVBufferHandle, capacity, ctx->m_UVVertexDecl);
+			bgfx::allocTransientVertexBuffer(&gpuvb->m_ColorBufferHandle, capacity, ctx->m_ColorVertexDecl);
+			VG_CHECK(gpuvb->m_PosBufferHandle.size == capacity * posStride && gpuvb->m_ColorBufferHandle.size == capacity * ctx->m_ColorVertexDecl.getStride(), "Transient vertex buffer allocation failed");
+
+			vb->m_Pos = (float*)gpuvb->m_PosBufferHandle.data;
+			vb->m_UV = (uv_t*)gpuvb->m_UVBufferHandle.data;
+			vb->m_Color = (uint32_t*)gpuvb->m_ColorBufferHandle.data;
+			vb->m_Capacity = capacity;
+			vb->m_Transient = true;
+			ctx->m_PredictedVertices -= bx::min(ctx->m_PredictedVertices, capacity);
+			return;
+		}
+	}
+#else
+	BX_UNUSED(minVertices);
+#endif
+
 	vb->m_Pos = allocVertexBufferData_Vec2(ctx);
 #if VG_CONFIG_UV_INT16
 	vb->m_UV = allocVertexBufferData_UV(ctx);
@@ -5339,9 +5407,26 @@ static VertexBuffer* allocVertexBuffer(Context* ctx)
 	vb->m_UV = allocVertexBufferData_Vec2(ctx);
 #endif
 	vb->m_Color = allocVertexBufferData_Uint32(ctx);
-	vb->m_Count = 0;
+	vb->m_Capacity = maxVertices;
+	vb->m_Transient = false;
+}
 
-	return vb;
+// Releases pool allocated vertex buffer data (transient buffer memory is released by bgfx at the end of the frame).
+static void releaseVertexBufferStorage(Context* ctx, VertexBuffer* vb)
+{
+	if (vb->m_Pos && !vb->m_Transient) {
+		releaseVertexBufferData_Vec2(ctx, vb->m_Pos);
+#if VG_CONFIG_UV_INT16
+		releaseVertexBufferData_UV(ctx, vb->m_UV);
+#else
+		releaseVertexBufferData_Vec2(ctx, vb->m_UV);
+#endif
+		releaseVertexBufferData_Uint32(ctx, vb->m_Color);
+	}
+
+	vb->m_Pos = nullptr;
+	vb->m_UV = nullptr;
+	vb->m_Color = nullptr;
 }
 
 static uint16_t allocIndexBuffer(Context* ctx)
@@ -5850,10 +5935,13 @@ static uint32_t allocVertices(Context* ctx, uint32_t numVertices, uint32_t* vbID
 
 	// Check if the current vertex buffer can hold the specified amount of vertices
 	VertexBuffer* vb = &ctx->m_VertexBuffers[ctx->m_NumVertexBuffers - 1];
-	if (vb->m_Count + numVertices > ctx->m_Config.m_MaxVBVertices) {
+	if (!vb->m_Pos) {
+		allocVertexBufferStorage(ctx, vb, numVertices);
+	} else if (vb->m_Count + numVertices > vb->m_Capacity) {
 		// It cannot. Allocate a new vb.
 		vb = allocVertexBuffer(ctx);
 		VG_CHECK(vb, "Failed to allocate new Vertex Buffer");
+		allocVertexBufferStorage(ctx, vb, numVertices);
 
 		// The currently active vertex buffer has changed so force a new draw command.
 		ctx->m_ForceNewDrawCommand = true;
