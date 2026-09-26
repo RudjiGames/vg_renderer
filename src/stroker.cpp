@@ -1553,7 +1553,7 @@ static uint32_t findNeighbor(const uint16_t* tris, EdgeHash* hash, uint16_t a, u
 
 static const uint32_t kMaxCavityTris = 32;
 
-// Retriangulates a cavity (the triangle 'tri' and up to 2 rings of its neighbors, at most kMaxCavityTris triangles)
+// Retriangulates a cavity (the triangle 'tri' and 2 rings of its neighbors, at most kMaxCavityTris triangles)
 // so that all its triangles are CCW. The cavity must be a topological disk; its boundary cycle is retriangulated by
 // ear clipping (only CCW ears, not containing other boundary vertices). Any triangulation of the boundary cycle has
 // the same signed coverage as the original triangles (as with edge flips). Cavity vertices which aren't on its
@@ -1589,6 +1589,12 @@ static bool retriangulateCavity(const Vec2* pos, uint16_t* tris, EdgeHash* hash,
 		ringStart = ringEnd;
 		if (numCavityTris == ringEnd) {
 			return false; // No new neighbors
+		}
+
+		// The triangle and its direct neighbors can't be retriangulated any better than by edge flips, so only try
+		// after adding the second ring.
+		if (ring == 0) {
+			continue;
 		}
 
 		// Boundary edges: edges of the cavity triangles whose twin isn't in the cavity.
@@ -1846,10 +1852,10 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 	const uint32_t numOccurrences = numFringeVertices / 2;
 	const uint32_t numTris = numIndices / 3;
 
-	// Scratch memory: scale (float) and first incident triangle (uint32) per occurrence, incident triangles
-	// (numIndices), worklist (numTris), in-worklist flags (numTris), angle sum per vertex (float, numVertices),
-	// original fringe vertices of each occurrence (2 Vec2, restored exactly on failure).
-	const uint32_t numScratch = numOccurrences * 2 + 1 + numIndices + numTris * 2 + numVertices + numOccurrences * 4;
+	// Scratch memory: scale (float), original fringe vertices (2 Vec2, restored exactly on failure) and changed
+	// occurrences list per occurrence; first incident triangle and a mark per vertex; incident triangles (numIndices);
+	// worklist and in-worklist flags per triangle.
+	const uint32_t numScratch = numOccurrences * 6 + numVertices * 2 + 1 + numIndices + numTris * 2;
 	if (numScratch > stroker->m_ClampScratchCapacity) {
 		if (stroker->m_ClampScratch) {
 			bx::alignedFree(stroker->m_Allocator, stroker->m_ClampScratch, 16);
@@ -1859,34 +1865,32 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 	}
 
 	float* scale = (float*)stroker->m_ClampScratch;
-	uint32_t* first = stroker->m_ClampScratch + numOccurrences;
-	uint32_t* incident = first + numOccurrences + 1;
+	Vec2* original = (Vec2*)(scale + numOccurrences);
+	uint32_t* changedList = (uint32_t*)(original + numOccurrences * 2);
+	uint32_t* first = changedList + numOccurrences;
+	uint32_t* mark = first + numVertices + 1;
+	uint32_t* incident = mark + numVertices;
 	uint32_t* worklist = incident + numIndices;
 	uint32_t* inWorklist = worklist + numTris;
-	float* angleSum = (float*)(inWorklist + numTris);
-	Vec2* original = (Vec2*)(angleSum + numVertices);
 
-	// Incident triangles of each occurrence (only inner fringe vertices move).
-	bx::memSet(first, 0, sizeof(uint32_t) * (numOccurrences + 1));
+	// Incident triangles of each vertex.
+	bx::memSet(first, 0, sizeof(uint32_t) * (numVertices + 1));
 	for (uint32_t i = 0; i < numIndices; ++i) {
-		if (tris[i] < numFringeVertices) {
-			++first[(tris[i] >> 1) + 1];
-		}
+		++first[tris[i] + 1];
 	}
-	for (uint32_t k = 0; k < numOccurrences; ++k) {
-		first[k + 1] += first[k];
+	for (uint32_t v = 0; v < numVertices; ++v) {
+		first[v + 1] += first[v];
 	}
 	for (uint32_t i = 0; i < numIndices; ++i) {
-		if (tris[i] < numFringeVertices) {
-			incident[first[tris[i] >> 1]++] = i / 3;
-		}
+		incident[first[tris[i]]++] = i / 3;
 	}
-	for (uint32_t k = numOccurrences; k > 0; --k) {
-		first[k] = first[k - 1];
+	for (uint32_t v = numVertices; v > 0; --v) {
+		first[v] = first[v - 1];
 	}
 	first[0] = 0;
 
 	uint32_t numWork = 0;
+	uint32_t numChanged = 0;
 	for (uint32_t k = 0; k < numOccurrences; ++k) {
 		scale[k] = 1.0f;
 	}
@@ -1909,11 +1913,12 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 
 		bool changed = false;
 		for (uint32_t j = 0; j < 3; ++j) {
-			if (tri[j] >= numFringeVertices) {
+			const uint32_t id = tri[j];
+			if (id >= numFringeVertices) {
 				continue; // Interior vertex
 			}
 
-			const uint32_t k = tri[j] >> 1;
+			const uint32_t k = id >> 1;
 			const float s = scale[k];
 			if (s == 0.0f) {
 				continue;
@@ -1922,6 +1927,7 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 			if (s == 1.0f) {
 				original[k * 2 + 0] = pos[k * 2 + 0];
 				original[k * 2 + 1] = pos[k * 2 + 1];
+				changedList[numChanged++] = k;
 			}
 
 			// inner = p + s * v, outer = inner - 2 * v (v is the inset vector, i.e. half the fringe).
@@ -1930,7 +1936,7 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 			scale[k] = newScale;
 			changed = true;
 
-			for (uint32_t n = first[k]; n < first[k + 1]; ++n) {
+			for (uint32_t n = first[id]; n < first[id + 1]; ++n) {
 				const uint32_t u = incident[n];
 				if (!inWorklist[u]) {
 					inWorklist[u] = 1;
@@ -1944,33 +1950,43 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 		}
 	}
 
-	// Check for folds (see above).
+	// Check for folds (see above). Only the triangles of the moved vertices changed, so only the vertices of those
+	// triangles have to be checked.
 	bool valid = numWork == 0;
 	if (valid) {
-		bx::memSet(angleSum, 0, sizeof(float) * numVertices);
-		for (uint32_t i = 0; i < numIndices; i += 3) {
-			for (uint32_t j = 0; j < 3; ++j) {
-				const Vec2 a = pos[tris[i + j]];
-				const Vec2 b = pos[tris[i + (j + 1) % 3]];
-				const Vec2 c = pos[tris[i + (j + 2) % 3]];
-				const Vec2 ab = vec2Sub(b, a);
-				const Vec2 ac = vec2Sub(c, a);
-				angleSum[tris[i + j]] += bx::atan2(ab.x * ac.y - ab.y * ac.x, ab.x * ac.x + ab.y * ac.y);
-			}
-		}
+		bx::memSet(mark, 0, sizeof(uint32_t) * numVertices);
+		for (uint32_t c = 0; c < numChanged && valid; ++c) {
+			const uint32_t movedID = changedList[c] * 2;
+			for (uint32_t n = first[movedID]; n < first[movedID + 1] && valid; ++n) {
+				const uint16_t* tri = &tris[incident[n] * 3];
+				for (uint32_t j = 0; j < 3 && valid; ++j) {
+					const uint32_t id = tri[j];
+					if (mark[id]) {
+						continue;
+					}
+					mark[id] = 1;
 
-		for (uint32_t i = 0; i < numVertices && valid; ++i) {
-			valid = angleSum[i] < bx::kPi2 + 1e-3f;
+					float angleSum = 0.0f;
+					for (uint32_t m = first[id]; m < first[id + 1]; ++m) {
+						const uint16_t* t = &tris[incident[m] * 3];
+						const uint32_t corner = t[0] == id ? 0 : (t[1] == id ? 1 : 2);
+						const Vec2 a = pos[id];
+						const Vec2 ab = vec2Sub(pos[t[(corner + 1) % 3]], a);
+						const Vec2 ac = vec2Sub(pos[t[(corner + 2) % 3]], a);
+						angleSum += bx::atan2(ab.x * ac.y - ab.y * ac.x, ab.x * ac.x + ab.y * ac.y);
+					}
+					valid = angleSum < bx::kPi2 + 1e-3f;
+				}
+			}
 		}
 	}
 
 	if (!valid) {
 		// Restore the original inset.
-		for (uint32_t k = 0; k < numOccurrences; ++k) {
-			if (scale[k] != 1.0f) {
-				pos[k * 2 + 0] = original[k * 2 + 0];
-				pos[k * 2 + 1] = original[k * 2 + 1];
-			}
+		for (uint32_t c = 0; c < numChanged; ++c) {
+			const uint32_t k = changedList[c];
+			pos[k * 2 + 0] = original[k * 2 + 0];
+			pos[k * 2 + 1] = original[k * 2 + 1];
 		}
 	}
 
