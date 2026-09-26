@@ -43,8 +43,6 @@
 extern "C" {
 #endif
 
-//typedef struct TESStesselator TESStesselator;
-
 struct TESStesselator {
 
 	/*** state needed for collecting the input data ***/
