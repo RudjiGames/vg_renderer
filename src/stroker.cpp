@@ -331,6 +331,8 @@ struct Stroker
 	uint32_t m_JoinCapacity;      // Number of elements in m_JoinBuffer
 	uint32_t* m_VertexMap;        // Tesselator vertex -> output vertex map used by strokerConcaveFillEndAA(). Grow-only.
 	uint32_t m_VertexMapCapacity;
+	uint32_t* m_EdgeHash;         // Keys and values of the edge hash table used by fixFlippedTriangles(). Grow-only.
+	uint32_t m_EdgeHashCapacity;  // Number of slots in m_EdgeHash
 	Vec2* m_ContourVertices;      // Copy of the contours added with strokerConcaveFillAddContour()
 	uint32_t m_NumContourVertices;
 	uint32_t m_ContourVertexCapacity;
@@ -692,6 +694,10 @@ void destroyStroker(Stroker* stroker)
 
 	if (stroker->m_VertexMap) {
 		bx::alignedFree(allocator, stroker->m_VertexMap, 16);
+	}
+
+	if (stroker->m_EdgeHash) {
+		bx::alignedFree(allocator, stroker->m_EdgeHash, 16);
 	}
 
 	if (stroker->m_ContourVertices) {
@@ -1428,6 +1434,159 @@ static void generateFringes(Vec2* dstPos, Color* dstColor, uint16_t* dstIndex, c
 	}
 }
 
+// Twice the signed area of triangle (i0, i1, i2) (positive if CCW).
+static inline float triArea2(const Vec2* pos, uint16_t i0, uint16_t i1, uint16_t i2)
+{
+	const Vec2 a = pos[i0];
+	const Vec2 b = pos[i1];
+	const Vec2 c = pos[i2];
+	return (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+}
+
+// Directed edge (a -> b) -> triangle hash table used by fixFlippedTriangles() (open addressing, linear probing).
+struct EdgeHash
+{
+	uint32_t* m_Keys;   // (a << 16) | b, UINT32_MAX for empty slots
+	uint32_t* m_Values; // Offset of the triangle's first index
+	uint32_t m_Mask;
+};
+
+static inline uint32_t edgeKey(uint16_t a, uint16_t b)
+{
+	return ((uint32_t)a << 16) | b;
+}
+
+static inline uint32_t* edgeHashSlot(EdgeHash* hash, uint32_t key)
+{
+	uint32_t slot = (key * 2654435761u) & hash->m_Mask;
+	while (hash->m_Keys[slot] != key && hash->m_Keys[slot] != UINT32_MAX) {
+		slot = (slot + 1) & hash->m_Mask;
+	}
+
+	return &hash->m_Keys[slot];
+}
+
+static inline void edgeHashSet(EdgeHash* hash, uint16_t a, uint16_t b, uint32_t tri)
+{
+	const uint32_t key = edgeKey(a, b);
+	uint32_t* slot = edgeHashSlot(hash, key);
+	*slot = key;
+	hash->m_Values[slot - hash->m_Keys] = tri;
+}
+
+// Tries to make triangle 'tri' CCW by flipping one of its edges, i.e. replacing it and the neighbor on the other
+// side of the edge with the 2 triangles on the other diagonal of the quad they form. The flip is accepted only if
+// both new triangles are CCW (see fixFlippedTriangles() for minArea2). Returns false if none of the triangle's edges
+// can be flipped.
+static bool flipEdgeOfTriangle(const Vec2* pos, uint16_t* tris, EdgeHash* hash, uint32_t tri, float minArea2)
+{
+	uint16_t* t = &tris[tri];
+	for (uint32_t e = 0; e < 3; ++e) {
+		const uint16_t a = t[e];
+		const uint16_t b = t[e == 2 ? 0 : e + 1];
+		const uint16_t c = t[e == 0 ? 2 : e - 1];
+
+		// Find the neighbor (b, a, d). The hash table can contain stale entries (edges removed by previous flips),
+		// so check that the triangle still has the edge.
+		const uint32_t* slot = edgeHashSlot(hash, edgeKey(b, a));
+		if (*slot == UINT32_MAX) {
+			continue;
+		}
+
+		const uint32_t n = hash->m_Values[slot - hash->m_Keys];
+		uint16_t* u = &tris[n];
+		const uint32_t k = u[0] == b ? 0 : (u[1] == b ? 1 : (u[2] == b ? 2 : 3));
+		if (n == tri || k == 3 || u[k == 2 ? 0 : k + 1] != a) {
+			continue;
+		}
+
+		const uint16_t d = u[k == 0 ? 2 : k - 1];
+		if (triArea2(pos, a, d, c) > minArea2 && triArea2(pos, d, b, c) > minArea2) {
+			t[0] = a; t[1] = d; t[2] = c;
+			u[0] = d; u[1] = b; u[2] = c;
+			edgeHashSet(hash, a, d, tri);
+			edgeHashSet(hash, d, c, tri);
+			edgeHashSet(hash, c, a, tri);
+			edgeHashSet(hash, d, b, n);
+			edgeHashSet(hash, b, c, n);
+			edgeHashSet(hash, c, d, n);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Makes all triangles CCW by flipping edges, if possible. Flipping the diagonal of the quad formed by 2 adjacent
+// triangles doesn't change the (signed) coverage of the pair, so if all triangles end up CCW they cover the same area
+// as the tesselation of the inset contours would (when the inset contours don't intersect themselves; otherwise no
+// sequence of flips can make all triangles CCW). The fast path (no flipped triangles) is a single pass over the
+// triangles; the edge hash table is built only if needed.
+// Degenerate (almost collinear) triangles with a tiny negative area are accepted (they don't cover anything visible
+// and usually can't be fixed by flipping, e.g. 3 consecutive inset vertices on an almost straight part of a contour).
+static bool fixFlippedTriangles(Stroker* stroker, const Vec2* pos, uint16_t* tris, uint32_t numIndices)
+{
+	const float minArea2 = -stroker->m_FringeWidth * stroker->m_FringeWidth * 1e-3f;
+
+	uint32_t i = 0;
+	while (i < numIndices && triArea2(pos, tris[i], tris[i + 1], tris[i + 2]) > minArea2) {
+		i += 3;
+	}
+
+	if (i == numIndices) {
+		return true;
+	}
+
+	// Build the edge hash table (load factor <= 0.5)
+	uint32_t capacity = 16;
+	while (capacity < numIndices * 2) {
+		capacity <<= 1;
+	}
+
+	if (capacity > stroker->m_EdgeHashCapacity) {
+		if (stroker->m_EdgeHash) {
+			bx::alignedFree(stroker->m_Allocator, stroker->m_EdgeHash, 16);
+		}
+		stroker->m_EdgeHash = (uint32_t*)bx::alignedAlloc(stroker->m_Allocator, sizeof(uint32_t) * 2 * capacity, 16);
+		stroker->m_EdgeHashCapacity = capacity;
+	}
+
+	EdgeHash hash;
+	hash.m_Keys = stroker->m_EdgeHash;
+	hash.m_Values = stroker->m_EdgeHash + capacity;
+	hash.m_Mask = capacity - 1;
+	bx::memSet(hash.m_Keys, 0xFF, sizeof(uint32_t) * capacity);
+	for (uint32_t t = 0; t < numIndices; t += 3) {
+		edgeHashSet(&hash, tris[t + 0], tris[t + 1], t);
+		edgeHashSet(&hash, tris[t + 1], tris[t + 2], t);
+		edgeHashSet(&hash, tris[t + 2], tris[t + 0], t);
+	}
+
+	const uint32_t kMaxPasses = 8;
+	for (uint32_t pass = 0; pass < kMaxPasses; ++pass) {
+		bool allCCW = true;
+		bool flipped = false;
+		for (; i < numIndices; i += 3) {
+			if (!(triArea2(pos, tris[i], tris[i + 1], tris[i + 2]) > minArea2)) {
+				allCCW = false;
+				flipped |= flipEdgeOfTriangle(pos, tris, &hash, i, minArea2);
+			}
+		}
+
+		if (allCCW) {
+			return true;
+		}
+
+		if (!flipped) {
+			return false;
+		}
+
+		i = 0;
+	}
+
+	return false;
+}
+
 // Tesselates the inset boundary contours (the inner fringe vertices generated by generateFringes() into the stroker's
 // buffers, 'numFringeVertices' vertices and 'numFringeIndices' indices) and appends the triangles to the stroker's
 // buffers. NOTE: Invalidates the current output of the tesselator.
@@ -1599,29 +1758,6 @@ bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillR
 	expandIB(stroker, numFringeIndices + numTriangleIndices);
 	generateFringes(stroker->m_PosBuffer, stroker->m_ColorBuffer, stroker->m_IndexBuffer, tessVertices, contours, numContours, boundaryVertices, stroker->m_FringeWidth, color);
 
-	// The interior triangles are valid only if moving their boundary vertices to the inner fringe vertices doesn't
-	// flip any of them. This isn't the case if the fringe is wider than the local feature size (e.g. thin spikes,
-	// where the inset contours intersect) or with skinny triangles. In that case tesselate the inset contours
-	// instead (a second sweep, which resolves their intersections using the fill rule).
-	const Vec2* fringePos = stroker->m_PosBuffer;
-	for (uint32_t i = 0; i < numTriangleIndices; i += 3) {
-		Vec2 p[3];
-		for (uint32_t j = 0; j < 3; ++j) {
-			const TESSindex corner = corners[i + j];
-			p[j] = corner != TESS_UNDEF ? fringePos[corner * 2] : tessVertices[triangles[i + j]];
-		}
-
-		const float area = (p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[2].x - p[0].x) * (p[1].y - p[0].y);
-		if (!(area > 0.0f)) {
-			if (!tesselateInsetContours(stroker, copyContours(stroker, contours, numContours), numContours, numFringeVertices, numFringeIndices, windingRule, color)) {
-				return false;
-			}
-
-			setMeshFromStrokerBuffers(stroker, mesh);
-			return true;
-		}
-	}
-
 	// Interior vertices
 	Vec2* dstPos = &stroker->m_PosBuffer[numFringeVertices];
 	for (uint32_t i = 0; i < numTessVertices; ++i) {
@@ -1637,6 +1773,20 @@ bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillR
 	for (uint32_t i = 0; i < numTriangleIndices; ++i) {
 		const TESSindex corner = corners[i];
 		dstIndex[i] = (uint16_t)(corner != TESS_UNDEF ? corner * 2 : vertexMap[triangles[i]]);
+	}
+
+	// The interior triangles are valid only if moving their boundary vertices to the inner fringe vertices doesn't
+	// flip any of them. This isn't the case if the fringe is wider than the local feature size (e.g. thin spikes,
+	// where the inset contours intersect) or with long skinny triangles (common on finely subdivided curves). The
+	// latter can be fixed by flipping edges. If that fails, tesselate the inset contours instead (a second sweep,
+	// which resolves their intersections using the fill rule).
+	if (!fixFlippedTriangles(stroker, stroker->m_PosBuffer, dstIndex, numTriangleIndices)) {
+		if (!tesselateInsetContours(stroker, copyContours(stroker, contours, numContours), numContours, numFringeVertices, numFringeIndices, windingRule, color)) {
+			return false;
+		}
+
+		setMeshFromStrokerBuffers(stroker, mesh);
+		return true;
 	}
 
 	stroker->m_NumVertices = numVertices;
