@@ -471,22 +471,37 @@ static void endGeometry(Stroker* stroker, const GeometryOutput* out, const Vec2*
 	mesh->m_NumIndices = numIndices;
 }
 
+// Inner bevels: the inner corner of a join is the intersection of the inner edges of its 2 segments, which is
+// projDist = |dot(d12, v_s)| behind the join along both segments (v_s is the extrusion vector scaled by the half
+// stroke width). If one of the segments is shorter than that (sharp turns of thick strokes), the intersection is far
+// away from the stroke and the join geometry creates a long spike. Such joins use 2 inner vertices instead (the inner
+// corners of the 2 segments, like NanoVG's inner bevels), connected through the join point. The inner sides of the 2
+// segments overlap in that case.
+static BX_FORCE_INLINE bool needsInnerBevel(const Vec2* vtx, uint32_t numVertices, uint32_t i, float projDist)
+{
+	const Vec2 d01 = vec2Sub(vtx[i], vtx[i != 0 ? i - 1 : numVertices - 1]);
+	const Vec2 d12 = vec2Sub(vtx[i + 1 < numVertices ? i + 1 : 0], vtx[i]);
+	return projDist * projDist > bx::min(d01.x * d01.x + d01.y * d01.y, d12.x * d12.x + d12.y * d12.y);
+}
+
 // Calculates the direction of each segment of the polyline: dirs[i] = vec2Dir(vtx[i], vtx[i + 1]) for
 // i in [0, numVertices - 1) and, for closed paths, the closing segment dirs[numVertices - 1] = vec2Dir(vtx[numVertices - 1], vtx[0]).
 // Also calculates the extrusion vector of each join: ext[i] = calcExtrusionVector(dirs[i - 1], dirs[i]) for
 // i in [1, numVertices - 1) and, for closed paths, ext[numVertices - 1] and ext[0] (using the closing segment).
 // The results are bit-identical to calling vec2Dir()/calcExtrusionVector() for each segment/join (the SIMD
 // version performs exactly the same IEEE operations, 4 segments at a time; bx::rsqrt() is 1.0f / sqrt() on SSE).
-// Also returns the squared length of each segment: lenSqr[i] = |vtx[i + 1] - vtx[i]|^2 (see needsInnerBevel()).
+// Also decides which joins need an inner bevel (innerBevel[i] != 0, see needsInnerBevel()) for the given half stroke
+// width (the one the join loops scale the extrusion vectors with to find the inner corner) and returns their number.
+// The flags are calculated once and used both for the geometry budget and by the join loops, so they always match.
 // All arrays point into the stroker's scratch buffer (valid until the next call).
-static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint32_t numVertices, bool closed, const Vec2** dirsOut, const Vec2** extOut, const float** lenSqrOut)
+static uint32_t calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint32_t numVertices, bool closed, float innerBevelHsw, const Vec2** dirsOut, const Vec2** extOut, const uint8_t** innerBevelOut)
 {
 	VG_CHECK(numVertices >= 2, "Invalid number of vertices");
 	const uint32_t numDirs = closed ? numVertices : numVertices - 1;
 
-	// Layout: [dirs[0 .. numDirs) + 4 padding] [ext[0 .. numDirs) + 4 padding] [lenSqr[0 .. numDirs) + 4 padding]
+	// Layout: [dirs[0 .. numDirs) + 4 padding] [ext[0 .. numDirs) + 4 padding] [innerBevel[0 .. numDirs) + 4 padding]
 	// The padding allows the SIMD code to always write 4 elements at a time.
-	const uint32_t required = numDirs * 2 + 8 + (numDirs + 4 + 1) / 2;
+	const uint32_t required = numDirs * 2 + 8 + (numDirs + 4 + 7) / 8;
 	if (required > stroker->m_SegmentCapacity) {
 		const uint32_t newCapacity = bx::max<uint32_t>(required, stroker->m_SegmentCapacity + (stroker->m_SegmentCapacity >> 1));
 		// The old contents aren't needed so free the old buffer first.
@@ -499,7 +514,8 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 
 	Vec2* dirs = stroker->m_SegmentBuffer;
 	Vec2* ext = dirs + numDirs + 4;
-	float* lenSqrs = &(ext + numDirs + 4)->x;
+	uint8_t* innerBevel = (uint8_t*)(ext + numDirs + 4);
+	uint32_t numInnerBevelJoins = 0;
 
 #if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86
 	const __m128 xmm_one = _mm_set1_ps(1.0f);
@@ -513,6 +529,12 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 	const Vec2 closingDir = closed ? vec2Dir(vtx[numVertices - 1], vtx[0]) : Vec2{ 0.0f, 0.0f };
 	__m128 prevDirX = _mm_set1_ps(closingDir.x);
 	__m128 prevDirY = _mm_set1_ps(closingDir.y);
+
+	// Squared length of the previous segment (for the inner bevel test). There's no join at the first vertex of an
+	// open path (its flag is cleared below).
+	const Vec2 closingSeg = vec2Sub(vtx[0], vtx[numVertices - 1]);
+	__m128 prevLenSqr = _mm_set1_ps(closingSeg.x * closingSeg.x + closingSeg.y * closingSeg.y);
+	const __m128 xmm_hsw = _mm_set1_ps(innerBevelHsw);
 
 	for (uint32_t i = 0; i < numDirs; i += 4) {
 		// Load the start (a) and end (b) points of the 4 segments (SoA).
@@ -544,7 +566,6 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 		const __m128 dx = _mm_sub_ps(bx_, ax);
 		const __m128 dy = _mm_sub_ps(by, ay);
 		const __m128 lenSqr = _mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy));
-		_mm_storeu_ps(&lenSqrs[i], lenSqr);
 		const __m128 invLen = _mm_andnot_ps(_mm_cmplt_ps(lenSqr, xmm_epsilon), _mm_div_ps(xmm_one, _mm_sqrt_ps(lenSqr)));
 		const __m128 d12x = _mm_mul_ps(dx, invLen);
 		const __m128 d12y = _mm_mul_ps(dy, invLen);
@@ -574,16 +595,32 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 		_mm_storeu_ps(dstExt, _mm_unpacklo_ps(vx, vy));
 		_mm_storeu_ps(dstExt + 4, _mm_unpackhi_ps(vx, vy));
 
+		// Inner bevels (needsInnerBevel()): projDist = dot(d12, v * hsw), limit = min(lenSqr[i - 1], lenSqr[i])
+		const __m128 projDist = _mm_add_ps(_mm_mul_ps(d12x, _mm_mul_ps(vx, xmm_hsw)), _mm_mul_ps(d12y, _mm_mul_ps(vy, xmm_hsw)));
+		const __m128 tl = _mm_shuffle_ps(prevLenSqr, lenSqr, _MM_SHUFFLE(0, 0, 3, 3));
+		const __m128 lenSqr01 = _mm_shuffle_ps(tl, lenSqr, _MM_SHUFFLE(2, 1, 2, 0));
+		uint32_t bevelMask = (uint32_t)_mm_movemask_ps(_mm_cmpgt_ps(_mm_mul_ps(projDist, projDist), _mm_min_ps(lenSqr01, lenSqr)));
+		if (i == 0 && !closed) {
+			bevelMask &= ~1u; // No join at the first vertex of an open path
+		}
+		if (i + 4 > numDirs) {
+			bevelMask &= (1u << (numDirs - i)) - 1; // Past the last segment
+		}
+		static const uint32_t kMaskToBytes[16] = {
+			0x00000000, 0x00000001, 0x00000100, 0x00000101, 0x00010000, 0x00010001, 0x00010100, 0x00010101,
+			0x01000000, 0x01000001, 0x01000100, 0x01000101, 0x01010000, 0x01010001, 0x01010100, 0x01010101
+		};
+		static const uint8_t kMaskBits[16] = { 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4 };
+		memcpy(&innerBevel[i], &kMaskToBytes[bevelMask], 4); // little endian (x86): byte k = lane k
+		numInnerBevelJoins += kMaskBits[bevelMask];
+
 		prevDirX = d12x;
 		prevDirY = d12y;
+		prevLenSqr = lenSqr;
 	}
 #else
 	for (uint32_t i = 0; i < numDirs; ++i) {
-		const Vec2& a = vtx[i];
-		const Vec2& b = vtx[i + 1 < numVertices ? i + 1 : 0];
-		dirs[i] = vec2Dir(a, b);
-		const Vec2 d = vec2Sub(b, a);
-		lenSqrs[i] = d.x * d.x + d.y * d.y;
+		dirs[i] = vec2Dir(vtx[i], vtx[i + 1 < numVertices ? i + 1 : 0]);
 	}
 
 	if (closed) {
@@ -593,51 +630,43 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 	for (uint32_t i = 1; i < numDirs; ++i) {
 		ext[i] = calcExtrusionVector(dirs[i - 1], dirs[i]);
 	}
+
+	innerBevel[0] = 0; // No join at the first vertex of an open path
+	for (uint32_t i = closed ? 0 : 1; i < numDirs; ++i) {
+		const Vec2 v_s = vec2Scale(ext[i], innerBevelHsw);
+		const float projDist = dirs[i].x * v_s.x + dirs[i].y * v_s.y;
+		innerBevel[i] = needsInnerBevel(vtx, numVertices, i, projDist) ? 1 : 0;
+		numInnerBevelJoins += innerBevel[i];
+	}
 #endif
 
 	*dirsOut = dirs;
 	*extOut = ext;
-	*lenSqrOut = lenSqrs;
+	*innerBevelOut = innerBevel;
+	return numInnerBevelJoins;
 }
 
 // Calculates the arc of each round join in [firstJoin, lastJoin) (the calculations the join loops used to perform
 // for each join) so that the exact amount of geometry is known before generating it. projScale is the scale
 // of the extrusion vector used to determine the inner corner (hsw or hsw_aa, see the join loops). Returns the
 // arcs (indexed by join/segment ID) and the total number of arc points.
-// Inner bevels: the inner corner of a join is the intersection of the inner edges of its 2 segments, which is
-// projDist = |dot(d12, v_s)| behind the join along both segments (v_s is the extrusion vector scaled by the half
-// stroke width). If one of the segments is shorter than that (sharp turns of thick strokes), the intersection is far
-// away from the stroke and the join geometry creates a long spike. Such joins use 2 inner vertices instead (the inner
-// corners of the 2 segments, like NanoVG's inner bevels), connected through the join point. The inner sides of the 2
-// segments overlap in that case.
-// 'lenSqr' are the squared segment lengths (see calcSegmentDirsAndExtrusions()); the join i is between segments i - 1
-// (the closing segment for i == 0) and i.
-static BX_FORCE_INLINE bool needsInnerBevel(const float* lenSqr, uint32_t numVertices, uint32_t i, float projDist)
+// Returns how many of the inner bevel joins (see calcSegmentDirsAndExtrusions()) are bevel/round joins (miter joins
+// and round joins generated as miters use the miter geometry).
+static uint32_t countInnerBevelFanJoins(const uint8_t* innerBevel, uint32_t numInnerBevelJoins, uint32_t firstJoin, uint32_t lastJoin, LineJoin::Enum lineJoin, const RoundJoinArc* arcs)
 {
-	return projDist * projDist > bx::min(lenSqr[i != 0 ? i - 1 : numVertices - 1], lenSqr[i]);
-}
-
-// Counts the joins in [firstJoin, lastJoin) which need an inner bevel (see needsInnerBevel()), exactly like the
-// stroker loops decide it. '*numFanJoins' is the number of those which are bevel/round joins (miter joins and round
-// joins generated as miters use the miter geometry).
-static uint32_t countInnerBevelJoins(const float* lenSqr, uint32_t numVertices, const Vec2* dirs, const Vec2* ext, uint32_t firstJoin, uint32_t lastJoin, float hsw, LineJoin::Enum lineJoin, const RoundJoinArc* arcs, uint32_t* numFanJoins)
-{
-	uint32_t numJoins = 0;
-	uint32_t numFan = 0;
-	for (uint32_t i = firstJoin; i < lastJoin; ++i) {
-		const Vec2 d12 = dirs[i];
-		const Vec2 v_s = vec2Scale(ext[i], hsw);
-		const float projDist = d12.x * v_s.x + d12.y * v_s.y;
-		if (needsInnerBevel(lenSqr, numVertices, i, projDist)) {
-			++numJoins;
-			if (lineJoin == LineJoin::Bevel || (lineJoin == LineJoin::Round && arcs[i].m_NumArcPoints != 0)) {
-				++numFan;
-			}
-		}
+	if (numInnerBevelJoins == 0 || lineJoin == LineJoin::Miter) {
+		return 0;
 	}
 
-	*numFanJoins = numFan;
-	return numJoins;
+	if (lineJoin == LineJoin::Bevel) {
+		return numInnerBevelJoins;
+	}
+
+	uint32_t numFan = 0;
+	for (uint32_t i = firstJoin; i < lastJoin; ++i) {
+		numFan += (innerBevel[i] && arcs[i].m_NumArcPoints != 0) ? 1 : 0;
+	}
+	return numFan;
 }
 
 // Indices connecting the end of the previous segment (IDs p*) to the start of a join (IDs t*).
@@ -2290,8 +2319,8 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 	// Precalculate all segment directions and join extrusion vectors.
 	const Vec2* segmentDirs;
 	const Vec2* extrusionVecs;
-	const float* segmentLenSqr;
-	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, &segmentDirs, &extrusionVecs, &segmentLenSqr);
+	const uint8_t* innerBevelFlags;
+	const uint32_t numInnerBevelJoins = calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, hsw, &segmentDirs, &extrusionVecs, &innerBevelFlags);
 
 	const uint32_t firstSegmentID = _Closed ? 0 : 1;
 	const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
@@ -2322,8 +2351,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 
 	// Inner bevel joins: miter +1 vertex, bevel/round +2 vertices, +3 indices (see needsInnerBevel()).
 	{
-		uint32_t numFanJoins = 0;
-		const uint32_t numInnerBevelJoins = countInnerBevelJoins(segmentLenSqr, numPathVertices, segmentDirs, extrusionVecs, firstSegmentID, numSegments, hsw, _LineJoin, roundJoinArcs, &numFanJoins);
+		const uint32_t numFanJoins = countInnerBevelFanJoins(innerBevelFlags, numInnerBevelJoins, firstSegmentID, numSegments, _LineJoin, roundJoinArcs);
 		numVertices += numInnerBevelJoins + numFanJoins;
 		numIndices += numInnerBevelJoins * 3;
 	}
@@ -2409,7 +2437,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 
 		// Check which one of the points is the inner corner.
 		float leftPointProjDist = d12.x * v_hsw.x + d12.y * v_hsw.y;
-		if (needsInnerBevel(segmentLenSqr, numPathVertices, iSegment, leftPointProjDist)) {
+		if (innerBevelFlags[iSegment]) {
 			// Inner bevel: [X0, X1] (inner corners of the 2 segments), then the outer side: [miter point] or
 			// [join point, arc/bevel points...]. X0-M-X1 (miter) or the fan around the join point and X0-P-X1 cover
 			// the join.
@@ -2742,8 +2770,8 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 	// Precalculate all segment directions and join extrusion vectors.
 	const Vec2* segmentDirs;
 	const Vec2* extrusionVecs;
-	const float* segmentLenSqr;
-	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, &segmentDirs, &extrusionVecs, &segmentLenSqr);
+	const uint8_t* innerBevelFlags;
+	const uint32_t numInnerBevelJoins = calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, hsw_aa, &segmentDirs, &extrusionVecs, &innerBevelFlags);
 
 	const uint32_t firstSegmentID = _Closed ? 0 : 1;
 	const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
@@ -2777,8 +2805,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 
 	// Inner bevel joins: miter +2 vertices, bevel/round +3 vertices, +9 indices (see needsInnerBevel()).
 	{
-		uint32_t numFanJoins = 0;
-		const uint32_t numInnerBevelJoins = countInnerBevelJoins(segmentLenSqr, numPathVertices, segmentDirs, extrusionVecs, firstSegmentID, numSegments, hsw_aa, _LineJoin, roundJoinArcs, &numFanJoins);
+		const uint32_t numFanJoins = countInnerBevelFanJoins(innerBevelFlags, numInnerBevelJoins, firstSegmentID, numSegments, _LineJoin, roundJoinArcs);
 		numVertices += numInnerBevelJoins * 2 + numFanJoins;
 		numIndices += numInnerBevelJoins * 9;
 	}
@@ -2904,7 +2931,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 
 		// Check which one of the points is the inner corner.
 		float leftPointAAProjDist = d12.x * v_hsw_aa.x + d12.y * v_hsw_aa.y;
-		if (needsInnerBevel(segmentLenSqr, numPathVertices, iSegment, leftPointAAProjDist)) {
+		if (innerBevelFlags[iSegment]) {
 			// Inner bevel (see polylineStroke()): [X0aa, X0, X1, X1aa], then the outer side: [M, Maa] or
 			// [join point, (arc/bevel point, AA point)...]. The inner fringe is a quad over X0-X1.
 			const bool leftInner = leftPointAAProjDist >= 0.0f;
@@ -3436,8 +3463,8 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 	// Precalculate all segment directions and join extrusion vectors.
 	const Vec2* segmentDirs;
 	const Vec2* extrusionVecs;
-	const float* segmentLenSqr;
-	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, closed, &segmentDirs, &extrusionVecs, &segmentLenSqr);
+	const uint8_t* innerBevelFlags;
+	const uint32_t numInnerBevelJoins = calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, closed, hsw_aa, &segmentDirs, &extrusionVecs, &innerBevelFlags);
 
 	const uint32_t firstSegmentID = closed ? 0 : 1;
 
@@ -3452,8 +3479,6 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 		numIndices = numJoins * (_LineJoin == LineJoin::Miter ? 12 : 15);
 
 		// Inner bevel joins: +1 vertex, +3 indices (see needsInnerBevel()).
-		uint32_t numFanJoins = 0;
-		const uint32_t numInnerBevelJoins = countInnerBevelJoins(segmentLenSqr, numPathVertices, segmentDirs, extrusionVecs, firstSegmentID, numSegments, hsw_aa, _LineJoin, nullptr, &numFanJoins);
 		numVertices += numInnerBevelJoins;
 		numIndices += numInnerBevelJoins * 3;
 		if (!closed) {
@@ -3524,7 +3549,7 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 
 		// Check which one of the points is the inner corner.
 		float leftPointAAProjDist = d12.x * v_hsw_aa.x + d12.y * v_hsw_aa.y;
-		if (needsInnerBevel(segmentLenSqr, numPathVertices, iSegment, leftPointAAProjDist)) {
+		if (innerBevelFlags[iSegment]) {
 			// Inner bevel (see polylineStroke()): [X0aa, P, X1aa], then the outer side: [Maa] or [O0aa, O1aa].
 			const bool leftInner = leftPointAAProjDist >= 0.0f;
 			const float innerSign = leftInner ? 1.0f : -1.0f;
