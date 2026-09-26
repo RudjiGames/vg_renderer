@@ -168,27 +168,113 @@ static inline __m128 xmm_rcp(__m128 a)
 }
 #endif
 
+// Every libtess2 allocation is prefixed by a header. Blocks are carved out of the scratch buffer while it has
+// room, and fall back to the heap once it's full (heap blocks are tracked so they can be freed on reset).
+// NOTE: Heap allocations are bounded by VG_CONFIG_LIBTESS2_HEAP_LIMIT because on some (self-intersecting)
+// inputs libtess2's sweep never terminates and keeps allocating. The limit makes such tessellations fail
+// instead of eating all available memory.
+struct libtess2AllocHeader
+{
+	libtess2AllocHeader* m_Next;
+	libtess2AllocHeader* m_Prev;
+	uint32_t m_Size;
+	uint32_t m_Heap;
+};
+
+static const uint32_t kLibtess2HeaderSize = 32;
+static_assert(sizeof(libtess2AllocHeader) <= kLibtess2HeaderSize, "libtess2 allocation header doesn't fit.");
+
 struct libtess2Allocator
 {
+	bx::AllocatorI* m_Allocator;
 	uint8_t* m_Buffer;
 	uint32_t m_Capacity;
 	uint32_t m_Size;
-	uint32_t m_LastOffset; // Offset of the most recent allocation (it can be resized in place)
+	libtess2AllocHeader* m_HeapList;
+	uint64_t m_HeapSize; // Total size of the live heap blocks
 };
+
+// Frees all heap blocks (libtess2 doesn't free everything when tessellation fails) and rewinds the scratch buffer.
+static void libtess2Reset(libtess2Allocator* alloc)
+{
+	while (alloc->m_HeapList) {
+		libtess2AllocHeader* header = alloc->m_HeapList;
+		alloc->m_HeapList = header->m_Next;
+		bx::alignedFree(alloc->m_Allocator, header, 16);
+	}
+
+	alloc->m_Size = 0;
+	alloc->m_HeapSize = 0;
+}
+
+#if VG_CONFIG_LIBTESS2_SCRATCH_BUFFER
+static inline libtess2AllocHeader* libtess2GetHeader(void* ptr)
+{
+	return (libtess2AllocHeader*)((uint8_t*)ptr - kLibtess2HeaderSize);
+}
 
 static void* libtess2Alloc(void* userData, uint32_t size)
 {
 	libtess2Allocator* alloc = (libtess2Allocator*)userData;
+
 	// Align all allocations to 16 bytes
-	uint32_t offset = (alloc->m_Size & ~0x0F) + ((alloc->m_Size & 0x0F) != 0 ? 0x10 : 0);
-	if ((uint64_t)offset + size > alloc->m_Capacity) {
-		return nullptr;
+	const uint32_t offset = (alloc->m_Size & ~0x0F) + ((alloc->m_Size & 0x0F) != 0 ? 0x10 : 0);
+
+	libtess2AllocHeader* header;
+	if ((uint64_t)offset + kLibtess2HeaderSize + size <= alloc->m_Capacity) {
+		header = (libtess2AllocHeader*)&alloc->m_Buffer[offset];
+		header->m_Next = nullptr;
+		header->m_Prev = nullptr;
+		header->m_Heap = 0;
+		alloc->m_Size = offset + kLibtess2HeaderSize + size;
+	} else {
+		if (alloc->m_HeapSize + size > VG_CONFIG_LIBTESS2_HEAP_LIMIT || (uint64_t)kLibtess2HeaderSize + size > UINT32_MAX) {
+			return nullptr;
+		}
+
+		header = (libtess2AllocHeader*)bx::alignedAlloc(alloc->m_Allocator, kLibtess2HeaderSize + size, 16);
+		if (!header) {
+			return nullptr;
+		}
+
+		header->m_Next = alloc->m_HeapList;
+		header->m_Prev = nullptr;
+		header->m_Heap = 1;
+		if (alloc->m_HeapList) {
+			alloc->m_HeapList->m_Prev = header;
+		}
+		alloc->m_HeapList = header;
+		alloc->m_HeapSize += size;
 	}
 
-	uint8_t* mem = &alloc->m_Buffer[offset];
-	alloc->m_Size = offset + size;
-	alloc->m_LastOffset = offset;
-	return mem;
+	header->m_Size = size;
+	return (uint8_t*)header + kLibtess2HeaderSize;
+}
+
+static void libtess2Free(void* userData, void* ptr)
+{
+	if (!ptr) {
+		return;
+	}
+
+	// Scratch blocks are released all at once by libtess2Reset().
+	libtess2AllocHeader* header = libtess2GetHeader(ptr);
+	if (!header->m_Heap) {
+		return;
+	}
+
+	libtess2Allocator* alloc = (libtess2Allocator*)userData;
+	if (header->m_Prev) {
+		header->m_Prev->m_Next = header->m_Next;
+	} else {
+		alloc->m_HeapList = header->m_Next;
+	}
+	if (header->m_Next) {
+		header->m_Next->m_Prev = header->m_Prev;
+	}
+
+	alloc->m_HeapSize -= header->m_Size;
+	bx::alignedFree(alloc->m_Allocator, header, 16);
 }
 
 static void* libtess2Realloc(void* userData, void* ptr, uint32_t size)
@@ -198,35 +284,29 @@ static void* libtess2Realloc(void* userData, void* ptr, uint32_t size)
 	}
 
 	libtess2Allocator* alloc = (libtess2Allocator*)userData;
-	const uint32_t offset = (uint32_t)((uint8_t*)ptr - alloc->m_Buffer);
+	libtess2AllocHeader* header = libtess2GetHeader(ptr);
 
-	// The last allocation can be resized in place.
-	if (offset == alloc->m_LastOffset) {
-		if ((uint64_t)offset + size > alloc->m_Capacity) {
-			return nullptr;
+	// The last scratch allocation can be resized in place.
+	if (!header->m_Heap) {
+		const uint32_t offset = (uint32_t)((uint8_t*)ptr - alloc->m_Buffer);
+		if (offset + header->m_Size == alloc->m_Size
+		&&  (uint64_t)offset + size <= alloc->m_Capacity) {
+			header->m_Size = size;
+			alloc->m_Size = offset + size;
+			return ptr;
 		}
-
-		alloc->m_Size = offset + size;
-		return ptr;
 	}
 
-	// Otherwise allocate a new block and copy the old contents. The old block's size isn't stored, but
-	// it ends before m_Size, so copying up to there (or up to the new size) covers all of it. The source
-	// range is inside the used part of the buffer and the destination is past it, so they can't overlap.
-	const uint32_t maxOldSize = alloc->m_Size - offset;
 	void* mem = libtess2Alloc(userData, size);
-	if (mem) {
-		bx::memCopy(mem, ptr, bx::min<uint32_t>(size, maxOldSize));
+	if (!mem) {
+		return nullptr;
 	}
 
+	bx::memCopy(mem, ptr, bx::min<uint32_t>(header->m_Size, size));
+	libtess2Free(userData, ptr);
 	return mem;
 }
-
-static void libtess2Free(void* userData, void* ptr)
-{
-	// Don't do anything!
-	BX_UNUSED(userData, ptr);
-}
+#endif // VG_CONFIG_LIBTESS2_SCRATCH_BUFFER
 
 // Arc of a round join (see calcRoundJoinArcs()).
 struct RoundJoinArc
@@ -625,6 +705,8 @@ void destroyStroker(Stroker* stroker)
 	if (stroker->m_Tesselator) {
 		tessDeleteTess(stroker->m_Tesselator);
 	}
+
+	libtess2Reset(&stroker->m_libTessAllocator);
 
 	if (stroker->m_libTessAllocator.m_Buffer) {
 		bx::alignedFree(allocator, stroker->m_libTessAllocator.m_Buffer, 16);
@@ -1205,13 +1287,13 @@ static void resetTesselator(Stroker* stroker)
 #if VG_CONFIG_LIBTESS2_SCRATCH_BUFFER
 	// Initialize the allocator once
 	if (!stroker->m_libTessAllocator.m_Buffer) {
+		stroker->m_libTessAllocator.m_Allocator = stroker->m_Allocator;
 		stroker->m_libTessAllocator.m_Capacity = VG_CONFIG_LIBTESS2_SCRATCH_BUFFER;
 		stroker->m_libTessAllocator.m_Buffer = (uint8_t*)bx::alignedAlloc(stroker->m_Allocator, stroker->m_libTessAllocator.m_Capacity, 16);
 	}
 
 	// Reset the allocator.
-	stroker->m_libTessAllocator.m_Size = 0;
-	stroker->m_libTessAllocator.m_LastOffset = UINT32_MAX;
+	libtess2Reset(&stroker->m_libTessAllocator);
 
 	// Initialize the tesselator
 	TESSalloc allocator;

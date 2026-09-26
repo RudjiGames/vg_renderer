@@ -50,7 +50,7 @@ struct TESStesselator {
 	/*** state needed for collecting the input data ***/
 	TESSmesh	*mesh;		/* stores the input contours, and eventually
 						the tessellation itself */
-	int outOfMemory;
+	TESSstatus status;
 
 	/*** state needed for projecting onto the sweep plane ***/
 

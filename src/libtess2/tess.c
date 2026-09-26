@@ -89,6 +89,11 @@ static void ComputeNormal( TESStesselator *tess, TESSreal norm[3] )
 	int i;
 
 	v = vHead->next;
+	if (v == vHead) {
+		/* No vertex is initialized -- normal doesn't matter */
+		norm[0] = 0; norm[1] = 0; norm[2] = 1;
+		return;
+	}
 	for( i = 0; i < 3; ++i ) {
 		c = v->coords[i];
 		minVal[i] = c;
@@ -646,7 +651,7 @@ TESStesselator* tessNewTess( TESSalloc* alloc )
 	// Initialize to begin polygon.
 	tess->mesh = NULL;
 
-	tess->outOfMemory = 0;
+	tess->status = TESS_STATUS_OK;
 	tess->vertexIndexCounter = 0;
 
 	tess->vertices = 0;
@@ -718,7 +723,7 @@ void OutputPolymesh( TESStesselator *tess, TESSmesh *mesh, int elementType, int 
 	{
 		if (!tessMeshMergeConvexFaces( mesh, polySize ))
 		{
-			tess->outOfMemory = 1;
+			tess->status = TESS_STATUS_OUT_OF_MEMORY;
 			return;
 		}
 	}
@@ -761,7 +766,7 @@ void OutputPolymesh( TESStesselator *tess, TESSmesh *mesh, int elementType, int 
 													  sizeof(TESSindex) * maxFaceCount * polySize );
 	if (!tess->elements)
 	{
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
@@ -770,7 +775,7 @@ void OutputPolymesh( TESStesselator *tess, TESSmesh *mesh, int elementType, int 
 													 sizeof(TESSreal) * tess->vertexCount * vertexSize );
 	if (!tess->vertices)
 	{
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
@@ -778,7 +783,7 @@ void OutputPolymesh( TESStesselator *tess, TESSmesh *mesh, int elementType, int 
 														    sizeof(TESSindex) * tess->vertexCount );
 	if (!tess->vertexIndices)
 	{
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
@@ -887,13 +892,13 @@ static void OutputBoundary( TESStesselator *tess, TESSmesh *mesh )
 	* half-edges. The number of contours is counted in the first pass. The occurrence IDs must fit in TESSindex
 	* (excluding TESS_UNDEF and TESS_VISITED). */
 	if ( numBoundaryEdges >= (int)TESS_VISITED ) {
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
 	verts = (TESSindex*)tess->alloc.memalloc( tess->alloc.userData, sizeof(TESSindex) * (numBoundaryEdges ? numBoundaryEdges : 1) );
 	if (!verts) {
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 	tess->boundaryVertices = verts;
@@ -903,7 +908,7 @@ static void OutputBoundary( TESStesselator *tess, TESSmesh *mesh )
 		if ( pass == 1 ) {
 			tess->boundaryContours = (TESSindex*)tess->alloc.memalloc( tess->alloc.userData, sizeof(TESSindex) * 2 * (numContours ? numContours : 1) );
 			if (!tess->boundaryContours) {
-				tess->outOfMemory = 1;
+				tess->status = TESS_STATUS_OUT_OF_MEMORY;
 				return;
 			}
 			tess->boundaryContourCount = numContours;
@@ -930,7 +935,7 @@ static void OutputBoundary( TESStesselator *tess, TESSmesh *mesh )
 						while ( !IsBoundaryEdge( c ) && ++steps <= numHalfEdges )
 							c = c->Sym->Lnext;
 						if ( ++steps > numHalfEdges ) {
-							tess->outOfMemory = 1;
+							tess->status = TESS_STATUS_OUT_OF_MEMORY;
 							return;
 						}
 						c->corner = TESS_VISITED;
@@ -967,7 +972,7 @@ static void OutputBoundary( TESStesselator *tess, TESSmesh *mesh )
 	/* Triangle corners (same face and vertex order as OutputPolymesh()) */
 	corners = (TESSindex*)tess->alloc.memalloc( tess->alloc.userData, sizeof(TESSindex) * 3 * (tess->elementCount ? tess->elementCount : 1) );
 	if (!corners) {
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 	tess->elementCorners = corners;
@@ -1021,7 +1026,7 @@ void OutputContours( TESStesselator *tess, TESSmesh *mesh, int vertexSize )
 													  sizeof(TESSindex) * tess->elementCount * 2 );
 	if (!tess->elements)
 	{
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
@@ -1029,7 +1034,7 @@ void OutputContours( TESStesselator *tess, TESSmesh *mesh, int vertexSize )
 													  sizeof(TESSreal) * tess->vertexCount * vertexSize );
 	if (!tess->vertices)
 	{
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
@@ -1037,7 +1042,7 @@ void OutputContours( TESStesselator *tess, TESSmesh *mesh, int vertexSize )
 														    sizeof(TESSindex) * tess->vertexCount );
 	if (!tess->vertexIndices)
 	{
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
@@ -1073,6 +1078,12 @@ void OutputContours( TESStesselator *tess, TESSmesh *mesh, int vertexSize )
 	}
 }
 
+static int IsValidCoord( TESSreal coord )
+{
+	return coord <= TESS_MAX_VALID_INPUT_VALUE &&
+	       coord >= TESS_MIN_VALID_INPUT_VALUE;
+}
+
 void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 					int stride, int numVertices )
 {
@@ -1083,7 +1094,7 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 	if ( tess->mesh == NULL )
 	  	tess->mesh = tessMeshNewMesh( &tess->alloc );
  	if ( tess->mesh == NULL ) {
-		tess->outOfMemory = 1;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
 	}
 
@@ -1099,15 +1110,22 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 		const TESSreal* coords = (const TESSreal*)src;
 		src += stride;
 
+		if (!IsValidCoord(coords[0]) ||
+		    !IsValidCoord(coords[1]) ||
+		    (size > 2 && !IsValidCoord(coords[2]))) {
+			tess->status = TESS_STATUS_INVALID_INPUT;
+			return;
+		}
+
 		if( e == NULL ) {
 			/* Make a self-loop (one vertex, one edge). */
 			e = tessMeshMakeEdge( tess->mesh );
 			if ( e == NULL ) {
-				tess->outOfMemory = 1;
+				tess->status = TESS_STATUS_OUT_OF_MEMORY;
 				return;
 			}
 			if ( !tessMeshSplice( tess->mesh, e, e->Sym ) ) {
-				tess->outOfMemory = 1;
+				tess->status = TESS_STATUS_OUT_OF_MEMORY;
 				return;
 			}
 		} else {
@@ -1115,7 +1133,7 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 			* in the ordering around the left face.
 			*/
 			if ( tessMeshSplitEdge( tess->mesh, e ) == NULL ) {
-				tess->outOfMemory = 1;
+				tess->status = TESS_STATUS_OUT_OF_MEMORY;
 				return;
 			}
 			e = e->Lnext;
@@ -1196,7 +1214,7 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 		return 0;
 	}
 
-	if (!tess->mesh)
+	if (tess->status != TESS_STATUS_OK || !tess->mesh)
 	{
 		return 0;
 	}
@@ -1238,7 +1256,7 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 	}
 	else if (elementType == TESS_POLYGONS_AND_BOUNDARY) {
 		OutputPolymesh( tess, mesh, TESS_POLYGONS, 3, vertexSize );     /* output triangles */
-		if (!tess->outOfMemory)
+		if (tess->status == TESS_STATUS_OK)
 			OutputBoundary( tess, mesh );
 	}
 	else
@@ -1249,9 +1267,7 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 	tessMeshDeleteMesh( &tess->alloc, mesh );
 	tess->mesh = NULL;
 
-	if (tess->outOfMemory)
-		return 0;
-	return 1;
+	return tess->status == TESS_STATUS_OK;
 }
 
 int tessGetVertexCount( TESStesselator *tess )
@@ -1302,4 +1318,9 @@ const TESSindex* tessGetBoundaryVertices( TESStesselator *tess )
 const TESSindex* tessGetElementCorners( TESStesselator *tess )
 {
 	return tess->elementCorners;
+}
+
+TESSstatus tessGetStatus( TESStesselator *tess )
+{
+	return tess->status;
 }
