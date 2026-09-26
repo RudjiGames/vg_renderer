@@ -4578,7 +4578,8 @@ static void ctxSubmitCommandList(Context* ctx, CommandListHandle handle)
 
 		const float cachedScale = clCache->m_AvgScale;
 		const float stateScale = state->m_AvgScale;
-		if (cachedScale == stateScale) {
+		// NOTE: cachedScale is 0 if the cache is empty.
+		if (cachedScale > 0.0f && bx::abs(stateScale - cachedScale) <= cachedScale * VG_CONFIG_SHAPE_CACHE_SCALE_TOLERANCE) {
 			clCacheRender(ctx, cl);
 			--ctx->m_SubmitCmdListRecursionDepth;
 			return;
