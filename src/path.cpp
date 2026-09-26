@@ -3,6 +3,21 @@
 
 namespace vg
 {
+// Caches the last (radius, scale, tolerance) -> (numPoints, cos(dtheta), sin(dtheta)) computation
+// so that consecutive shapes with the same radius don't recompute acos/cos/sin. The key is compared
+// bitwise and includes every input of the computation, so the result is bit-identical to computing
+// it from scratch (no invalidation needed on pathReset()). m_NumPoints == 0 means empty (the computed
+// value is always >= 2).
+struct ArcStepCache
+{
+	uint32_t m_KeyRadius;
+	uint32_t m_KeyScale;
+	uint32_t m_KeyTolerance;
+	uint32_t m_NumPoints;
+	float m_CosDTheta;
+	float m_SinDTheta;
+};
+
 struct Path
 {
 	bx::AllocatorI* m_Allocator;
@@ -15,10 +30,90 @@ struct Path
 	uint32_t m_SubPathCapacity;
 	float m_Scale;
 	float m_TesselationTolerance;
+	ArcStepCache m_RoundedRectCache;        // pathRoundedRect()
+	ArcStepCache m_RoundedRectVaryingCache; // pathRoundedRectVarying() (per corner)
+	ArcStepCache m_EllipseCache;            // pathEllipse()/pathCircle()
 };
 
 static float* pathAllocVertices(Path* path, uint32_t n);
 static void pathAddVertex(Path* path, float x, float y);
+
+static inline bool arcStepCacheLookup(const ArcStepCache* cache, uint32_t kr, uint32_t ks, uint32_t kt)
+{
+	return cache->m_NumPoints != 0
+		&& cache->m_KeyRadius == kr
+		&& cache->m_KeyScale == ks
+		&& cache->m_KeyTolerance == kt
+		;
+}
+
+static inline void arcStepCacheStore(ArcStepCache* cache, uint32_t kr, uint32_t ks, uint32_t kt, uint32_t numPoints, float cos_dtheta, float sin_dtheta)
+{
+	cache->m_KeyRadius = kr;
+	cache->m_KeyScale = ks;
+	cache->m_KeyTolerance = kt;
+	cache->m_NumPoints = numPoints;
+	cache->m_CosDTheta = cos_dtheta;
+	cache->m_SinDTheta = sin_dtheta;
+}
+
+// pathRoundedRect(): number of points of a quarter circle (incl. both end points) and the per-step rotation.
+static const ArcStepCache* pathGetRoundedRectStep(Path* path, float r)
+{
+	ArcStepCache* cache = &path->m_RoundedRectCache;
+	const uint32_t kr = bx::floatToBits(r);
+	const uint32_t ks = bx::floatToBits(path->m_Scale);
+	const uint32_t kt = bx::floatToBits(path->m_TesselationTolerance);
+	if (!arcStepCacheLookup(cache, kr, ks, kt)) {
+		const float da = bx::acos((path->m_Scale * r) / ((path->m_Scale * r) + path->m_TesselationTolerance)) * 2.0f;
+		const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPi / da));
+		const uint32_t numPointsQuarterCircle = (numPointsHalfCircle >> 1) + 1;
+
+		const float dtheta = -bx::kPiHalf / (float)(numPointsQuarterCircle - 1);
+		arcStepCacheStore(cache, kr, ks, kt, numPointsQuarterCircle, bx::cos(dtheta), bx::sin(dtheta));
+	}
+
+	return cache;
+}
+
+// pathRoundedRectVarying(): same as above for a single corner (note: slightly different expression, kept as is).
+static const ArcStepCache* pathGetRoundedRectVaryingStep(Path* path, float r)
+{
+	ArcStepCache* cache = &path->m_RoundedRectVaryingCache;
+	const uint32_t kr = bx::floatToBits(r);
+	const uint32_t ks = bx::floatToBits(path->m_Scale);
+	const uint32_t kt = bx::floatToBits(path->m_TesselationTolerance);
+	if (!arcStepCacheLookup(cache, kr, ks, kt)) {
+		const float halfDa = bx::acos((path->m_Scale * r) / ((path->m_Scale * r) + path->m_TesselationTolerance));
+		const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPiHalf / halfDa));
+		const uint32_t numPointsQuarterCircle = (numPointsHalfCircle >> 1) + 1;
+
+		const float dtheta = -bx::kPiHalf / (float)(numPointsQuarterCircle - 1);
+		arcStepCacheStore(cache, kr, ks, kt, numPointsQuarterCircle, bx::cos(dtheta), bx::sin(dtheta));
+	}
+
+	return cache;
+}
+
+// pathEllipse(): number of points of the full circle and the per-step rotation.
+static const ArcStepCache* pathGetEllipseStep(Path* path, float avgR)
+{
+	ArcStepCache* cache = &path->m_EllipseCache;
+	const uint32_t kr = bx::floatToBits(avgR);
+	const uint32_t ks = bx::floatToBits(path->m_Scale);
+	const uint32_t kt = bx::floatToBits(path->m_TesselationTolerance);
+	if (!arcStepCacheLookup(cache, kr, ks, kt)) {
+		const float da = bx::acos((path->m_Scale * avgR) / ((path->m_Scale * avgR) + path->m_TesselationTolerance)) * 2.0f;
+
+		const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPi / da));
+		const uint32_t numPoints = (numPointsHalfCircle * 2);
+
+		const float dtheta = -bx::kPi2 / (float)numPoints;
+		arcStepCacheStore(cache, kr, ks, kt, numPoints, bx::cos(dtheta), bx::sin(dtheta));
+	}
+
+	return cache;
+}
 
 Path* createPath(bx::AllocatorI* allocator)
 {
@@ -88,7 +183,7 @@ void pathCubicTo(Path* path, float c1x, float c1y, float c2x, float c2y, float x
 	VG_CHECK(path->m_CurSubPath && path->m_CurSubPath->m_NumVertices != 0, "moveTo() should be called once before calling cubicTo()");
 
 	const int MAX_LEVELS = 10;
-	static float stack[MAX_LEVELS * 8];
+	float stack[MAX_LEVELS * 8];
 
 	const uint32_t lastVertexID = path->m_CurSubPath->m_FirstVertexID + (path->m_CurSubPath->m_NumVertices - 1);
 	const float* lastVertex = &path->m_Vertices[lastVertexID << 1];
@@ -297,13 +392,10 @@ void pathRoundedRect(Path* path, float x, float y, float w, float h, float r)
 
 	r = bx::min<float>(rx, ry);
 
-	const float da = bx::acos((path->m_Scale * r) / ((path->m_Scale * r) + path->m_TesselationTolerance)) * 2.0f;
-	const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPi / da));
-	const uint32_t numPointsQuarterCircle = (numPointsHalfCircle >> 1) + 1;
-
-	const float dtheta = -bx::kPiHalf / (float)(numPointsQuarterCircle - 1);
-	const float cos_dtheta = bx::cos(dtheta);
-	const float sin_dtheta = bx::sin(dtheta);
+	const ArcStepCache* step = pathGetRoundedRectStep(path, r);
+	const uint32_t numPointsQuarterCircle = step->m_NumPoints;
+	const float cos_dtheta = step->m_CosDTheta;
+	const float sin_dtheta = step->m_SinDTheta;
 
 	pathMoveTo(path, x, y + r);
 	pathLineTo(path, x, y + h - r);
@@ -422,13 +514,10 @@ void pathRoundedRectVarying(Path* path, float x, float y, float w, float h, floa
 	} else {
 		pathMoveTo(path, x + rtl, y);
 
-		const float halfDa = bx::acos((path->m_Scale * rtl) / ((path->m_Scale * rtl) + path->m_TesselationTolerance));
-		const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPiHalf / halfDa));
-		const uint32_t numPointsQuarterCircle = (numPointsHalfCircle >> 1) + 1;
-
-		const float dtheta = -bx::kPiHalf / (float)(numPointsQuarterCircle - 1);
-		const float cos_dtheta = bx::cos(dtheta);
-		const float sin_dtheta = bx::sin(dtheta);
+		const ArcStepCache* step = pathGetRoundedRectVaryingStep(path, rtl);
+		const uint32_t numPointsQuarterCircle = step->m_NumPoints;
+		const float cos_dtheta = step->m_CosDTheta;
+		const float sin_dtheta = step->m_SinDTheta;
 
 		const float cx = x + rtl;
 		const float cy = y + rtl;
@@ -455,13 +544,10 @@ void pathRoundedRectVarying(Path* path, float x, float y, float w, float h, floa
 	} else {
 		pathLineTo(path, x, y + h - rbl);
 
-		const float halfDa = bx::acos((path->m_Scale * rbl) / ((path->m_Scale * rbl) + path->m_TesselationTolerance));
-		const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPiHalf / halfDa));
-		const uint32_t numPointsQuarterCircle = (numPointsHalfCircle >> 1) + 1;
-
-		const float dtheta = -bx::kPiHalf / (float)(numPointsQuarterCircle - 1);
-		const float cos_dtheta = bx::cos(dtheta);
-		const float sin_dtheta = bx::sin(dtheta);
+		const ArcStepCache* step = pathGetRoundedRectVaryingStep(path, rbl);
+		const uint32_t numPointsQuarterCircle = step->m_NumPoints;
+		const float cos_dtheta = step->m_CosDTheta;
+		const float sin_dtheta = step->m_SinDTheta;
 
 		const float cx = x + rbl;
 		const float cy = y + h - rbl;
@@ -488,13 +574,10 @@ void pathRoundedRectVarying(Path* path, float x, float y, float w, float h, floa
 	} else {
 		pathLineTo(path, x + w - rbr, y + h);
 
-		const float halfDa = bx::acos((path->m_Scale * rbr) / ((path->m_Scale * rbr) + path->m_TesselationTolerance));
-		const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPiHalf / halfDa));
-		const uint32_t numPointsQuarterCircle = (numPointsHalfCircle >> 1) + 1;
-
-		const float dtheta = -bx::kPiHalf / (float)(numPointsQuarterCircle - 1);
-		const float cos_dtheta = bx::cos(dtheta);
-		const float sin_dtheta = bx::sin(dtheta);
+		const ArcStepCache* step = pathGetRoundedRectVaryingStep(path, rbr);
+		const uint32_t numPointsQuarterCircle = step->m_NumPoints;
+		const float cos_dtheta = step->m_CosDTheta;
+		const float sin_dtheta = step->m_SinDTheta;
 
 		const float cx = x + w - rbr;
 		const float cy = y + h - rbr;
@@ -521,13 +604,10 @@ void pathRoundedRectVarying(Path* path, float x, float y, float w, float h, floa
 	} else {
 		pathLineTo(path, x + w, y + rtr);
 
-		const float halfDa = bx::acos((path->m_Scale * rtr) / ((path->m_Scale * rtr) + path->m_TesselationTolerance));
-		const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPiHalf / halfDa));
-		const uint32_t numPointsQuarterCircle = (numPointsHalfCircle >> 1) + 1;
-
-		const float dtheta = -bx::kPiHalf / (float)(numPointsQuarterCircle - 1);
-		const float cos_dtheta = bx::cos(dtheta);
-		const float sin_dtheta = bx::sin(dtheta);
+		const ArcStepCache* step = pathGetRoundedRectVaryingStep(path, rtr);
+		const uint32_t numPointsQuarterCircle = step->m_NumPoints;
+		const float cos_dtheta = step->m_CosDTheta;
+		const float sin_dtheta = step->m_SinDTheta;
 
 		const float cx = x + w - rtr;
 		const float cy = y + rtr;
@@ -592,18 +672,14 @@ void pathCircle(Path* path, float cx, float cy, float r)
 void pathEllipse(Path* path, float cx, float cy, float rx, float ry)
 {
 	const float avgR = (rx + ry) * 0.5f;
-	const float da = bx::acos((path->m_Scale * avgR) / ((path->m_Scale * avgR) + path->m_TesselationTolerance)) * 2.0f;
-
-	const uint32_t numPointsHalfCircle = bx::max(2, (uint32_t)bx::ceil(bx::kPi / da));
-	const uint32_t numPoints = (numPointsHalfCircle * 2);
+	const ArcStepCache* step = pathGetEllipseStep(path, avgR);
+	const uint32_t numPoints = step->m_NumPoints;
+	const float cos_dtheta = step->m_CosDTheta;
+	const float sin_dtheta = step->m_SinDTheta;
 
 	pathMoveTo(path, cx + rx, cy);
 
 	float* circleVertices = pathAllocVertices(path, numPoints - 1);
-
-	const float dtheta = -bx::kPi2 / (float)numPoints;
-	const float cos_dtheta = bx::cos(dtheta);
-	const float sin_dtheta = bx::sin(dtheta);
 
 	float ca = 1.0f;
 	float sa = 0.0f;

@@ -20,6 +20,13 @@
 #include <bgfx/bgfx.h>
 #include <bgfx/embedded_shader.h>
 
+#if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86 && FONS_QUAD_SIMD
+#	include <emmintrin.h>
+#	define VG_TEXT_UV_SIMD 1
+#else
+#	define VG_TEXT_UV_SIMD 0
+#endif
+
 // Shaders
 #include "shaders/vs_textured.bin.h"
 #include "shaders/fs_textured.bin.h"
@@ -37,7 +44,7 @@ BX_PRAGMA_DIAGNOSTIC_IGNORED_MSVC(4706) // assignment within conditional express
 #define VG_CONFIG_MAX_FONT_IMAGES                4
 #define VG_CONFIG_MIN_FONT_ATLAS_SIZE            512
 #define VG_CONFIG_COMMAND_LIST_CACHE_STACK_SIZE  32
-#define VG_CONFIG_COMMAND_LIST_ALIGNMENT         16
+#define VG_CONFIG_COMMAND_LIST_ALIGNMENT         4 // All command payload fields are at most 4-byte aligned
 
 // Minimum font size (after scaling with the current transformation matrix),
 // below which no text will be rendered.
@@ -255,6 +262,16 @@ struct CommandHeader
 	CommandType::Enum m_Type;
 	uint32_t m_Size;
 };
+
+// Commands which only produce geometry and don't modify any state. They can be skipped
+// when the scissor rect is empty and the command list allows culling.
+static inline bool isCullableCommand(uint32_t type)
+{
+	return (type >= CommandType::FirstStrokerCommand && type <= CommandType::LastStrokerCommand)
+		|| type == CommandType::IndexedTriList
+		|| type == CommandType::Text
+		|| type == CommandType::TextBox;
+}
 
 struct CachedMesh
 {
@@ -1212,7 +1229,44 @@ void end(Context* ctx)
 	uint16_t prevScissorID = UINT16_MAX;
 	uint32_t prevClipCmdID = UINT32_MAX;
 	uint32_t stencilState = BGFX_STENCIL_NONE;
-	uint8_t nextStencilValue = 1;
+	uint8_t nextStencilValue = 1; // 0 after wrapping around (see below)
+
+	auto submitClipCommand = [&](const DrawCommand* clipCmd, uint8_t stencilValue) {
+		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[clipCmd->m_VertexBufferID];
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		bgfx::setVertexBuffer(0, &gpuvb->m_PosBufferHandle, clipCmd->m_FirstVertexID, clipCmd->m_NumVertices);
+		bgfx::setIndexBuffer(&indexBuffer, clipCmd->m_FirstIndexID, clipCmd->m_NumIndices);
+#else
+		bgfx::setVertexBuffer(0, gpuvb->m_PosBufferHandle, clipCmd->m_FirstVertexID, clipCmd->m_NumVertices);
+		bgfx::setIndexBuffer(gpuib->m_bgfxHandle, clipCmd->m_FirstIndexID, clipCmd->m_NumIndices);
+#endif
+		// Set scissor.
+		{
+			const uint16_t* cmdScissorRect = &clipCmd->m_ScissorRect[0];
+			if (!bx::memCmp(cmdScissorRect, &prevScissorRect[0], sizeof(uint16_t) * 4)) {
+				bgfx::setScissor(prevScissorID);
+			} else {
+				prevScissorID = bgfx::setScissor(cmdScissorRect[0] * devicePixelRatio, cmdScissorRect[1] * devicePixelRatio, cmdScissorRect[2] * devicePixelRatio, cmdScissorRect[3] * devicePixelRatio);
+				bx::memCopy(prevScissorRect, cmdScissorRect, sizeof(uint16_t) * 4);
+			}
+		}
+
+		VG_CHECK(clipCmd->m_Type == DrawCommand::Type::Clip, "Invalid clip command");
+		VG_CHECK(clipCmd->m_HandleID == UINT16_MAX, "Invalid clip command image handle");
+
+		bgfx::setState(0);
+		bgfx::setStencil(0
+			| BGFX_STENCIL_TEST_ALWAYS             // pass always
+			| BGFX_STENCIL_FUNC_REF(stencilValue)  // value = stencilValue
+			| BGFX_STENCIL_FUNC_RMASK(0xff)
+			| BGFX_STENCIL_OP_FAIL_S_REPLACE
+			| BGFX_STENCIL_OP_FAIL_Z_REPLACE
+			| BGFX_STENCIL_OP_PASS_Z_REPLACE, BGFX_STENCIL_NONE);
+
+		// TODO: Check if it's better to use Type_TexturedVertexColor program here to avoid too many 
+		// state switches.
+		bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::Clip]);
+	};
 
 	for (uint32_t iCmd = 0; iCmd < numDrawCommands; ++iCmd) {
 		DrawCommand* cmd = &ctx->m_DrawCommands[iCmd];
@@ -1222,45 +1276,19 @@ void end(Context* ctx)
 			prevClipCmdID = cmdClipState->m_FirstCmdID;
 			const uint32_t numClipCommands = cmdClipState->m_NumCmds;
 			if (numClipCommands) {
+				if (nextStencilValue == 0) {
+					// All 255 stencil values have been used in this frame. Reset the stencil buffer to 0
+					// by rendering all clip meshes (the only things which write to it) with a value of 0.
+					for (uint32_t iClip = 0; iClip < ctx->m_NumClipCommands; ++iClip) {
+						submitClipCommand(&ctx->m_ClipCommands[iClip], 0);
+					}
+					nextStencilValue = 1;
+				}
+
 				for (uint32_t iClip = 0; iClip < numClipCommands; ++iClip) {
 					VG_CHECK(cmdClipState->m_FirstCmdID + iClip < ctx->m_NumClipCommands, "Invalid clip command index");
 
-					DrawCommand* clipCmd = &ctx->m_ClipCommands[cmdClipState->m_FirstCmdID + iClip];
-
-					GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[clipCmd->m_VertexBufferID];
-#if VG_CONFIG_USE_TRANSIENT_BUFFERS
-					bgfx::setVertexBuffer(0, &gpuvb->m_PosBufferHandle, clipCmd->m_FirstVertexID, clipCmd->m_NumVertices);
-					bgfx::setIndexBuffer(&indexBuffer, clipCmd->m_FirstIndexID, clipCmd->m_NumIndices);
-#else
-					bgfx::setVertexBuffer(0, gpuvb->m_PosBufferHandle, clipCmd->m_FirstVertexID, clipCmd->m_NumVertices);
-					bgfx::setIndexBuffer(gpuib->m_bgfxHandle, clipCmd->m_FirstIndexID, clipCmd->m_NumIndices);
-#endif
-					// Set scissor.
-					{
-						const uint16_t* cmdScissorRect = &clipCmd->m_ScissorRect[0];
-						if (!bx::memCmp(cmdScissorRect, &prevScissorRect[0], sizeof(uint16_t) * 4)) {
-							bgfx::setScissor(prevScissorID);
-						} else {
-							prevScissorID = bgfx::setScissor(cmdScissorRect[0] * devicePixelRatio, cmdScissorRect[1] * devicePixelRatio, cmdScissorRect[2] * devicePixelRatio, cmdScissorRect[3] * devicePixelRatio);
-							bx::memCopy(prevScissorRect, cmdScissorRect, sizeof(uint16_t) * 4);
-						}
-					}
-
-					VG_CHECK(clipCmd->m_Type == DrawCommand::Type::Clip, "Invalid clip command");
-					VG_CHECK(clipCmd->m_HandleID == UINT16_MAX, "Invalid clip command image handle");
-
-					bgfx::setState(0);
-					bgfx::setStencil(0
-						| BGFX_STENCIL_TEST_ALWAYS                // pass always
-						| BGFX_STENCIL_FUNC_REF(nextStencilValue) // value = nextStencilValue
-						| BGFX_STENCIL_FUNC_RMASK(0xff)
-						| BGFX_STENCIL_OP_FAIL_S_REPLACE
-						| BGFX_STENCIL_OP_FAIL_Z_REPLACE
-						| BGFX_STENCIL_OP_PASS_Z_REPLACE, BGFX_STENCIL_NONE);
-
-					// TODO: Check if it's better to use Type_TexturedVertexColor program here to avoid too many 
-					// state switches.
-					bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::Clip]);
+					submitClipCommand(&ctx->m_ClipCommands[cmdClipState->m_FirstCmdID + iClip], nextStencilValue);
 				}
 
 				stencilState = 0
@@ -4431,7 +4459,7 @@ static void ctxSubmitCommandList(Context* ctx, CommandListHandle handle)
 
 		const uint8_t* nextCmd = cmd + cmdHeader->m_Size;
 		
-		if (skipCmds && cmdHeader->m_Type >= CommandType::FirstStrokerCommand && cmdHeader->m_Type <= CommandType::LastStrokerCommand) {
+		if (skipCmds && isCullableCommand(cmdHeader->m_Type)) {
 			cmd = nextCmd;
 			continue;
 		}
@@ -5513,6 +5541,24 @@ static uint32_t allocIndices(Context* ctx, uint32_t numIndices)
 	return firstIndexID;
 }
 
+// Returns true if 2 different gradient/image pattern handles describe the same paint, so draw
+// commands using them can be merged (e.g. a gradient recreated with the same parameters every time).
+static bool isSamePaint(const Context* ctx, DrawCommand::Type::Enum type, uint16_t handleA, uint16_t handleB)
+{
+	if (type == DrawCommand::Type::ColorGradient) {
+		const Gradient* a = &ctx->m_Gradients[handleA];
+		const Gradient* b = &ctx->m_Gradients[handleB];
+		return bx::memCmp(a, b, sizeof(Gradient)) == 0;
+	} else if (type == DrawCommand::Type::ImagePattern) {
+		const ImagePattern* a = &ctx->m_ImagePatterns[handleA];
+		const ImagePattern* b = &ctx->m_ImagePatterns[handleB];
+		return a->m_ImageHandle.idx == b->m_ImageHandle.idx
+			&& bx::memCmp(a->m_Matrix, b->m_Matrix, sizeof(a->m_Matrix)) == 0;
+	}
+
+	return false;
+}
+
 static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_t numIndices, DrawCommand::Type::Enum type, uint16_t handle)
 {
 	uint32_t vertexBufferID;
@@ -5531,7 +5577,7 @@ static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_
 		      && prevCmd->m_ScissorRect[2] == (uint16_t)scissor[2] 
 		      && prevCmd->m_ScissorRect[3] == (uint16_t)scissor[3], "Invalid scissor rect");
 
-		if (prevCmd->m_Type == type && prevCmd->m_HandleID == handle) {
+		if (prevCmd->m_Type == type && (prevCmd->m_HandleID == handle || isSamePaint(ctx, type, prevCmd->m_HandleID, handle))) {
 			return prevCmd;
 		}
 	}
@@ -5733,7 +5779,29 @@ static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQua
 	uint32_t* dstColor = &vb->m_Color[vbOffset];
 	vgutil::memset32(dstColor, numDrawVertices, &c);
 
+#if VG_TEXT_UV_SIMD
+	// { s0, t0, s1, t1 } are contiguous in FONSquad. Output order: s0 t0, s1 t0, s1 t1, s0 t1
+	uv_t* dstUV = &vb->m_UV[vbOffset << 1];
+	const FONSquad* q = quads;
 #if VG_CONFIG_UV_INT16
+	const __m128 uvScale = _mm_set1_ps((float)INT16_MAX);
+#endif
+	for (uint32_t i = 0; i < numQuads; ++i) {
+		const __m128 st = _mm_loadu_ps(&q->s0);
+#if VG_CONFIG_UV_INT16
+		// Truncating conversion, same as the (int16_t) cast (values are in [0, INT16_MAX]).
+		const __m128i st_i32 = _mm_cvttps_epi32(_mm_mul_ps(st, uvScale));
+		const __m128i uv01 = _mm_shuffle_epi32(st_i32, _MM_SHUFFLE(1, 2, 1, 0)); // { s0, t0, s1, t0 }
+		const __m128i uv23 = _mm_shuffle_epi32(st_i32, _MM_SHUFFLE(3, 0, 3, 2)); // { s1, t1, s0, t1 }
+		_mm_storeu_si128((__m128i*)dstUV, _mm_packs_epi32(uv01, uv23));
+#else
+		_mm_storeu_ps(dstUV + 0, _mm_shuffle_ps(st, st, _MM_SHUFFLE(1, 2, 1, 0)));
+		_mm_storeu_ps(dstUV + 4, _mm_shuffle_ps(st, st, _MM_SHUFFLE(3, 0, 3, 2)));
+#endif
+		dstUV += 8;
+		++q;
+	}
+#elif VG_CONFIG_UV_INT16
 	int16_t* dstUV = &vb->m_UV[vbOffset << 1];
 	const FONSquad* q = quads;
 	uint32_t nq = numQuads;
@@ -6092,9 +6160,11 @@ static void clCacheRender(Context* ctx, CommandList* cl)
 			continue;
 		}
 
-		if (skipCmds && cmdHeader->m_Type >= CommandType::FirstStrokerCommand && cmdHeader->m_Type <= CommandType::LastStrokerCommand) {
+		if (skipCmds && isCullableCommand(cmdHeader->m_Type)) {
 			cmd = nextCmd;
-			++nextCachedCommand;
+			if (cmdHeader->m_Type >= CommandType::FirstStrokerCommand && cmdHeader->m_Type <= CommandType::LastStrokerCommand) {
+				++nextCachedCommand;
+			}
 			continue;
 		}
 
