@@ -1587,6 +1587,69 @@ static uint64_t* sortPolygonKeys(uint64_t* keys, uint64_t* temp, uint32_t n)
 	return src;
 }
 
+// Returns true if all the edges of the polygon turn CCW around point c and the polygon winds around it exactly once,
+// i.e. the polygon is star-shaped wrt c (c is in its kernel), so it's simple.
+static bool windsOnceAround(const Vec2* vtx, uint32_t n, const Vec2& c)
+{
+	uint32_t numCrossings = 0; // Edges crossing the ray from c towards +X (from below)
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& a = vtx[i];
+		const Vec2& b = vtx[i + 1 == n ? 0 : i + 1];
+		if (!(orient2d(c, a, b) > 0.0)) {
+			return false;
+		}
+
+		numCrossings += (a.y < c.y && b.y >= c.y) ? 1 : 0;
+	}
+
+	return numCrossings == 1;
+}
+
+// Returns true if any 2 non-adjacent edges of the polygon intersect or touch. Uses a sweep along the X or Y axis:
+// the edges are sorted by their min coordinate and each edge is tested only against the following edges whose range
+// overlaps with its own.
+static bool hasIntersectingEdges(const Vec2* vtx, uint32_t n, bool sweepY)
+{
+	float edgeMin[kMaxSimplePolygonVertices];
+	float edgeMax[kMaxSimplePolygonVertices];
+	uint64_t sortKeys[kMaxSimplePolygonVertices];
+	uint64_t sortTemp[kMaxSimplePolygonVertices];
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		const float c1 = sweepY ? p1.y : p1.x;
+		const float c2 = sweepY ? p2.y : p2.x;
+		edgeMin[i] = bx::min(c1, c2);
+		edgeMax[i] = bx::max(c1, c2);
+		sortKeys[i] = ((uint64_t)floatSortKey(edgeMin[i]) << 32) | i;
+	}
+
+	const uint64_t* sortedEdges = sortPolygonKeys(sortKeys, sortTemp, n);
+	for (uint32_t i = 0; i < n; ++i) {
+		const uint32_t ea = (uint32_t)sortedEdges[i];
+		const float maxC = edgeMax[ea];
+		const Vec2& a = vtx[ea];
+		const Vec2& b = vtx[ea + 1 == n ? 0 : ea + 1];
+		for (uint32_t j = i + 1; j < n; ++j) {
+			const uint32_t eb = (uint32_t)sortedEdges[j];
+			if (edgeMin[eb] > maxC) {
+				break;
+			}
+
+			const uint32_t d = ea > eb ? ea - eb : eb - ea;
+			if (d == 1 || d == n - 1) {
+				continue; // Adjacent
+			}
+
+			if (segmentsIntersect(a, b, vtx[eb], vtx[eb + 1 == n ? 0 : eb + 1])) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 // Uniform grid over the bounding box of a polygon (see triangulateSimplePolygon()).
 struct PolygonGrid
 {
@@ -1683,6 +1746,8 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 	bool isReflex[kMaxSimplePolygonVertices]; // Reflex or flat vertices (see ear clipping below)
 	float sumDx = 0.0f;
 	float sumDy = 0.0f;
+	double sumX = 0.0;
+	double sumY = 0.0;
 	Vec2 bbMin = vtx[0];
 	Vec2 bbMax = vtx[0];
 	for (uint32_t i = 0; i < n; ++i) {
@@ -1700,49 +1765,18 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 		isReflex[i] = !(o > 0.0);
 		sumDx += bx::abs(p2.x - p1.x);
 		sumDy += bx::abs(p2.y - p1.y);
+		sumX += p1.x;
+		sumY += p1.y;
 		bbMin = { bx::min(bbMin.x, p1.x), bx::min(bbMin.y, p1.y) };
 		bbMax = { bx::max(bbMax.x, p1.x), bx::max(bbMax.y, p1.y) };
 	}
 
-	// Other edges are tested with a sweep along the X or Y axis (the one along which the edges overlap less):
-	// the edges are sorted by their min coordinate and each edge is tested only against the following edges whose
-	// range overlaps with its own.
-	const bool sweepY = sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x);
-	float edgeMin[kMaxSimplePolygonVertices];
-	float edgeMax[kMaxSimplePolygonVertices];
-	uint64_t sortKeys[kMaxSimplePolygonVertices];
-	uint64_t sortTemp[kMaxSimplePolygonVertices];
-	for (uint32_t i = 0; i < n; ++i) {
-		const Vec2& p1 = vtx[i];
-		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
-		const float c1 = sweepY ? p1.y : p1.x;
-		const float c2 = sweepY ? p2.y : p2.x;
-		edgeMin[i] = bx::min(c1, c2);
-		edgeMax[i] = bx::max(c1, c2);
-		sortKeys[i] = ((uint64_t)floatSortKey(edgeMin[i]) << 32) | i;
-	}
-
-	const uint64_t* sortedEdges = sortPolygonKeys(sortKeys, sortTemp, n);
-	for (uint32_t i = 0; i < n; ++i) {
-		const uint32_t ea = (uint32_t)sortedEdges[i];
-		const float maxC = edgeMax[ea];
-		const Vec2& a = vtx[ea];
-		const Vec2& b = vtx[ea + 1 == n ? 0 : ea + 1];
-		for (uint32_t j = i + 1; j < n; ++j) {
-			const uint32_t eb = (uint32_t)sortedEdges[j];
-			if (edgeMin[eb] > maxC) {
-				break;
-			}
-
-			const uint32_t d = ea > eb ? ea - eb : eb - ea;
-			if (d == 1 || d == n - 1) {
-				continue; // Adjacent
-			}
-
-			if (segmentsIntersect(a, b, vtx[eb], vtx[eb + 1 == n ? 0 : eb + 1])) {
-				return 0;
-			}
-		}
+	// Star-shaped polygons (e.g. stars, circles, rounded shapes) are simple if they wind exactly once around a point
+	// of their kernel (the average of the vertices is tried). Other polygons are tested with a sweep.
+	const Vec2 center = { (float)(sumX / n), (float)(sumY / n) };
+	if (!windsOnceAround(vtx, n, center)
+	&&  hasIntersectingEdges(vtx, n, sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x))) {
+		return 0;
 	}
 
 	PolygonGrid grid;
