@@ -36,6 +36,8 @@
 #include "shaders/fs_image_pattern.bin.h"
 #include "shaders/vs_stencil.bin.h"
 #include "shaders/fs_stencil.bin.h"
+#include "shaders/vs_shape.bin.h"
+#include "shaders/fs_shape.bin.h"
 
 BX_PRAGMA_DIAGNOSTIC_IGNORED_MSVC(4706) // assignment within conditional expression
 
@@ -62,6 +64,8 @@ static const bgfx::EmbeddedShader s_EmbeddedShaders[] =
 	BGFX_EMBEDDED_SHADER(fs_image_pattern),
 	BGFX_EMBEDDED_SHADER(vs_stencil),
 	BGFX_EMBEDDED_SHADER(fs_stencil),
+	BGFX_EMBEDDED_SHADER(vs_shape),
+	BGFX_EMBEDDED_SHADER(fs_shape),
 
 	BGFX_EMBEDDED_SHADER_END()
 };
@@ -122,6 +126,7 @@ struct DrawCommand
 			ColorGradient,
 			ImagePattern,
 			Clip,
+			Shape, // Analytic shapes (see createDrawCommand_Shape())
 
 			NumTypes
 		};
@@ -136,7 +141,31 @@ struct DrawCommand
 	uint32_t m_NumIndices;
 	uint16_t m_ScissorRect[4];
 	uint16_t m_HandleID; // Type::Textured => ImageHandle, Type::ColorGradient => GradientHandle, Type::ImagePattern => ImagePatternHandle
+	uint32_t m_FirstShapeVertexID; // Type::Shape => first vertex in Context::m_ShapeVertices
 };
+
+// A rectangle, rounded rectangle or circle added to an empty path. It's converted to path vertices only if the path
+// can't be drawn as an analytic shape (see drawPendingShape()).
+struct PendingShape
+{
+	struct Type
+	{
+		enum Enum : uint8_t
+		{
+			None = 0,
+			Rect,               // x, y, w, h
+			RoundedRect,        // x, y, w, h, r
+			RoundedRectVarying, // x, y, w, h, rtl, rtr, rbr, rbl
+			Circle,             // cx, cy, r
+		};
+	};
+
+	Type::Enum m_Type;
+	float m_Args[8];
+};
+
+// Floats per vertex of Type::Shape draw commands (3 x vec4, see fs_shape.sc)
+static const uint32_t kShapeVertexSize = 12;
 
 struct GPUVertexBuffer
 {
@@ -445,6 +474,16 @@ struct Context
 
 	float* m_TransformedVertices;
 	uint32_t m_TransformedVertexCapacity;
+	PendingShape m_PendingShape;       // A shape added to the (still empty) path, not converted to path vertices yet
+	float* m_ShapeVertices;            // Per vertex shape parameters of Type::Shape draw commands (kShapeVertexSize floats each):
+	uint32_t m_NumShapeVertices;       // m_ShapeTransientBuffer's data or m_ShapeHeapVertices (see growShapeVertices())
+	uint32_t m_ShapeVertexCapacity;    // Capacity of m_ShapeVertices (0 until the first shape of the frame)
+	float* m_ShapeHeapVertices;        // Persistent storage, reused across frames. Grow-only.
+	uint32_t m_ShapeHeapCapacity;
+	uint32_t m_NumFrameShapeVertices;  // Number of shape vertices generated between the last begin()/end() pair
+	bgfx::TransientVertexBuffer m_ShapeTransientBuffer;
+	bool m_ShapeTransient;             // m_ShapeVertices points directly into m_ShapeTransientBuffer
+	bool m_ShapesSupported;            // The analytic shape program is available for the active renderer
 	bool m_PathTransformed;
 	bool m_PathBoundsValid;
 	float m_PathBounds[4]; // { minx, miny, maxx, maxy } of the transformed path
@@ -485,6 +524,7 @@ struct Context
 	bgfx::VertexLayout m_PosVertexDecl;
 	bgfx::VertexLayout m_UVVertexDecl;
 	bgfx::VertexLayout m_ColorVertexDecl;
+	bgfx::VertexLayout m_ShapeVertexDecl;
 	bgfx::ProgramHandle m_ProgramHandle[DrawCommand::Type::NumTypes];
 	bgfx::UniformHandle m_TexUniform;
 	bgfx::UniformHandle m_PaintMatUniform;
@@ -534,6 +574,10 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
+static void flushPendingShape(Context* ctx);
+static bool deferShape(Context* ctx, PendingShape::Type::Enum type, const float* args, uint32_t numArgs);
+static bool pendingShapeHasSharpCorners(const Context* ctx);
+static bool drawPendingShape(Context* ctx, Color color, uint32_t mode, float halfStrokeWidth, bool sharpCorners);
 
 // Makes the stroker write its geometry directly into the vertex/index buffers of a draw command, which is
 // equivalent to (but avoids the copies of) generating the mesh into the stroker's buffers and calling
@@ -887,6 +931,32 @@ Context* createContext(bx::AllocatorI* allocator, const ContextConfig* userCfg)
 		bgfx::createEmbeddedShader(s_EmbeddedShaders, bgfxRendererType, "fs_stencil"),
 		true);
 
+	ctx->m_ProgramHandle[DrawCommand::Type::Shape] = BGFX_INVALID_HANDLE;
+#if VG_CONFIG_ENABLE_ANALYTIC_SHAPES
+	{
+		// NOTE: The shaders might not be available for all renderers (e.g. if they haven't been compiled for it), in
+		// which case the shapes are generated as geometry.
+		const bgfx::ShaderHandle vs = bgfx::createEmbeddedShader(s_EmbeddedShaders, bgfxRendererType, "vs_shape");
+		const bgfx::ShaderHandle fs = bgfx::createEmbeddedShader(s_EmbeddedShaders, bgfxRendererType, "fs_shape");
+		if (bgfx::isValid(vs) && bgfx::isValid(fs)) {
+			ctx->m_ProgramHandle[DrawCommand::Type::Shape] = bgfx::createProgram(vs, fs, true);
+		} else {
+			if (bgfx::isValid(vs)) {
+				bgfx::destroy(vs);
+			}
+			if (bgfx::isValid(fs)) {
+				bgfx::destroy(fs);
+			}
+		}
+	}
+	ctx->m_ShapeVertexDecl.begin()
+		.add(bgfx::Attrib::TexCoord1, 4, bgfx::AttribType::Float)
+		.add(bgfx::Attrib::TexCoord2, 4, bgfx::AttribType::Float)
+		.add(bgfx::Attrib::TexCoord3, 4, bgfx::AttribType::Float)
+		.end();
+#endif
+	ctx->m_ShapesSupported = bgfx::isValid(ctx->m_ProgramHandle[DrawCommand::Type::Shape]);
+
 	ctx->m_TexUniform = bgfx::createUniform("s_tex", bgfx::UniformType::Sampler, 1);
 	ctx->m_PaintMatUniform = bgfx::createUniform("u_paintMat", bgfx::UniformType::Mat3, 1);
 	ctx->m_ExtentRadiusFeatherUniform = bgfx::createUniform("u_extentRadiusFeather", bgfx::UniformType::Vec4, 1);
@@ -1105,6 +1175,12 @@ void destroyContext(Context* ctx)
 	bx::free(allocator, ctx->m_AlphaScaledColors);
 	ctx->m_AlphaScaledColors = nullptr;
 
+	bx::free(allocator, ctx->m_ShapeHeapVertices);
+	ctx->m_ShapeHeapVertices = nullptr;
+	ctx->m_ShapeHeapCapacity = 0;
+	ctx->m_ShapeVertices = nullptr;
+	ctx->m_ShapeVertexCapacity = 0;
+
 #if BX_CONFIG_SUPPORTS_THREADING
 	bx::deleteObject(allocator, ctx->m_DataPoolMutex);
 #endif
@@ -1154,6 +1230,11 @@ void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasH
 
 	ctx->m_NumDrawCommands = 0;
 	ctx->m_ForceNewDrawCommand = true;
+	ctx->m_NumShapeVertices = 0;
+	ctx->m_ShapeVertices = nullptr;
+	ctx->m_ShapeVertexCapacity = 0;
+	ctx->m_ShapeTransient = false;
+	ctx->m_PendingShape.m_Type = PendingShape::Type::None;
 
 	ctx->m_NumClipCommands = 0;
 	ctx->m_ForceNewClipCommand = true;
@@ -1311,6 +1392,25 @@ void end(Context* ctx)
 		bgfx::update(gpuib->m_bgfxHandle, 0, indexMem);
 	}
 #endif
+
+	// Per vertex parameters of analytic shapes (see createDrawCommand_Shape())
+	bgfx::TransientVertexBuffer shapeVertexBuffer;
+	bool hasShapeVertexBuffer = false;
+	ctx->m_NumFrameShapeVertices = ctx->m_NumShapeVertices;
+	if (ctx->m_ShapeTransient) {
+		// The parameters have been written directly into the transient buffer.
+		shapeVertexBuffer = ctx->m_ShapeTransientBuffer;
+		hasShapeVertexBuffer = true;
+	} else if (ctx->m_NumShapeVertices != 0) {
+		const uint32_t numShapeVertices = ctx->m_NumShapeVertices;
+		if (bgfx::getAvailTransientVertexBuffer(numShapeVertices, ctx->m_ShapeVertexDecl) == numShapeVertices) {
+			bgfx::allocTransientVertexBuffer(&shapeVertexBuffer, numShapeVertices, ctx->m_ShapeVertexDecl);
+			bx::memCopy(shapeVertexBuffer.data, ctx->m_ShapeVertices, sizeof(float) * kShapeVertexSize * numShapeVertices);
+			hasShapeVertexBuffer = true;
+		} else {
+			VG_WARN(false, "Not enough transient vertex buffer memory for %u shape vertices", numShapeVertices);
+		}
+	}
 
 	const uint16_t viewID = ctx->m_ViewID;
 	const uint16_t canvasWidth = ctx->m_CanvasWidth;
@@ -1486,6 +1586,20 @@ void end(Context* ctx)
 			bgfx::setStencil(stencilState);
 
 			bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::ImagePattern]);
+		} else if (cmd->m_Type == DrawCommand::Type::Shape) {
+			if (!hasShapeVertexBuffer) {
+				bgfx::discard();
+				continue;
+			}
+
+			bgfx::setVertexBuffer(2, &shapeVertexBuffer, cmd->m_FirstShapeVertexID, cmd->m_NumVertices);
+			bgfx::setState(0
+				| BGFX_STATE_WRITE_A
+				| BGFX_STATE_WRITE_RGB
+				| BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA));
+			bgfx::setStencil(stencilState);
+
+			bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::Shape]);
 		} else {
 			VG_CHECK(false, "Unknown draw command type");
 		}
@@ -3186,6 +3300,7 @@ static void ctxBeginPath(Context* ctx)
 
 	pathReset(path, avgScale, testTol);
 	strokerReset(stroker, avgScale, testTol, fringeWidth);
+	ctx->m_PendingShape.m_Type = PendingShape::Type::None;
 	ctx->m_PathTransformed = false;
 	ctx->m_PathBoundsValid = false;
 }
@@ -3193,78 +3308,106 @@ static void ctxBeginPath(Context* ctx)
 static void ctxMoveTo(Context* ctx, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathMoveTo(ctx->m_Path, x, y);
 }
 
 static void ctxLineTo(Context* ctx, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathLineTo(ctx->m_Path, x, y);
 }
 
 static void ctxCubicTo(Context* ctx, float c1x, float c1y, float c2x, float c2y, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathCubicTo(ctx->m_Path, c1x, c1y, c2x, c2y, x, y);
 }
 
 static void ctxQuadraticTo(Context* ctx, float cx, float cy, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathQuadraticTo(ctx->m_Path, cx, cy, x, y);
 }
 
 static void ctxArc(Context* ctx, float cx, float cy, float r, float a0, float a1, Winding::Enum dir)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathArc(ctx->m_Path, cx, cy, r, a0, a1, dir);
 }
 
 static void ctxArcTo(Context* ctx, float x1, float y1, float x2, float y2, float r)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathArcTo(ctx->m_Path, x1, y1, x2, y2, r);
 }
 
 static void ctxRect(Context* ctx, float x, float y, float w, float h)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	pathRect(ctx->m_Path, x, y, w, h);
+	const float args[] = { x, y, w, h };
+	if (!deferShape(ctx, PendingShape::Type::Rect, args, 4)) {
+		flushPendingShape(ctx);
+		pathRect(ctx->m_Path, x, y, w, h);
+	}
 }
 
 static void ctxRoundedRect(Context* ctx, float x, float y, float w, float h, float r)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	pathRoundedRect(ctx->m_Path, x, y, w, h, r);
+	const float args[] = { x, y, w, h, r };
+	if (!deferShape(ctx, PendingShape::Type::RoundedRect, args, 5)) {
+		flushPendingShape(ctx);
+		pathRoundedRect(ctx->m_Path, x, y, w, h, r);
+	}
 }
 
 static void ctxRoundedRectVarying(Context* ctx, float x, float y, float w, float h, float rtl, float rtr, float rbr, float rbl)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	pathRoundedRectVarying(ctx->m_Path, x, y, w, h, rtl, rtr, rbr, rbl);
+	const float args[] = { x, y, w, h, rtl, rtr, rbr, rbl };
+	if (!deferShape(ctx, PendingShape::Type::RoundedRectVarying, args, 8)) {
+		flushPendingShape(ctx);
+		pathRoundedRectVarying(ctx->m_Path, x, y, w, h, rtl, rtr, rbr, rbl);
+	}
 }
 
 static void ctxCircle(Context* ctx, float cx, float cy, float radius)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	pathCircle(ctx->m_Path, cx, cy, radius);
+	const float args[] = { cx, cy, radius };
+	if (!deferShape(ctx, PendingShape::Type::Circle, args, 3)) {
+		flushPendingShape(ctx);
+		pathCircle(ctx->m_Path, cx, cy, radius);
+	}
 }
 
 static void ctxEllipse(Context* ctx, float cx, float cy, float rx, float ry)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	pathEllipse(ctx->m_Path, cx, cy, rx, ry);
+	const float args[] = { cx, cy, rx };
+	if (rx != ry || !deferShape(ctx, PendingShape::Type::Circle, args, 3)) {
+		flushPendingShape(ctx);
+		pathEllipse(ctx->m_Path, cx, cy, rx, ry);
+	}
 }
 
 static void ctxPolyline(Context* ctx, const float* coords, uint32_t numPoints)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathPolyline(ctx->m_Path, coords, numPoints);
 }
 
 static void ctxClosePath(Context* ctx)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
+	flushPendingShape(ctx);
 	pathClose(ctx->m_Path);
 }
 
@@ -3286,13 +3429,21 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 		return;
 	}
 
-	const float* pathVertices = transformPath(ctx);
-
 #if VG_CONFIG_FORCE_AA_OFF
 	const bool aa = false;
 #else
 	const bool aa = recordClipCommands ? false : VG_FILL_FLAGS_AA(flags);
 #endif
+
+	// Analytic shapes aren't recorded in caches or used as clip shapes.
+	if (ctx->m_PendingShape.m_Type != PendingShape::Type::None && aa && !hasCache && !recordClipCommands) {
+		if (drawPendingShape(ctx, col, 0, 0.0f, true)) {
+			return;
+		}
+	}
+
+	flushPendingShape(ctx);
+	const float* pathVertices = transformPath(ctx);
 	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
 	const FillRule::Enum fillRule = VG_FILL_FLAGS_RULE(flags);
 
@@ -3416,6 +3567,7 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 	const bool hasCache = false;
 #endif
 
+	flushPendingShape(ctx);
 	const float* pathVertices = transformPath(ctx);
 
 	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
@@ -3555,6 +3707,7 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 	const bool aa = VG_FILL_FLAGS_AA(flags);
 #endif
 
+	flushPendingShape(ctx);
 	const float* pathVertices = transformPath(ctx);
 
 	// Skip generating geometry which will be completely scissored out. Cached command lists must
@@ -3685,6 +3838,17 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 
 	const float strokeWidth = isThin ? fringeWidth : scaledStrokeWidth;
 
+	// Analytic shapes aren't recorded in caches or used as clip shapes. Corners with a radius of 0 are joins: miter
+	// joins are sharp and round joins are round (thin strokes use bevel joins instead of round joins).
+	if (ctx->m_PendingShape.m_Type != PendingShape::Type::None && aa && !hasCache && !recordClipCommands) {
+		if (lineJoin == LineJoin::Miter || (lineJoin == LineJoin::Round && !isThin) || !pendingShapeHasSharpCorners(ctx)) {
+			if (drawPendingShape(ctx, col, isThin ? 2 : 1, strokeWidth * 0.5f, lineJoin == LineJoin::Miter)) {
+				return;
+			}
+		}
+	}
+
+	flushPendingShape(ctx);
 	const float* pathVertices = transformPath(ctx);
 
 	const Path* path = ctx->m_Path;
@@ -3789,6 +3953,7 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 	const bool aa = VG_STROKE_FLAGS_AA(flags);
 #endif
 
+	flushPendingShape(ctx);
 	const float* pathVertices = transformPath(ctx);
 
 	const State* state = getState(ctx);
@@ -3918,6 +4083,7 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 
 	const float strokeWidth = isThin ? fringeWidth : scaledStrokeWidth;
 
+	flushPendingShape(ctx);
 	const float* pathVertices = transformPath(ctx);
 
 	// Skip generating geometry which will be completely scissored out. Cached command lists must
@@ -5761,6 +5927,285 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 
 	cmd->m_NumVertices += numVertices;
 	cmd->m_NumIndices += numIndices;
+}
+
+// Analytic shapes: a rectangle, rounded rectangle or circle added to an empty path is kept as a PendingShape. If
+// the path is then filled or stroked with a solid color, AA, and a similarity transform (translation, rotation,
+// uniform scale), it's drawn as a single quad whose coverage is computed by fs_shape.sc (Type::Shape draw command).
+// Otherwise (or when any other path command is added) it's converted to path vertices.
+
+// Converts the pending shape (if any) to path vertices.
+static void flushPendingShape(Context* ctx)
+{
+	PendingShape* shape = &ctx->m_PendingShape;
+	const PendingShape::Type::Enum type = shape->m_Type;
+	if (type == PendingShape::Type::None) {
+		return;
+	}
+
+	shape->m_Type = PendingShape::Type::None;
+
+	const float* a = shape->m_Args;
+	Path* path = ctx->m_Path;
+	switch (type) {
+	case PendingShape::Type::Rect:
+		pathRect(path, a[0], a[1], a[2], a[3]);
+		break;
+	case PendingShape::Type::RoundedRect:
+		pathRoundedRect(path, a[0], a[1], a[2], a[3], a[4]);
+		break;
+	case PendingShape::Type::RoundedRectVarying:
+		pathRoundedRectVarying(path, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+		break;
+	case PendingShape::Type::Circle:
+		pathCircle(path, a[0], a[1], a[2]);
+		break;
+	default:
+		break;
+	}
+}
+
+// Returns true if the shape has been kept as the pending shape of the path (instead of being added to the path).
+static bool deferShape(Context* ctx, PendingShape::Type::Enum type, const float* args, uint32_t numArgs)
+{
+#if VG_CONFIG_ENABLE_ANALYTIC_SHAPES
+	if (!ctx->m_ShapesSupported || ctx->m_PendingShape.m_Type != PendingShape::Type::None || pathGetNumVertices(ctx->m_Path) != 0) {
+		return false;
+	}
+
+	// Only non-degenerate shapes (also rejects NaNs)
+	if (type == PendingShape::Type::Circle) {
+		if (!(args[2] > 0.0f)) {
+			return false;
+		}
+	} else {
+		if (!(args[2] > 0.0f) || !(args[3] > 0.0f)) {
+			return false;
+		}
+		for (uint32_t i = 4; i < numArgs; ++i) {
+			if (!(args[i] >= 0.0f)) {
+				return false;
+			}
+		}
+	}
+
+	PendingShape* shape = &ctx->m_PendingShape;
+	shape->m_Type = type;
+	bx::memCopy(shape->m_Args, args, sizeof(float) * numArgs);
+	return true;
+#else
+	BX_UNUSED(ctx, type, args, numArgs);
+	return false;
+#endif
+}
+
+struct AnalyticShape
+{
+	float m_Center[2];
+	float m_HalfSize[2];
+	float m_Radii[4]; // Corner radii { (+x, +y), (+x, -y), (-x, +y), (-x, -y) } (canvas y points down)
+};
+
+// Same corners and radii as the path functions (see pathRect(), pathRoundedRect(), pathRoundedRectVarying() and
+// pathCircle()).
+static void getAnalyticShape(const PendingShape* shape, AnalyticShape* out)
+{
+	const float* a = shape->m_Args;
+	if (shape->m_Type == PendingShape::Type::Circle) {
+		out->m_Center[0] = a[0];
+		out->m_Center[1] = a[1];
+		out->m_HalfSize[0] = a[2];
+		out->m_HalfSize[1] = a[2];
+		out->m_Radii[0] = out->m_Radii[1] = out->m_Radii[2] = out->m_Radii[3] = a[2];
+		return;
+	}
+
+	const float hw = a[2] * 0.5f;
+	const float hh = a[3] * 0.5f;
+	out->m_Center[0] = a[0] + hw;
+	out->m_Center[1] = a[1] + hh;
+	out->m_HalfSize[0] = hw;
+	out->m_HalfSize[1] = hh;
+
+	if (shape->m_Type == PendingShape::Type::RoundedRect) {
+		const float r = a[4] < 0.1f ? 0.0f : bx::min<float>(a[4], hw, hh);
+		out->m_Radii[0] = out->m_Radii[1] = out->m_Radii[2] = out->m_Radii[3] = r;
+	} else if (shape->m_Type == PendingShape::Type::RoundedRectVarying) {
+		const float rtl = a[4], rtr = a[5], rbr = a[6], rbl = a[7];
+		if (rtl < 0.1f && rtr < 0.1f && rbr < 0.1f && rbl < 0.1f) {
+			out->m_Radii[0] = out->m_Radii[1] = out->m_Radii[2] = out->m_Radii[3] = 0.0f;
+		} else {
+			const float r[4] = { rbr, rtr, rbl, rtl };
+			for (uint32_t i = 0; i < 4; ++i) {
+				const float ri = bx::min<float>(r[i], hw, hh);
+				out->m_Radii[i] = ri < 0.1f ? 0.0f : ri;
+			}
+		}
+	} else {
+		out->m_Radii[0] = out->m_Radii[1] = out->m_Radii[2] = out->m_Radii[3] = 0.0f;
+	}
+}
+
+static bool pendingShapeHasSharpCorners(const Context* ctx)
+{
+	AnalyticShape shape;
+	getAnalyticShape(&ctx->m_PendingShape, &shape);
+	return shape.m_Radii[0] == 0.0f || shape.m_Radii[1] == 0.0f || shape.m_Radii[2] == 0.0f || shape.m_Radii[3] == 0.0f;
+}
+
+// The shape parameters are written directly into a bgfx transient vertex buffer, with a capacity based on the number
+// of shape vertices of the previous frame. If the frame needs more (or there isn't enough transient memory), they are
+// moved to the heap buffer and copied into a transient vertex buffer in end().
+static void growShapeVertices(Context* ctx, uint32_t minCapacity)
+{
+	const uint32_t stride = sizeof(float) * kShapeVertexSize;
+	if (ctx->m_ShapeVertexCapacity == 0) {
+		const uint32_t prevCount = ctx->m_NumFrameShapeVertices;
+		const uint32_t capacity = bx::max<uint32_t>(minCapacity, prevCount + prevCount / 8 + 256);
+		if (bgfx::getAvailTransientVertexBuffer(capacity, ctx->m_ShapeVertexDecl) == capacity) {
+			bgfx::allocTransientVertexBuffer(&ctx->m_ShapeTransientBuffer, capacity, ctx->m_ShapeVertexDecl);
+			ctx->m_ShapeVertices = (float*)ctx->m_ShapeTransientBuffer.data;
+			ctx->m_ShapeVertexCapacity = capacity;
+			ctx->m_ShapeTransient = true;
+			return;
+		}
+	}
+
+	if (minCapacity > ctx->m_ShapeHeapCapacity) {
+		ctx->m_ShapeHeapCapacity = bx::max<uint32_t>(minCapacity, bx::max<uint32_t>(256, ctx->m_ShapeHeapCapacity + ctx->m_ShapeHeapCapacity / 2));
+		ctx->m_ShapeHeapVertices = (float*)bx::realloc(ctx->m_Allocator, ctx->m_ShapeHeapVertices, stride * ctx->m_ShapeHeapCapacity);
+	}
+
+	if (ctx->m_ShapeTransient) {
+		bx::memCopy(ctx->m_ShapeHeapVertices, ctx->m_ShapeVertices, stride * ctx->m_NumShapeVertices);
+		ctx->m_ShapeTransient = false;
+	}
+
+	ctx->m_ShapeVertices = ctx->m_ShapeHeapVertices;
+	ctx->m_ShapeVertexCapacity = ctx->m_ShapeHeapCapacity;
+}
+
+// Allocates the 4 vertices (a quad) of an analytic shape. Returns false if they can't be allocated. Otherwise
+// *pos points to the 4 positions and *params to the kShapeVertexSize parameters of each vertex (see fs_shape.sc).
+static bool createDrawCommand_Shape(Context* ctx, Color color, float** pos, float** params)
+{
+	if (!canAllocVertices(ctx, 4)) {
+		return false;
+	}
+
+	DrawCommand* cmd = allocDrawCommand(ctx, 4, 6, DrawCommand::Type::Shape, UINT16_MAX);
+	if (cmd->m_NumVertices == 0) {
+		cmd->m_FirstShapeVertexID = ctx->m_NumShapeVertices;
+	}
+	VG_CHECK(cmd->m_FirstShapeVertexID + cmd->m_NumVertices == ctx->m_NumShapeVertices, "Shape vertices of a draw command must be contiguous");
+
+	VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
+	const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
+	*pos = &vb->m_Pos[vbOffset << 1];
+	uint32_t* dstColor = &vb->m_Color[vbOffset];
+	dstColor[0] = dstColor[1] = dstColor[2] = dstColor[3] = color;
+
+	if (ctx->m_NumShapeVertices + 4 > ctx->m_ShapeVertexCapacity) {
+		growShapeVertices(ctx, ctx->m_NumShapeVertices + 4);
+	}
+	*params = &ctx->m_ShapeVertices[ctx->m_NumShapeVertices * kShapeVertexSize];
+	ctx->m_NumShapeVertices += 4;
+
+	IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
+	uint16_t* dstIndex = &ib->m_Indices[cmd->m_FirstIndexID + cmd->m_NumIndices];
+	const uint16_t base = (uint16_t)cmd->m_NumVertices;
+	dstIndex[0] = base;
+	dstIndex[1] = (uint16_t)(base + 1);
+	dstIndex[2] = (uint16_t)(base + 2);
+	dstIndex[3] = base;
+	dstIndex[4] = (uint16_t)(base + 2);
+	dstIndex[5] = (uint16_t)(base + 3);
+
+	cmd->m_NumVertices += 4;
+	cmd->m_NumIndices += 6;
+	return true;
+}
+
+// Draws the pending shape as a Type::Shape draw command. mode: 0 = fill, 1 = stroke, 2 = thin stroke (see
+// fs_shape.sc). halfStrokeWidth and the fringe width are in canvas units. sharpCorners: whether corners with a
+// radius of 0 are sharp (fills and miter joins) or round (round joins).
+// Returns false if the shape can't be drawn this way with the current transform.
+static bool drawPendingShape(Context* ctx, Color color, uint32_t mode, float halfStrokeWidth, bool sharpCorners)
+{
+	const State* state = getState(ctx);
+	const float* mtx = state->m_TransformMtx;
+
+	// Similarity transforms only: orthogonal axes of equal length.
+	const float len0 = mtx[0] * mtx[0] + mtx[1] * mtx[1];
+	const float len1 = mtx[2] * mtx[2] + mtx[3] * mtx[3];
+	const float dot = mtx[0] * mtx[2] + mtx[1] * mtx[3];
+	const float tolerance = 1e-4f * bx::max<float>(len0, len1);
+	if (!(len0 > 0.0f) || bx::abs(len0 - len1) > tolerance || bx::abs(dot) > tolerance) {
+		return false;
+	}
+
+	const float scale = bx::sqrt(len0);
+
+	AnalyticShape shape;
+	getAnalyticShape(&ctx->m_PendingShape, &shape);
+
+	// The quad covers all the pixels with a non-zero coverage (see fs_shape.sc).
+	const float fringeWidth = ctx->m_FringeWidth;
+	const float margin = (mode == 1 ? halfStrokeWidth : 0.0f) + fringeWidth;
+	const float ex = shape.m_HalfSize[0] + margin / scale;
+	const float ey = shape.m_HalfSize[1] + margin / scale;
+	const float corners[4][2] = { { -ex, -ey }, { ex, -ey }, { ex, ey }, { -ex, ey } };
+
+	float quad[8];
+	for (uint32_t i = 0; i < 4; ++i) {
+		const float x = shape.m_Center[0] + corners[i][0];
+		const float y = shape.m_Center[1] + corners[i][1];
+		quad[i * 2 + 0] = mtx[0] * x + mtx[2] * y + mtx[4];
+		quad[i * 2 + 1] = mtx[1] * x + mtx[3] * y + mtx[5];
+	}
+
+	const float minx = bx::min<float>(quad[0], quad[2], bx::min<float>(quad[4], quad[6]));
+	const float miny = bx::min<float>(quad[1], quad[3], bx::min<float>(quad[5], quad[7]));
+	const float maxx = bx::max<float>(quad[0], quad[2], bx::max<float>(quad[4], quad[6]));
+	const float maxy = bx::max<float>(quad[1], quad[3], bx::max<float>(quad[5], quad[7]));
+
+	const float* scissor = state->m_ScissorRect;
+	if (scissor[2] < 1.0f || scissor[3] < 1.0f || isRectOutsideScissor(state, minx, miny, maxx, maxy)) {
+		return true; // Culled
+	}
+
+	float* pos;
+	float* params;
+	if (!createDrawCommand_Shape(ctx, color, &pos, &params)) {
+		return true;
+	}
+
+	const float shapeParams[kShapeVertexSize - 2] = {
+		shape.m_HalfSize[0] * scale,
+		shape.m_HalfSize[1] * scale,
+		shape.m_Radii[0] * scale,
+		shape.m_Radii[1] * scale,
+		shape.m_Radii[2] * scale,
+		shape.m_Radii[3] * scale,
+		halfStrokeWidth,
+		fringeWidth,
+		(float)mode,
+		sharpCorners ? 1.0f : 0.0f
+	};
+
+	for (uint32_t i = 0; i < 4; ++i) {
+		pos[i * 2 + 0] = quad[i * 2 + 0];
+		pos[i * 2 + 1] = quad[i * 2 + 1];
+
+		float* v = &params[i * kShapeVertexSize];
+		v[0] = corners[i][0] * scale;
+		v[1] = corners[i][1] * scale;
+		for (uint32_t j = 0; j < kShapeVertexSize - 2; ++j) {
+			v[2 + j] = shapeParams[j];
+		}
+	}
+
+	return true;
 }
 
 // Image pattern UVs are an affine function of the (canvas space) vertex positions (see vs_image_pattern.sc).
