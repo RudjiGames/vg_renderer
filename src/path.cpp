@@ -172,15 +172,24 @@ void pathMoveTo(Path* path, float x, float y)
 	pathAddVertex(path, x, y);
 }
 
+// If there's no current sub-path (e.g. a lineTo() right after beginPath()), start a new one at (x, y).
+// Same as the HTML canvas "ensure there is a subpath" step; previously this dereferenced a null sub-path.
+static inline void pathEnsureSubPath(Path* path, float x, float y)
+{
+	if (!path->m_CurSubPath || path->m_CurSubPath->m_NumVertices == 0) {
+		pathMoveTo(path, x, y);
+	}
+}
+
 void pathLineTo(Path* path, float x, float y)
 {
-	VG_CHECK(path->m_CurSubPath && path->m_CurSubPath->m_NumVertices != 0, "moveTo() should be called once before calling lineTo()");
+	pathEnsureSubPath(path, x, y);
 	pathAddVertex(path, x, y);
 }
 
 void pathCubicTo(Path* path, float c1x, float c1y, float c2x, float c2y, float x, float y)
 {
-	VG_CHECK(path->m_CurSubPath && path->m_CurSubPath->m_NumVertices != 0, "moveTo() should be called once before calling cubicTo()");
+	pathEnsureSubPath(path, c1x, c1y);
 
 	const int MAX_LEVELS = 10;
 	float stack[MAX_LEVELS * 8];
@@ -312,7 +321,7 @@ void pathCubicTo(Path* path, float c1x, float c1y, float c2x, float c2y, float x
 void pathQuadraticTo(Path* path, float cx, float cy, float x, float y)
 {
 	// Convert quadratic bezier to cubic bezier (http://fontforge.github.io/bezier.html)
-	VG_CHECK(path->m_CurSubPath && path->m_CurSubPath->m_NumVertices != 0, "moveTo() should be called once before calling quadraticTo()");
+	pathEnsureSubPath(path, cx, cy);
 
 	const uint32_t lastVertexID = path->m_CurSubPath->m_FirstVertexID + (path->m_CurSubPath->m_NumVertices - 1);
 	const float* lastVertex = &path->m_Vertices[lastVertexID << 1];
@@ -330,7 +339,7 @@ void pathQuadraticTo(Path* path, float cx, float cy, float x, float y)
 
 void pathArcTo(Path* path, float x1, float y1, float x2, float y2, float r)
 {
-	VG_CHECK(path->m_CurSubPath && path->m_CurSubPath->m_NumVertices != 0, "moveTo() should be called once before calling arcTo()");
+	pathEnsureSubPath(path, x1, y1);
 
 	const uint32_t lastVertexID = path->m_CurSubPath->m_FirstVertexID + (path->m_CurSubPath->m_NumVertices - 1);
 	const float* lastVertex = &path->m_Vertices[lastVertexID << 1];
@@ -339,15 +348,33 @@ void pathArcTo(Path* path, float x1, float y1, float x2, float y2, float r)
 	const float x0 = lastVertex[0];
 	const float y0 = lastVertex[1];
 
-	// TODO: Handle degenerate cases.
-//	if (nvg__ptEquals(x0, y0, x1, y1, ctx->distTol) ||
-//		nvg__ptEquals(x1, y1, x2, y2, ctx->distTol) ||
-//		nvg__distPtSeg(x1, y1, x0, y0, x2, y2) < ctx->distTol * ctx->distTol ||
-//		radius < ctx->distTol) 
-//	{
-//		nvgLineTo(ctx, x1,y1);
-//		return;
-//	}
+	// Handle degenerate cases (same as nvgArcTo(); NanoVG's distTol is 0.01 pixels).
+	{
+		const float distTol = 0.01f / path->m_Scale;
+		const float distTolSqr = distTol * distTol;
+
+		const float d01x = x1 - x0, d01y = y1 - y0;
+		const float d12x = x2 - x1, d12y = y2 - y1;
+
+		// Squared distance of (x1, y1) from the segment (x0, y0)-(x2, y2) (nvg__distPtSeg())
+		const float pqx = x2 - x0, pqy = y2 - y0;
+		const float d = pqx * pqx + pqy * pqy;
+		float t = pqx * (x1 - x0) + pqy * (y1 - y0);
+		if (d > 0.0f) {
+			t /= d;
+		}
+		t = bx::clamp<float>(t, 0.0f, 1.0f);
+		const float sx = x0 + t * pqx - x1;
+		const float sy = y0 + t * pqy - y1;
+
+		if (d01x * d01x + d01y * d01y < distTolSqr
+			|| d12x * d12x + d12y * d12y < distTolSqr
+			|| sx * sx + sy * sy < distTolSqr
+			|| r < distTol) {
+			pathLineTo(path, x1, y1);
+			return;
+		}
+	}
 
 	// Calculate tangential circle to lines (x0,y0)-(x1,y1) and (x1,y1)-(x2,y2).
 	float dx0 = x0 - x1;
@@ -370,7 +397,9 @@ void pathArcTo(Path* path, float x1, float y1, float x2, float y2, float r)
 		dy1 *= invLen;
 	}
 
-	const float a = bx::acos(dx0 * dx1 + dy0 * dy1);
+	// NOTE: The dot product is clamped because rounding can push it slightly outside [-1, 1] for (anti)parallel
+	// directions, which made acos() return NaN (and the whole arc NaN).
+	const float a = bx::acos(bx::clamp<float>(dx0 * dx1 + dy0 * dy1, -1.0f, 1.0f));
 	const float d = r / bx::tan(a / 2.0f);
 
 	if (d > 10000.0f) {
@@ -785,7 +814,21 @@ void pathArc(Path* path, float cx, float cy, float r, float a0, float a1, Windin
 
 void pathPolyline(Path* path, const float* coords, uint32_t numPoints)
 {
-	VG_CHECK(path->m_CurSubPath && path->m_CurSubPath->m_NumVertices != 0, "moveTo() should be called once before calling polyline()");
+	if (numPoints == 0) {
+		return;
+	}
+
+	// If there's no current sub-path (e.g. polyline() right after beginPath()), the first point
+	// starts a new one (same as moveTo()).
+	if (!path->m_CurSubPath || path->m_CurSubPath->m_NumVertices == 0) {
+		pathMoveTo(path, coords[0], coords[1]);
+		coords += 2;
+		numPoints--;
+		if (numPoints == 0) {
+			return;
+		}
+	}
+
 	VG_CHECK(!path->m_CurSubPath->m_IsClosed, "Cannot add new vertices to a closed path");
 
 	if (path->m_CurSubPath->m_NumVertices > 0) {
@@ -808,8 +851,7 @@ void pathPolyline(Path* path, const float* coords, uint32_t numPoints)
 
 void pathClose(Path* path)
 {
-	VG_CHECK(path->m_CurSubPath && path->m_CurSubPath->m_NumVertices != 0, "Cannot close empty path");
-	if (path->m_CurSubPath->m_IsClosed || path->m_CurSubPath->m_NumVertices <= 2) {
+	if (!path->m_CurSubPath || path->m_CurSubPath->m_IsClosed || path->m_CurSubPath->m_NumVertices <= 2) {
 		return;
 	}
 
