@@ -317,6 +317,10 @@ struct RoundJoinArc
 	uint32_t m_NumArcPoints;
 };
 
+// Max number of vertices of a concave polygon to triangulate by ear clipping instead of libtess2
+// (see triangulateSimplePolygon()).
+static const uint32_t kMaxSimplePolygonVertices = 64;
+
 struct Stroker
 {
 	bx::AllocatorI* m_Allocator;
@@ -335,6 +339,9 @@ struct Stroker
 	uint32_t m_EdgeHashCapacity;  // Number of slots in m_EdgeHash
 	uint32_t* m_ClampScratch;     // Scratch memory used by clampInset(). Grow-only.
 	uint32_t m_ClampScratchCapacity;
+	Vec2 m_SimplePolyVertices[kMaxSimplePolygonVertices];                  // See triangulateSimplePolygon()
+	uint16_t m_SimplePolyTriangles[(kMaxSimplePolygonVertices - 2) * 3];
+	uint16_t m_SimplePolyBoundary[kMaxSimplePolygonVertices + 2];           // Boundary vertex IDs + contour (first, count)
 	Vec2* m_ContourVertices;      // Copy of the contours added with strokerConcaveFillAddContour()
 	uint32_t m_NumContourVertices;
 	uint32_t m_ContourVertexCapacity;
@@ -1436,9 +1443,8 @@ bool strokerConcaveFillBegin(Stroker* stroker)
 
 void strokerConcaveFillAddContour(Stroker* stroker, const float* vertexList, uint32_t numVertices)
 {
-	tessAddContour(stroker->m_Tesselator, 2, vertexList, sizeof(float) * 2, numVertices);
-
-	// Keep a copy of the contours in case strokerConcaveFillEndAA() has to tesselate them again.
+	// The contours are added to the tesselator only if they have to be tesselated (see
+	// strokerConcaveFillEnd()/strokerConcaveFillEndAA()).
 	if (stroker->m_NumContourVertices + numVertices > stroker->m_ContourVertexCapacity) {
 		const uint32_t newCapacity = bx::max<uint32_t>(stroker->m_NumContourVertices + numVertices, stroker->m_ContourVertexCapacity + (stroker->m_ContourVertexCapacity >> 1));
 		stroker->m_ContourVertices = (Vec2*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_ContourVertices, sizeof(Vec2) * newCapacity, 16);
@@ -1455,6 +1461,167 @@ void strokerConcaveFillAddContour(Stroker* stroker, const float* vertexList, uin
 	stroker->m_ContourSizes[stroker->m_NumContours++] = numVertices;
 }
 
+// Adds the contours added with strokerConcaveFillAddContour() to the tesselator.
+static void addContoursToTesselator(Stroker* stroker)
+{
+	const Vec2* contourVertices = stroker->m_ContourVertices;
+	for (uint32_t i = 0; i < stroker->m_NumContours; ++i) {
+		tessAddContour(stroker->m_Tesselator, 2, contourVertices, sizeof(Vec2), (int)stroker->m_ContourSizes[i]);
+		contourVertices += stroker->m_ContourSizes[i];
+	}
+}
+
+static inline double orient2d(const Vec2& a, const Vec2& b, const Vec2& c)
+{
+	return ((double)b.x - (double)a.x) * ((double)c.y - (double)a.y) - ((double)b.y - (double)a.y) * ((double)c.x - (double)a.x);
+}
+
+// Returns true if the segments (a, b) and (c, d) intersect or touch (incl. collinear overlaps).
+static bool segmentsIntersect(const Vec2& a, const Vec2& b, const Vec2& c, const Vec2& d)
+{
+	if (bx::max(a.x, b.x) < bx::min(c.x, d.x) || bx::max(c.x, d.x) < bx::min(a.x, b.x)
+	||  bx::max(a.y, b.y) < bx::min(c.y, d.y) || bx::max(c.y, d.y) < bx::min(a.y, b.y)) {
+		return false;
+	}
+
+	const double o1 = orient2d(a, b, c);
+	const double o2 = orient2d(a, b, d);
+	const double o3 = orient2d(c, d, a);
+	const double o4 = orient2d(c, d, b);
+	if (((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0)) && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))) {
+		return true;
+	}
+
+	// Touching (the bounding boxes overlap, so a zero orientation means the point is on the other segment)
+	return o1 == 0.0 || o2 == 0.0 || o3 == 0.0 || o4 == 0.0;
+}
+
+// Fast path for concave fills: if the only contour is a simple polygon (no self intersections, no touching edges,
+// no duplicate vertices) with at most kMaxSimplePolygonVertices vertices, it's triangulated by ear clipping, which is
+// much faster than libtess2 for small polygons. Both fill rules fill the interior of a simple polygon. The vertices
+// are stored in CCW order in m_SimplePolyVertices (so the boundary contour is 0..n-1, like the tesselator's boundary
+// contours, with the interior on the left) and the n - 2 CCW triangles in m_SimplePolyTriangles.
+// Returns the number of vertices, or 0 if the fast path can't be used (the contours have to be tesselated).
+static uint32_t triangulateSimplePolygon(Stroker* stroker)
+{
+	if (stroker->m_NumContours != 1) {
+		return 0;
+	}
+
+	const uint32_t n = stroker->m_ContourSizes[0];
+	if (n < 3 || n > kMaxSimplePolygonVertices) {
+		return 0;
+	}
+
+	const Vec2* src = stroker->m_ContourVertices;
+
+	// Orientation (and degenerate polygons)
+	double area2 = 0.0;
+	for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
+		area2 += (double)src[j].x * (double)src[i].y - (double)src[i].x * (double)src[j].y;
+	}
+	if (!(bx::abs(area2) > 1e-6) || area2 != area2) {
+		return 0;
+	}
+
+	Vec2* vtx = stroker->m_SimplePolyVertices;
+	for (uint32_t i = 0; i < n; ++i) {
+		vtx[i] = area2 > 0.0 ? src[i] : src[n - 1 - i];
+	}
+
+	// Simplicity: adjacent edges must not fold back onto each other, other edges must not intersect or touch
+	// (this also rejects duplicate vertices).
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p0 = vtx[i == 0 ? n - 1 : i - 1];
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		if (p0.x == p1.x && p0.y == p1.y) {
+			return 0;
+		}
+		if (orient2d(p0, p1, p2) == 0.0 && ((double)p1.x - p0.x) * ((double)p2.x - p1.x) + ((double)p1.y - p0.y) * ((double)p2.y - p1.y) <= 0.0) {
+			return 0;
+		}
+	}
+	for (uint32_t i = 0; i + 2 < n; ++i) {
+		const Vec2& a = vtx[i];
+		const Vec2& b = vtx[i + 1];
+		for (uint32_t j = i + 2; j < n; ++j) {
+			if (i == 0 && j == n - 1) {
+				continue; // Adjacent (closing edge)
+			}
+			if (segmentsIntersect(a, b, vtx[j], vtx[j + 1 == n ? 0 : j + 1])) {
+				return 0;
+			}
+		}
+	}
+
+	// Ear clipping. An ear (p, c, q) must be convex (or c on the segment p-q) and no other vertex may be inside
+	// or on the triangle.
+	uint16_t remaining[kMaxSimplePolygonVertices];
+	for (uint32_t i = 0; i < n; ++i) {
+		remaining[i] = (uint16_t)i;
+	}
+
+	uint16_t* tri = stroker->m_SimplePolyTriangles;
+	uint32_t numRemaining = n;
+	uint32_t k = 0;
+	uint32_t numTested = 0;
+	while (numRemaining > 3) {
+		if (numTested == numRemaining) {
+			return 0; // No ear found (numerical problems)
+		}
+
+		const uint32_t kp = k == 0 ? numRemaining - 1 : k - 1;
+		const uint32_t kn = k + 1 == numRemaining ? 0 : k + 1;
+		const Vec2& p = vtx[remaining[kp]];
+		const Vec2& c = vtx[remaining[k]];
+		const Vec2& q = vtx[remaining[kn]];
+		const double o = orient2d(p, c, q);
+		bool isEar = o > 0.0 || (o == 0.0 && ((double)c.x - p.x) * ((double)q.x - c.x) + ((double)c.y - p.y) * ((double)q.y - c.y) > 0.0);
+		for (uint32_t m = 0; m < numRemaining && isEar; ++m) {
+			if (m == kp || m == k || m == kn) {
+				continue;
+			}
+
+			const Vec2& r = vtx[remaining[m]];
+			isEar = !(orient2d(p, c, r) >= 0.0 && orient2d(c, q, r) >= 0.0 && orient2d(q, p, r) >= 0.0);
+		}
+
+		if (!isEar) {
+			k = kn;
+			++numTested;
+			continue;
+		}
+
+		tri[0] = remaining[kp];
+		tri[1] = remaining[k];
+		tri[2] = remaining[kn];
+		tri += 3;
+
+		for (uint32_t m = k; m + 1 < numRemaining; ++m) {
+			remaining[m] = remaining[m + 1];
+		}
+		--numRemaining;
+		k = k < numRemaining ? k : 0;
+		k = k == 0 ? numRemaining - 1 : k - 1; // Continue with the previous vertex (it might have become an ear)
+		numTested = 0;
+	}
+
+	tri[0] = remaining[0];
+	tri[1] = remaining[1];
+	tri[2] = remaining[2];
+
+	// Boundary: vertices 0..n-1, a single contour (first = 0, count = n)
+	uint16_t* boundary = stroker->m_SimplePolyBoundary;
+	for (uint32_t i = 0; i < n; ++i) {
+		boundary[i] = (uint16_t)i;
+	}
+	boundary[n + 0] = 0;
+	boundary[n + 1] = (uint16_t)n;
+
+	return n;
+}
+
 bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule)
 {
 	const int windingRule = fillRule == vg::FillRule::NonZero ? TESS_WINDING_NONZERO : TESS_WINDING_ODD;
@@ -1464,6 +1631,18 @@ bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule
 	// in XY space (previously the winding depended on the input). NonZero and EvenOdd are symmetric wrt the
 	// sign of the winding number, so the filled region is the same either way (the sweep direction might
 	// differ, so the exact triangulation can differ on degenerate input).
+	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker);
+	if (numSimplePolyVertices != 0) {
+		mesh->m_PosBuffer = &stroker->m_SimplePolyVertices[0].x;
+		mesh->m_ColorBuffer = nullptr;
+		mesh->m_IndexBuffer = stroker->m_SimplePolyTriangles;
+		mesh->m_NumVertices = numSimplePolyVertices;
+		mesh->m_NumIndices = (numSimplePolyVertices - 2) * 3;
+		return true;
+	}
+
+	addContoursToTesselator(stroker);
+
 	const float normal[3] = { 0.0f, 0.0f, 1.0f };
 	if (!tessTesselate(stroker->m_Tesselator, windingRule, TESS_POLYGONS, 3, 2, &normal[0])) {
 		return false;
@@ -2153,11 +2332,7 @@ static bool concaveFillEndAATwoSweeps(Stroker* stroker, Mesh* mesh, uint32_t col
 	// The tesselator's mesh has been consumed. Tesselate the contours again.
 	resetTesselator(stroker);
 	TESStesselator* tess = stroker->m_Tesselator;
-	const Vec2* contourVertices = stroker->m_ContourVertices;
-	for (uint32_t i = 0; i < stroker->m_NumContours; ++i) {
-		tessAddContour(tess, 2, contourVertices, sizeof(Vec2), (int)stroker->m_ContourSizes[i]);
-		contourVertices += stroker->m_ContourSizes[i];
-	}
+	addContoursToTesselator(stroker);
 
 	const float normal[3] = { 0.0f, 0.0f, 1.0f };
 	if (!tessTesselate(tess, windingRule, TESS_BOUNDARY_CONTOURS, 1, 2, &normal[0])) {
@@ -2195,27 +2370,51 @@ bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillR
 	// around the boundary contours ([-fringeWidth/2, +fringeWidth/2] around each contour) and the interior
 	// triangles use the inner fringe vertices instead of the boundary vertices, i.e. the interior is inset by
 	// half the fringe width (the same area the tesselation of the inset boundary contours covers).
-	const float normal[3] = { 0.0f, 0.0f, 1.0f };
-	TESStesselator* tess = stroker->m_Tesselator;
-	if (!tessTesselate(tess, windingRule, TESS_POLYGONS_AND_BOUNDARY, 3, 2, &normal[0])) {
-		// Triangulating the interior requires more memory than extracting the boundary contours. Try the 2 sweep
-		// version.
-		return concaveFillEndAATwoSweeps(stroker, mesh, color, windingRule);
-	}
+	// Simple polygons are triangulated by ear clipping (see triangulateSimplePolygon()); the result has the same
+	// form as the tesselator's output: the boundary contour is the polygon itself and each triangle corner is a
+	// boundary vertex (corner = vertex ID).
+	uint32_t numContours, numTessVertices, numTriangleIndices, numBoundaryVertices;
+	const Vec2* tessVertices;
+	const TESSindex* triangles;
+	const TESSindex* corners;
+	const TESSindex* contours;
+	const TESSindex* boundaryVertices;
+	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker);
+	if (numSimplePolyVertices != 0) {
+		numContours = 1;
+		tessVertices = stroker->m_SimplePolyVertices;
+		numTessVertices = numSimplePolyVertices;
+		triangles = stroker->m_SimplePolyTriangles;
+		numTriangleIndices = (numSimplePolyVertices - 2) * 3;
+		corners = stroker->m_SimplePolyTriangles;
+		boundaryVertices = stroker->m_SimplePolyBoundary;
+		contours = &stroker->m_SimplePolyBoundary[numSimplePolyVertices];
+		numBoundaryVertices = numSimplePolyVertices;
+	} else {
+		addContoursToTesselator(stroker);
 
-	const uint32_t numContours = (uint32_t)tessGetBoundaryContourCount(tess);
-	if (numContours == 0) {
-		return false;
-	}
+		const float normal[3] = { 0.0f, 0.0f, 1.0f };
+		TESStesselator* tess = stroker->m_Tesselator;
+		if (!tessTesselate(tess, windingRule, TESS_POLYGONS_AND_BOUNDARY, 3, 2, &normal[0])) {
+			// Triangulating the interior requires more memory than extracting the boundary contours. Try the 2
+			// sweep version.
+			return concaveFillEndAATwoSweeps(stroker, mesh, color, windingRule);
+		}
 
-	const Vec2* tessVertices = (const Vec2*)tessGetVertices(tess);
-	const uint32_t numTessVertices = (uint32_t)tessGetVertexCount(tess);
-	const TESSindex* triangles = tessGetElements(tess);
-	const uint32_t numTriangleIndices = (uint32_t)tessGetElementCount(tess) * 3;
-	const TESSindex* corners = tessGetElementCorners(tess);
-	const TESSindex* contours = tessGetBoundaryContours(tess);
-	const TESSindex* boundaryVertices = tessGetBoundaryVertices(tess);
-	const uint32_t numBoundaryVertices = (uint32_t)tessGetBoundaryVertexCount(tess);
+		numContours = (uint32_t)tessGetBoundaryContourCount(tess);
+		if (numContours == 0) {
+			return false;
+		}
+
+		tessVertices = (const Vec2*)tessGetVertices(tess);
+		numTessVertices = (uint32_t)tessGetVertexCount(tess);
+		triangles = tessGetElements(tess);
+		numTriangleIndices = (uint32_t)tessGetElementCount(tess) * 3;
+		corners = tessGetElementCorners(tess);
+		contours = tessGetBoundaryContours(tess);
+		boundaryVertices = tessGetBoundaryVertices(tess);
+		numBoundaryVertices = (uint32_t)tessGetBoundaryVertexCount(tess);
+	}
 
 	// Output vertices: 2 fringe vertices (inner, outer) for each boundary vertex occurrence (in contour order),
 	// followed by the interior vertices (tesselator vertices which aren't on the boundary).
