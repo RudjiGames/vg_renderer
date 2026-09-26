@@ -1605,6 +1605,25 @@ static bool windsOnceAround(const Vec2* vtx, uint32_t n, const Vec2& c)
 	return numCrossings == 1;
 }
 
+// Returns the number of times the edge direction of the polygon turns around (+1 for simple CCW polygons, -1 for
+// simple CW polygons). Counts the (exact) crossings of the +X direction.
+static int32_t calcTurningNumber(const Vec2* vtx, uint32_t n)
+{
+	int32_t turningNumber = 0;
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p0 = vtx[i == 0 ? n - 1 : i - 1];
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		const double o = orient2d(p0, p1, p2);
+		const double dy01 = (double)p1.y - (double)p0.y;
+		const double dy12 = (double)p2.y - (double)p1.y;
+		turningNumber += (dy01 < 0.0 && dy12 >= 0.0 && o > 0.0) ? 1 : 0;
+		turningNumber -= (dy01 >= 0.0 && dy12 < 0.0 && o < 0.0) ? 1 : 0;
+	}
+
+	return turningNumber;
+}
+
 // Returns true if any 2 non-adjacent edges of the polygon intersect or touch. Uses a sweep along the X or Y axis:
 // the edges are sorted by their min coordinate and each edge is tested only against the following edges whose range
 // overlaps with its own.
@@ -1772,11 +1791,14 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 	}
 
 	// Star-shaped polygons (e.g. stars, circles, rounded shapes) are simple if they wind exactly once around a point
-	// of their kernel (the average of the vertices is tried). Other polygons are tested with a sweep.
+	// of their kernel (the average of the vertices is tried). Other polygons are tested with a sweep, unless they
+	// can't be simple because their edge direction doesn't turn around exactly once (Umlaufsatz; cheap).
 	const Vec2 center = { (float)(sumX / n), (float)(sumY / n) };
-	if (!windsOnceAround(vtx, n, center)
-	&&  hasIntersectingEdges(vtx, n, sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x))) {
-		return 0;
+	if (!windsOnceAround(vtx, n, center)) {
+		if (calcTurningNumber(vtx, n) != 1
+		||  hasIntersectingEdges(vtx, n, sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x))) {
+			return 0;
+		}
 	}
 
 
