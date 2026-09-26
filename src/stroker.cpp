@@ -1435,7 +1435,7 @@ static void resetTesselator(Stroker* stroker)
 
 bool strokerConcaveFillBegin(Stroker* stroker)
 {
-	resetTesselator(stroker);
+	// The tesselator is (re)created only when it's used (see addContoursToTesselator() and tesselateInsetContours()).
 	stroker->m_NumContourVertices = 0;
 	stroker->m_NumContours = 0;
 	return true;
@@ -1461,9 +1461,10 @@ void strokerConcaveFillAddContour(Stroker* stroker, const float* vertexList, uin
 	stroker->m_ContourSizes[stroker->m_NumContours++] = numVertices;
 }
 
-// Adds the contours added with strokerConcaveFillAddContour() to the tesselator.
+// (Re)creates the tesselator and adds the contours added with strokerConcaveFillAddContour().
 static void addContoursToTesselator(Stroker* stroker)
 {
+	resetTesselator(stroker);
 	const Vec2* contourVertices = stroker->m_ContourVertices;
 	for (uint32_t i = 0; i < stroker->m_NumContours; ++i) {
 		tessAddContour(stroker->m_Tesselator, 2, contourVertices, sizeof(Vec2), (int)stroker->m_ContourSizes[i]);
@@ -2269,6 +2270,7 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 // buffers. NOTE: Invalidates the current output of the tesselator.
 static bool tesselateInsetContours(Stroker* stroker, const TESSindex* contours, uint32_t numContours, uint32_t numFringeVertices, uint32_t numFringeIndices, int windingRule, Color color)
 {
+	resetTesselator(stroker);
 	TESStesselator* tess = stroker->m_Tesselator;
 	for (uint32_t iContour = 0; iContour < numContours; ++iContour) {
 		const uint32_t first = contours[iContour * 2 + 0];
@@ -2330,9 +2332,8 @@ static void setMeshFromStrokerBuffers(Stroker* stroker, Mesh* mesh)
 static bool concaveFillEndAATwoSweeps(Stroker* stroker, Mesh* mesh, uint32_t color, int windingRule)
 {
 	// The tesselator's mesh has been consumed. Tesselate the contours again.
-	resetTesselator(stroker);
-	TESStesselator* tess = stroker->m_Tesselator;
 	addContoursToTesselator(stroker);
+	TESStesselator* tess = stroker->m_Tesselator;
 
 	const float normal[3] = { 0.0f, 0.0f, 1.0f };
 	if (!tessTesselate(tess, windingRule, TESS_BOUNDARY_CONTOURS, 1, 2, &normal[0])) {
