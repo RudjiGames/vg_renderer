@@ -24,6 +24,10 @@
 #	define VG_CONFIG_LIBTESS2_SCRATCH_BUFFER (32 * 1024 * 1024) // Set to 0 to let libtess2 use malloc/free
 #endif
 
+#ifndef VG_CONFIG_LIBTESS2_HEAP_LIMIT
+#	define VG_CONFIG_LIBTESS2_HEAP_LIMIT (32 * 1024 * 1024) // Max heap memory libtess2 can use after the scratch buffer is full
+#endif
+
 #ifndef VG_CONFIG_UV_INT16
 #	define VG_CONFIG_UV_INT16 1
 #endif
