@@ -107,11 +107,23 @@ enum TessWindingRule
 //         glEnd();
 //     }
 
+// TESS_POLYGONS_AND_BOUNDARY
+//   Same output as TESS_POLYGONS (only triangles are supported, polySize must be 3) plus the boundary contours
+//   of the tesselated area, obtained from the same sweep (see tessGetBoundaryContours()). The boundary contours
+//   are the same as the ones TESS_BOUNDARY_CONTOURS would output (in a different order and starting at different
+//   vertices), with the interior always on the left side of the contour, but their vertices are indices into the
+//   polygons' vertex array (tessGetVertices()). A vertex can appear in more than one contour (or more than once in the
+//   same contour) if the tesselated area touches itself at that vertex.
+//   For each corner of each triangle, tessGetElementCorners() returns the boundary vertex occurrence (index into
+//   tessGetBoundaryVertices()) whose interior wedge (between its incoming and outgoing boundary edges) contains the
+//   corner, or TESS_UNDEF if the vertex isn't on the boundary.
+
 enum TessElementType
 {
 	TESS_POLYGONS,
 	TESS_CONNECTED_POLYGONS,
 	TESS_BOUNDARY_CONTOURS,
+	TESS_POLYGONS_AND_BOUNDARY,
 };
 
 
@@ -234,6 +246,22 @@ int tessGetElementCount( TESStesselator *tess );
 
 // tessGetElements() - Returns pointer to the first element.
 const TESSindex* tessGetElements( TESStesselator *tess );
+
+// TESS_POLYGONS_AND_BOUNDARY only:
+// tessGetBoundaryContourCount() - Returns the number of boundary contours.
+int tessGetBoundaryContourCount( TESStesselator *tess );
+
+// tessGetBoundaryContours() - Returns [first, count] pairs (one per contour) into tessGetBoundaryVertices().
+const TESSindex* tessGetBoundaryContours( TESStesselator *tess );
+
+// tessGetBoundaryVertexCount() - Returns the total number of boundary contour vertices.
+int tessGetBoundaryVertexCount( TESStesselator *tess );
+
+// tessGetBoundaryVertices() - Returns the vertices of all boundary contours (indices into tessGetVertices()).
+const TESSindex* tessGetBoundaryVertices( TESStesselator *tess );
+
+// tessGetElementCorners() - Returns 3 values per triangle (see TESS_POLYGONS_AND_BOUNDARY).
+const TESSindex* tessGetElementCorners( TESStesselator *tess );
 
 #ifdef __cplusplus
 };

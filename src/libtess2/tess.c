@@ -592,6 +592,8 @@ static TESSalloc defaulAlloc =
 	0,
 };
 
+static void FreeBoundaryOutput( TESStesselator *tess );
+
 TESStesselator* tessNewTess( TESSalloc* alloc )
 {
 	TESStesselator* tess;
@@ -649,6 +651,11 @@ TESStesselator* tessNewTess( TESSalloc* alloc )
 
 	tess->vertices = 0;
 	tess->vertexIndices = 0;
+	tess->boundaryContours = 0;
+	tess->boundaryContourCount = 0;
+	tess->boundaryVertices = 0;
+	tess->boundaryVertexCount = 0;
+	tess->elementCorners = 0;
 	tess->vertexCount = 0;
 	tess->elements = 0;
 	tess->elementCount = 0;
@@ -679,6 +686,7 @@ void tessDeleteTess( TESStesselator *tess )
 		alloc.memfree( alloc.userData, tess->elements );
 		tess->elements = 0;
 	}
+	FreeBoundaryOutput( tess );
 
 	alloc.memfree( alloc.userData, tess );
 }
@@ -825,6 +833,158 @@ void OutputPolymesh( TESStesselator *tess, TESSmesh *mesh, int elementType, int 
 			for (i = faceVerts; i < polySize; ++i)
 				*elements++ = TESS_UNDEF;
 		}
+	}
+}
+
+#define TESS_VISITED ((TESSindex)(TESS_UNDEF - 1))
+
+static void FreeBoundaryOutput( TESStesselator *tess )
+{
+	if (tess->boundaryContours != NULL) {
+		tess->alloc.memfree( tess->alloc.userData, tess->boundaryContours );
+		tess->boundaryContours = 0;
+	}
+	if (tess->boundaryVertices != NULL) {
+		tess->alloc.memfree( tess->alloc.userData, tess->boundaryVertices );
+		tess->boundaryVertices = 0;
+	}
+	if (tess->elementCorners != NULL) {
+		tess->alloc.memfree( tess->alloc.userData, tess->elementCorners );
+		tess->elementCorners = 0;
+	}
+	tess->boundaryContourCount = 0;
+	tess->boundaryVertexCount = 0;
+}
+
+static int IsBoundaryEdge( const TESShalfEdge *e )
+{
+	return e->Lface->inside && !e->Rface->inside;
+}
+
+/* OutputBoundary( tess, mesh ) outputs the boundary contours of the (tesselated) interior
+* and the boundary vertex occurrence of each triangle corner (see TESS_POLYGONS_AND_BOUNDARY).
+* Must be called after OutputPolymesh() (uses the vertex and face numbering).
+*/
+static void OutputBoundary( TESStesselator *tess, TESSmesh *mesh )
+{
+	TESShalfEdge *e, *start, *cur, *c;
+	TESSface *f;
+	TESSindex *verts, *corners;
+	int numBoundaryEdges = 0;
+	int numHalfEdges = 0;
+	int numContours = 0;
+	int pass, i, steps;
+
+	/* Reset the corners and count the boundary half-edges. */
+	for ( e = mesh->eHead.next; e != &mesh->eHead; e = e->next ) {
+		e->corner = TESS_UNDEF;
+		e->Sym->corner = TESS_UNDEF;
+		numBoundaryEdges += IsBoundaryEdge( e ) + IsBoundaryEdge( e->Sym );
+		numHalfEdges += 2;
+	}
+
+	/* Every boundary half-edge belongs to exactly one contour, so there are as many contour vertices as boundary
+	* half-edges. The number of contours is counted in the first pass. The occurrence IDs must fit in TESSindex
+	* (excluding TESS_UNDEF and TESS_VISITED). */
+	if ( numBoundaryEdges >= (int)TESS_VISITED ) {
+		tess->outOfMemory = 1;
+		return;
+	}
+
+	verts = (TESSindex*)tess->alloc.memalloc( tess->alloc.userData, sizeof(TESSindex) * (numBoundaryEdges ? numBoundaryEdges : 1) );
+	if (!verts) {
+		tess->outOfMemory = 1;
+		return;
+	}
+	tess->boundaryVertices = verts;
+	tess->boundaryVertexCount = 0;
+
+	for ( pass = 0; pass < 2; ++pass ) {
+		if ( pass == 1 ) {
+			tess->boundaryContours = (TESSindex*)tess->alloc.memalloc( tess->alloc.userData, sizeof(TESSindex) * 2 * (numContours ? numContours : 1) );
+			if (!tess->boundaryContours) {
+				tess->outOfMemory = 1;
+				return;
+			}
+			tess->boundaryContourCount = numContours;
+		}
+
+		numContours = 0;
+		for ( e = mesh->eHead.next; e != &mesh->eHead; e = e->next ) {
+			for ( i = 0; i < 2; ++i ) {
+				start = i == 0 ? e : e->Sym;
+				if ( !IsBoundaryEdge( start ) )
+					continue;
+
+				if ( pass == 0 ) {
+					/* Count the contours by walking them and marking their edges. */
+					if ( start->corner != TESS_UNDEF )
+						continue;
+
+					cur = start;
+					steps = 0;
+					do {
+						/* The next boundary edge is the first one CW from cur->Sym around cur->Dst.
+						* NOTE: The step counter guards against infinite loops on an inconsistent mesh. */
+						c = cur->Lnext;
+						while ( !IsBoundaryEdge( c ) && ++steps <= numHalfEdges )
+							c = c->Sym->Lnext;
+						if ( ++steps > numHalfEdges ) {
+							tess->outOfMemory = 1;
+							return;
+						}
+						c->corner = TESS_VISITED;
+						cur = c;
+					} while ( cur != start );
+					++numContours;
+				} else {
+					/* The corners of the boundary edges were set to TESS_VISITED by the first pass. Walk each
+					* contour and assign the occurrence IDs to all corners in the wedges of its vertices. */
+					if ( start->corner != TESS_VISITED )
+						continue;
+
+					tess->boundaryContours[numContours * 2 + 0] = (TESSindex)tess->boundaryVertexCount;
+					cur = start;
+					do {
+						const TESSindex id = (TESSindex)tess->boundaryVertexCount++;
+						verts[id] = cur->Dst->n;
+
+						c = cur->Lnext;
+						while ( !IsBoundaryEdge( c ) ) {
+							c->corner = id;
+							c = c->Sym->Lnext;
+						}
+						c->corner = id;
+						cur = c;
+					} while ( cur != start );
+					tess->boundaryContours[numContours * 2 + 1] = (TESSindex)tess->boundaryVertexCount - tess->boundaryContours[numContours * 2 + 0];
+					++numContours;
+				}
+			}
+		}
+	}
+
+	/* Triangle corners (same face and vertex order as OutputPolymesh()) */
+	corners = (TESSindex*)tess->alloc.memalloc( tess->alloc.userData, sizeof(TESSindex) * 3 * (tess->elementCount ? tess->elementCount : 1) );
+	if (!corners) {
+		tess->outOfMemory = 1;
+		return;
+	}
+	tess->elementCorners = corners;
+
+	for ( f = mesh->fHead.next; f != &mesh->fHead; f = f->next ) {
+		if ( !f->inside ) continue;
+
+		e = f->anEdge;
+		i = 0;
+		do {
+			*corners++ = e->corner;
+			++i;
+			e = e->Lnext;
+		} while ( e != f->anEdge );
+
+		for ( ; i < 3; ++i )
+			*corners++ = TESS_UNDEF;
 	}
 }
 
@@ -1013,6 +1173,7 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 		tess->alloc.memfree( tess->alloc.userData, tess->vertexIndices );
 		tess->vertexIndices = 0;
 	}
+	FreeBoundaryOutput( tess );
 
 	tess->vertexIndexCounter = 0;
 
@@ -1075,6 +1236,11 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 	if (elementType == TESS_BOUNDARY_CONTOURS) {
 		OutputContours( tess, mesh, vertexSize );     /* output contours */
 	}
+	else if (elementType == TESS_POLYGONS_AND_BOUNDARY) {
+		OutputPolymesh( tess, mesh, TESS_POLYGONS, 3, vertexSize );     /* output triangles */
+		if (!tess->outOfMemory)
+			OutputBoundary( tess, mesh );
+	}
 	else
 	{
 		OutputPolymesh( tess, mesh, elementType, polySize, vertexSize );     /* output polygons */
@@ -1111,4 +1277,29 @@ int tessGetElementCount( TESStesselator *tess )
 const TESSindex* tessGetElements( TESStesselator *tess )
 {
 	return tess->elements;
+}
+
+int tessGetBoundaryContourCount( TESStesselator *tess )
+{
+	return tess->boundaryContourCount;
+}
+
+const TESSindex* tessGetBoundaryContours( TESStesselator *tess )
+{
+	return tess->boundaryContours;
+}
+
+int tessGetBoundaryVertexCount( TESStesselator *tess )
+{
+	return tess->boundaryVertexCount;
+}
+
+const TESSindex* tessGetBoundaryVertices( TESStesselator *tess )
+{
+	return tess->boundaryVertices;
+}
+
+const TESSindex* tessGetElementCorners( TESStesselator *tess )
+{
+	return tess->elementCorners;
 }
