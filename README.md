@@ -22,6 +22,7 @@ Strokes and fills are generated using the Stroker struct (`src/vg/stroker.cpp, .
 8. FontStash: glyph hashing uses BKDR (seems to give better distribution of glyphs in the LUT; fewer collisions when searching for cached glyphs)
 9. FontStash: optional (compile-time flag) caching of glyph indices and kerning info for ASCII chars in order to avoid repeated calls to stbtt functions.
 10. Per-fill and per-stroke control over whether anti-aliasing geometry should be generated.
+11. Anti-aliased solid color fills and strokes of rectangles, rounded rectangles and circles are drawn as single quads with analytic (signed distance) coverage in the fragment shader instead of generated geometry (`VG_CONFIG_ENABLE_ANALYTIC_SHAPES`).
 
 ### What's not supported compared to NanoVG
 

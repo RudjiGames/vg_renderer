@@ -9,7 +9,23 @@
 #endif
 
 #ifndef VG_CONFIG_ENABLE_SHAPE_CACHING
-#	define VG_CONFIG_ENABLE_SHAPE_CACHING 0
+#	define VG_CONFIG_ENABLE_SHAPE_CACHING 1
+#endif
+
+// Draw anti-aliased solid color fills and strokes of rectangles, rounded rectangles and circles (with a similarity
+// transform, i.e. translation, rotation and uniform scale) as single quads whose coverage is computed in the fragment
+// shader, instead of generating their geometry on the CPU. Only used if the shader program is available for the
+// active renderer (see src/shaders).
+#ifndef VG_CONFIG_ENABLE_ANALYTIC_SHAPES
+#	define VG_CONFIG_ENABLE_ANALYTIC_SHAPES 1
+#endif
+
+// Cached command list geometry is reused as long as the scale of the transform stays within this relative
+// tolerance of the scale it was generated with (e.g. 0.1 = +/-10%). Otherwise it's regenerated. Reusing it at a
+// slightly different scale slightly changes the width of the AA fringe and the flattening tolerance of curves.
+// 0 = regenerate on any change of scale.
+#ifndef VG_CONFIG_SHAPE_CACHE_SCALE_TOLERANCE
+#	define VG_CONFIG_SHAPE_CACHE_SCALE_TOLERANCE 0.1f
 #endif
 
 #ifndef VG_CONFIG_ENABLE_SIMD
