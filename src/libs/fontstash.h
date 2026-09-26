@@ -270,6 +270,13 @@ void fonsDrawDebug(FONScontext* s, float x, float y);
 struct FONSttFontImpl {
 	FT_Face font;
 };
+
+#define FONS__ASCII_CODEPOINT_KERN 0
+
+static void fons__tt_freeFont(FONSttFontImpl *font)
+{
+	FONS_NOTUSED(font);
+}
 typedef struct FONSttFontImpl FONSttFontImpl;
 
 static FT_Library ftLibrary;
@@ -386,10 +393,43 @@ static void fons__tmpfree(void* ptr, void* up);
 #define STBTT_DEF extern
 #include "stb_truetype.h"
 
+// Direct-mapped cache of stbtt_GetGlyphKernAdvance() results (a pure function of the font data and
+// the glyph pair) for the pairs not covered by the ASCII kerning table (non-ASCII glyphs, "known non-zero"
+// entries of the kern codemap). 8 bytes per entry.
+#ifndef FONS_KERN_CACHE_BITS
+#	define FONS_KERN_CACHE_BITS 10
+#endif
+#define FONS__KERN_CACHE_SIZE (1 << FONS_KERN_CACHE_BITS)
+static_assert(FONS_KERN_CACHE_BITS >= 1 && FONS_KERN_CACHE_BITS <= 20, "Invalid FONS_KERN_CACHE_BITS");
+#define FONS__KERN_CACHE_INVALID_KEY UINT32_MAX
+
+struct FONSkernCacheEntry {
+	uint32_t key; // (glyph1 << 16) | glyph2
+	int value;
+};
+typedef struct FONSkernCacheEntry FONSkernCacheEntry;
+
+// Direct-mapped cache of stbtt_FindGlyphIndex() results (a pure function of the font data and the codepoint)
+// for codepoints not covered by ascii_to_glyph_index.
+#ifndef FONS_GLYPH_INDEX_CACHE_BITS
+#	define FONS_GLYPH_INDEX_CACHE_BITS 8
+#endif
+#define FONS__GLYPH_INDEX_CACHE_SIZE (1 << FONS_GLYPH_INDEX_CACHE_BITS)
+#define FONS__GLYPH_INDEX_CACHE_INVALID_KEY UINT32_MAX
+static_assert(FONS_GLYPH_INDEX_CACHE_BITS >= 1 && FONS_GLYPH_INDEX_CACHE_BITS <= 20, "Invalid FONS_GLYPH_INDEX_CACHE_BITS");
+
+struct FONSglyphIndexCacheEntry {
+	uint32_t codepoint;
+	int glyphIndex;
+};
+typedef struct FONSglyphIndexCacheEntry FONSglyphIndexCacheEntry;
+
 struct FONSttFontImpl {
 	stbtt_fontinfo font;
 	int minAsciiGlyphIndex;
 	int maxAsciiGlyphIndex;
+	FONSkernCacheEntry kern_cache[FONS__KERN_CACHE_SIZE];
+	FONSglyphIndexCacheEntry glyph_index_cache[FONS__GLYPH_INDEX_CACHE_SIZE];
 
 #if FONS_ASCII_TO_GLYPH_INDEX_ARRAY
 	int ascii_to_glyph_index[FONS_NUM_ASCII_TO_GLYPH_INDICES];
@@ -412,11 +452,38 @@ struct FONSttFontImpl {
 	// store the lookup table, as glyphs for the ASCII characters can still
 	// have very high indices (so we want to bring them back to a known small
 	// range, which will determine the size of the lookup table).
+	// JD: kern_ascii is indexed as [(cp1 - FONS_FIRST_ASCII_CODEPOINT) * FONS_NUM_ASCII_TO_GLYPH_INDICES + (cp2 - FONS_FIRST_ASCII_CODEPOINT)]
+	// and is fully populated in fons__tt_loadFont() (kern_ascii_ready != 0), so it can also be indexed
+	// directly by codepoint pairs (see fons__tt_getAsciiCodepointKernAdvance()).
 	int16_t *kern_ascii;
 	uint8_t *glyph_index_to_ascii; // Contains zero if the glyph is non-ASCII.
+	int kern_ascii_ready;
 #endif
 };
 typedef struct FONSttFontImpl FONSttFontImpl;
+
+#if FONS_ASCII_TO_GLYPH_INDEX_ARRAY && FONS_GLYPH_KERN_ARRAY_ASCII
+#	define FONS__ASCII_CODEPOINT_KERN 1
+#else
+#	define FONS__ASCII_CODEPOINT_KERN 0
+#endif
+
+static inline int fons__tt_getGlyphKernAdvanceCached(FONSttFontImpl *font, int glyph1, int glyph2)
+{
+	// TrueType glyph indices are < 65535 (numGlyphs is 16-bit), so the key never equals the invalid key.
+	// Anything else is not cached.
+	if ((unsigned int)glyph1 >= 0xFFFF || (unsigned int)glyph2 >= 0xFFFF) {
+		return stbtt_GetGlyphKernAdvance(&font->font, glyph1, glyph2);
+	}
+
+	const uint32_t key = ((uint32_t)glyph1 << 16) | (uint32_t)glyph2;
+	FONSkernCacheEntry* entry = &font->kern_cache[(uint32_t)(key * 0x9E3779B1u) >> (32 - FONS_KERN_CACHE_BITS)];
+	if (entry->key != key) {
+		entry->key = key;
+		entry->value = stbtt_GetGlyphKernAdvance(&font->font, glyph1, glyph2);
+	}
+	return entry->value;
+}
 
 int fons__tt_init(FONScontext *context)
 {
@@ -432,7 +499,17 @@ int fons__tt_getGlyphIndex(FONSttFontImpl *font, int codepoint)
 	}
 #endif
 
-	return stbtt_FindGlyphIndex(&font->font, codepoint);
+	const uint32_t key = (uint32_t)codepoint;
+	if (key == FONS__GLYPH_INDEX_CACHE_INVALID_KEY) {
+		return stbtt_FindGlyphIndex(&font->font, codepoint);
+	}
+
+	FONSglyphIndexCacheEntry* entry = &font->glyph_index_cache[(uint32_t)(key * 0x9E3779B1u) >> (32 - FONS_GLYPH_INDEX_CACHE_BITS)];
+	if (entry->codepoint != key) {
+		entry->codepoint = key;
+		entry->glyphIndex = stbtt_FindGlyphIndex(&font->font, codepoint);
+	}
+	return entry->glyphIndex;
 }
 
 int fons__tt_getGlyphKernAdvance(FONSttFontImpl *font, int glyph1, int glyph2)
@@ -448,18 +525,11 @@ int fons__tt_getGlyphKernAdvance(FONSttFontImpl *font, int glyph1, int glyph2)
 		uint8_t ascii_codepoint_1 = font->glyph_index_to_ascii[g1];
 		uint8_t ascii_codepoint_2 = font->glyph_index_to_ascii[g2];
 		if (ascii_codepoint_1 != 0 && ascii_codepoint_2 != 0) {
-			int32_t i1 = ascii_codepoint_1 - FONS_FIRST_ASCII_CODEPOINT;
-			int32_t i2 = ascii_codepoint_2 - FONS_FIRST_ASCII_CODEPOINT;
-			//// MC: Implement Rosenberg-Strong's pairing function to look up
-			//// indices to compact memory usage for fonts with a lot of glyphs.
-			const int max = bx::max(i1, i2);
-			const int combo = max * max + max + i1 - i2;
-			int16_t kern = font->kern_ascii[combo];
-			if (kern == INT16_MIN) {
-				kern = stbtt_GetGlyphKernAdvance(&font->font, glyph1, glyph2);
-				font->kern_ascii[combo] = kern;
-			}
-			return kern;
+			// JD: The table is fully populated at load time (kern(g1, g2) only depends on the glyph pair, so it
+			// doesn't matter which of the codepoints mapping to the same glyph glyph_index_to_ascii returns).
+			const int32_t i1 = ascii_codepoint_1 - FONS_FIRST_ASCII_CODEPOINT;
+			const int32_t i2 = ascii_codepoint_2 - FONS_FIRST_ASCII_CODEPOINT;
+			return font->kern_ascii[i1 * FONS_NUM_ASCII_TO_GLYPH_INDICES + i2];
 		}
 #endif
 
@@ -472,13 +542,13 @@ int fons__tt_getGlyphKernAdvance(FONSttFontImpl *font, int glyph1, int glyph2)
 		int8_t status = (uint64_entry >> bit_idx) & 3;
 		if (status == 0) {
 			// Unknown
-			int kern = stbtt_GetGlyphKernAdvance(&font->font, glyph1, glyph2);
+			int kern = fons__tt_getGlyphKernAdvanceCached(font, glyph1, glyph2);
 			if (kern == 0) {
 				// Update to known-to-be-zero
-				uint64_entry |= 1 << bit_idx;
+				uint64_entry |= (uint64_t)1 << bit_idx;
 			} else {
 				// Update to known-to-be-non-zero
-				uint64_entry |= 2 << bit_idx;
+				uint64_entry |= (uint64_t)2 << bit_idx;
 			}
 			font->kern_codemap[uint64_idx] = uint64_entry;
 			return kern;
@@ -487,20 +557,38 @@ int fons__tt_getGlyphKernAdvance(FONSttFontImpl *font, int glyph1, int glyph2)
 			return 0;
 		} else {
 			// Known to be non-zero
-			return stbtt_GetGlyphKernAdvance(&font->font, glyph1, glyph2);
+			return fons__tt_getGlyphKernAdvanceCached(font, glyph1, glyph2);
 		}
 #endif
 	}
 #endif
 
-	return stbtt_GetGlyphKernAdvance(&font->font, glyph1, glyph2);
+	return fons__tt_getGlyphKernAdvanceCached(font, glyph1, glyph2);
 }
+
+#if FONS__ASCII_CODEPOINT_KERN
+// Returns the same value as fons__tt_getGlyphKernAdvance(font, fons__tt_getGlyphIndex(font, cp1), fons__tt_getGlyphIndex(font, cp2))
+// for 2 printable ASCII codepoints. Only valid if font->kern_ascii_ready != 0.
+static inline int fons__tt_getAsciiCodepointKernAdvance(FONSttFontImpl *font, unsigned int cp1, unsigned int cp2)
+{
+	return font->kern_ascii[(cp1 - FONS_FIRST_ASCII_CODEPOINT) * FONS_NUM_ASCII_TO_GLYPH_INDICES + (cp2 - FONS_FIRST_ASCII_CODEPOINT)];
+}
+#endif
 
 
 int fons__tt_loadFont(FONScontext *context, FONSttFontImpl *font, unsigned char *data, int dataSize)
 {
 	int stbError;
 	FONS_NOTUSED(dataSize);
+
+	for (int i = 0; i < FONS__KERN_CACHE_SIZE; ++i) {
+		font->kern_cache[i].key = FONS__KERN_CACHE_INVALID_KEY;
+		font->kern_cache[i].value = 0;
+	}
+	for (int i = 0; i < FONS__GLYPH_INDEX_CACHE_SIZE; ++i) {
+		font->glyph_index_cache[i].codepoint = FONS__GLYPH_INDEX_CACHE_INVALID_KEY;
+		font->glyph_index_cache[i].glyphIndex = 0;
+	}
 
 	font->font.userdata = context;
 	stbError = stbtt_InitFont(&font->font, data, 0);
@@ -570,6 +658,23 @@ int fons__tt_loadFont(FONScontext *context, FONSttFontImpl *font, unsigned char 
 			int min_kern = INT_MAX;
 			int max_kern = INT_MIN;
 			int non_zero_kern = 0;
+#if FONS_GLYPH_KERN_ARRAY_ASCII
+			// JD: Fill the whole table (indexed by codepoint pairs).
+			for (int first_cp = FONS_FIRST_ASCII_CODEPOINT; first_cp <= FONS_LAST_ASCII_CODEPOINT; ++first_cp) {
+				const int first = fons__tt_getGlyphIndex(font, first_cp);
+				int16_t* row = &font->kern_ascii[(first_cp - FONS_FIRST_ASCII_CODEPOINT) * FONS_NUM_ASCII_TO_GLYPH_INDICES];
+				for (int second_cp = FONS_FIRST_ASCII_CODEPOINT; second_cp <= FONS_LAST_ASCII_CODEPOINT; ++second_cp) {
+					const int second = fons__tt_getGlyphIndex(font, second_cp);
+					const int16_t value = (int16_t)stbtt_GetGlyphKernAdvance(&font->font, first, second);
+					row[second_cp - FONS_FIRST_ASCII_CODEPOINT] = value;
+
+					min_kern = bx::min(min_kern, (int)value);
+					max_kern = bx::max(max_kern, (int)value);
+					non_zero_kern += (value != 0);
+				}
+			}
+			font->kern_ascii_ready = 1;
+#else
 			for (int second_cp = FONS_FIRST_ASCII_CODEPOINT; second_cp <= FONS_LAST_ASCII_CODEPOINT; ++second_cp) {
 				int second = fons__tt_getGlyphIndex(font, second_cp);
 				for (int first_cp = FONS_FIRST_ASCII_CODEPOINT; first_cp <= FONS_LAST_ASCII_CODEPOINT; ++first_cp) {
@@ -582,6 +687,8 @@ int fons__tt_loadFont(FONScontext *context, FONSttFontImpl *font, unsigned char 
 					non_zero_kern += (value != 0);
 				}
 			}
+#endif
+			BX_UNUSED(non_zero_kern);
 			assert(min_kern >= INT16_MIN);
 			assert(max_kern <= INT16_MAX);
 		}
@@ -589,6 +696,22 @@ int fons__tt_loadFont(FONScontext *context, FONSttFontImpl *font, unsigned char 
 	}
 
 	return stbError;
+}
+
+static void fons__tt_freeFont(FONSttFontImpl *font)
+{
+#if FONS_GLYPH_KERN_ARRAY_ASCII
+	FONSfree(font->kern_ascii);
+	font->kern_ascii = NULL;
+	FONSfree(font->glyph_index_to_ascii);
+	font->glyph_index_to_ascii = NULL;
+	font->kern_ascii_ready = 0;
+#endif
+#if FONS_GLYPH_KERN_NONZERO_CODEMAP
+	FONSfree(font->kern_codemap);
+	font->kern_codemap = NULL;
+#endif
+	FONS_NOTUSED(font);
 }
 
 void fons__tt_getFontVMetrics(FONSttFontImpl *font, int *ascent, int *descent, int *lineGap)
@@ -655,22 +778,21 @@ static unsigned int fons__hashint(unsigned int a)
 	return a;
 }
 #else
-static unsigned int fons__hashGlyphCode(uint64_t glyphCode)
+static constexpr int fons__log2i(unsigned int v)
 {
-	// BKDR
-	const char* c = (const char*)&glyphCode;
-	unsigned int seed = 131; /* 31 131 1313 13131 131313 etc.. */
+	return v <= 1 ? 0 : 1 + fons__log2i(v >> 1);
+}
 
-	unsigned int hash = (*c++);
-	hash = (hash * seed) + (*c++);
-	hash = (hash * seed) + (*c++);
-	hash = (hash * seed) + (*c++);
-	hash = (hash * seed) + (*c++);
-	hash = (hash * seed) + (*c++);
-	hash = (hash * seed) + (*c++);
-	hash = (hash * seed) + (*c);
+#define FONS__HASH_LUT_BITS fons__log2i(FONS_HASH_LUT_SIZE)
+static_assert(FONS_HASH_LUT_SIZE >= 2 && (FONS_HASH_LUT_SIZE & (FONS_HASH_LUT_SIZE - 1)) == 0, "FONS_HASH_LUT_SIZE must be a power of 2 (>= 2)");
 
-	return hash;
+// Fibonacci hashing: one 64-bit multiply, the top FONS__HASH_LUT_BITS bits of the product
+// select the bucket (they depend on every bit of the glyph code: codepoint, size and blur).
+// The result is always < FONS_HASH_LUT_SIZE so the callers' "& (FONS_HASH_LUT_SIZE - 1)" is a no-op.
+// Only affects bucket selection; glyph codes are unique in the LUT so lookups return the same glyphs.
+static inline unsigned int fons__hashGlyphCode(uint64_t glyphCode)
+{
+	return (unsigned int)((glyphCode * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - FONS__HASH_LUT_BITS));
 }
 #endif
 
@@ -699,6 +821,34 @@ struct FONSglyph
 };
 typedef struct FONSglyph FONSglyph;
 
+// Per-font cache mapping printable ASCII codepoints (0x20..0x7E) to indices into font->glyphs, for a few
+// (isize, iblur) combinations, so the hot glyph lookup can skip hashing and the LUT chain walk.
+// An entry is only ever a copy of what the LUT lookup found (or just inserted), so a hit returns exactly the
+// glyph the LUT lookup would. -1 means "unknown" (fall back to the LUT). Indices (not pointers) are stored so
+// glyph array reallocation doesn't matter; the whole cache is invalidated whenever the glyphs are reset
+// (fonsResetAtlas()).
+#ifndef FONS_ASCII_GLYPH_CACHE
+#	define FONS_ASCII_GLYPH_CACHE 1
+#endif
+
+#if FONS_ASCII_GLYPH_CACHE
+#ifndef FONS_ASCII_GLYPH_CACHE_SLOTS
+#	define FONS_ASCII_GLYPH_CACHE_SLOTS 8
+#endif
+#define FONS__GLYPH_CACHE_FIRST_CP 0x20
+#define FONS__GLYPH_CACHE_NUM_CP (0x7E - 0x20 + 1)
+#define FONS__GLYPH_CACHE_INVALID_KEY UINT64_MAX
+
+struct FONSasciiGlyphCache
+{
+	uint64_t key[FONS_ASCII_GLYPH_CACHE_SLOTS]; // (isize, iblur) key; FONS__GLYPH_CACHE_INVALID_KEY if unused
+	int mru;
+	int victim;
+	int glyph[FONS_ASCII_GLYPH_CACHE_SLOTS][FONS__GLYPH_CACHE_NUM_CP];
+};
+typedef struct FONSasciiGlyphCache FONSasciiGlyphCache;
+#endif
+
 struct FONSfont
 {
 	FONSttFontImpl font;
@@ -715,8 +865,132 @@ struct FONSfont
 	int lut[FONS_HASH_LUT_SIZE];
 	int fallbacks[FONS_MAX_FALLBACKS];
 	int nfallbacks;
+#if FONS_ASCII_GLYPH_CACHE
+	FONSasciiGlyphCache asciiGlyphCache;
+#endif
 };
 typedef struct FONSfont FONSfont;
+
+#if FONS_ASCII_GLYPH_CACHE
+// The part of the glyph code (see MAKE_GLYPH_CODE) which doesn't depend on the codepoint. Never equal to
+// FONS__GLYPH_CACHE_INVALID_KEY (low 32 bits are always 0 / high 32 bits are always 0).
+static inline uint64_t fons__glyphCacheKey(short isize, short iblur)
+{
+#if FONS_SEPARATE_CODEPOINT
+	return (uint64_t)(unsigned short)isize | ((uint64_t)(unsigned short)iblur << 16);
+#else
+	return MAKE_GLYPH_CODE(0, isize, iblur);
+#endif
+}
+
+static void fons__glyphCacheReset(FONSfont* font)
+{
+	FONSasciiGlyphCache* gc = &font->asciiGlyphCache;
+	for (int s = 0; s < FONS_ASCII_GLYPH_CACHE_SLOTS; ++s) {
+		gc->key[s] = FONS__GLYPH_CACHE_INVALID_KEY;
+	}
+	gc->mru = 0;
+	gc->victim = 0;
+}
+
+static inline int fons__glyphCacheFindSlot(FONSfont* font, uint64_t key)
+{
+	FONSasciiGlyphCache* gc = &font->asciiGlyphCache;
+	if (gc->key[gc->mru] == key) {
+		return gc->mru;
+	}
+	for (int s = 0; s < FONS_ASCII_GLYPH_CACHE_SLOTS; ++s) {
+		if (gc->key[s] == key) {
+			gc->mru = s;
+			return s;
+		}
+	}
+	return -1;
+}
+
+static void fons__glyphCacheStore(FONSfont* font, uint64_t key, unsigned int ci, int glyphIdx)
+{
+	FONSasciiGlyphCache* gc = &font->asciiGlyphCache;
+	int s = fons__glyphCacheFindSlot(font, key);
+	if (s < 0) {
+		s = gc->victim;
+		gc->victim = (gc->victim + 1) % FONS_ASCII_GLYPH_CACHE_SLOTS;
+		gc->key[s] = key;
+		for (int i = 0; i < FONS__GLYPH_CACHE_NUM_CP; ++i) {
+			gc->glyph[s][i] = -1;
+		}
+		gc->mru = s;
+	}
+	gc->glyph[s][ci] = glyphIdx;
+}
+#endif
+
+// Returns the index (into font->glyphs) of the cached glyph for (codepoint, isize, iblur) or -1 if there's none.
+// When -1 is returned, *lutBucket receives the LUT bucket the glyph should be inserted into.
+static inline int fons__findGlyph(FONSfont* font, unsigned int codepoint, short isize, short iblur, unsigned int* lutBucket)
+{
+#if FONS_ASCII_GLYPH_CACHE
+	const unsigned int ci = codepoint - FONS__GLYPH_CACHE_FIRST_CP;
+	uint64_t ckey = 0;
+	if (ci < FONS__GLYPH_CACHE_NUM_CP) {
+		ckey = fons__glyphCacheKey(isize, iblur);
+		const int s = fons__glyphCacheFindSlot(font, ckey);
+		if (s >= 0) {
+			const int gi = font->asciiGlyphCache.glyph[s][ci];
+			if (gi != -1) {
+				*lutBucket = 0; // Unused by the callers when a glyph is found.
+				return gi;
+			}
+		}
+	}
+#endif
+
+#if FONS_SEPARATE_CODEPOINT
+	const unsigned int h = fons__hashint(codepoint) & (FONS_HASH_LUT_SIZE-1);
+#else
+	const uint64_t glyphCode = MAKE_GLYPH_CODE(codepoint, isize, iblur);
+	const unsigned int h = fons__hashGlyphCode(glyphCode) & (FONS_HASH_LUT_SIZE - 1);
+#endif
+	*lutBucket = h;
+
+	int i = font->lut[h];
+	while (i != -1) {
+		const FONSglyph* g = &font->glyphs[i];
+#if FONS_SEPARATE_CODEPOINT
+		if (g->codepoint == codepoint && g->size == isize && g->blur == iblur) {
+#else
+		if (g->glyphCode == glyphCode) {
+#endif
+#if FONS_ASCII_GLYPH_CACHE
+			if (ci < FONS__GLYPH_CACHE_NUM_CP) {
+				fons__glyphCacheStore(font, ckey, ci, i);
+			}
+#endif
+			return i;
+		}
+		i = g->next;
+	}
+
+	return -1;
+}
+
+// Inserts the most recently allocated glyph (font->glyphs[font->nglyphs - 1]) into the lookup structures.
+static inline void fons__insertGlyph(FONSfont* font, FONSglyph* glyph, unsigned int codepoint, short isize, short iblur, unsigned int h)
+{
+	glyph->next = font->lut[h];
+	font->lut[h] = font->nglyphs - 1;
+
+#if FONS_ASCII_GLYPH_CACHE
+	const unsigned int ci = codepoint - FONS__GLYPH_CACHE_FIRST_CP;
+	if (ci < FONS__GLYPH_CACHE_NUM_CP) {
+		fons__glyphCacheStore(font, fons__glyphCacheKey(isize, iblur), ci, font->nglyphs - 1);
+	}
+#else
+	FONS_NOTUSED(codepoint);
+	FONS_NOTUSED(isize);
+	FONS_NOTUSED(iblur);
+#endif
+}
 
 struct FONSstate
 {
@@ -834,6 +1108,17 @@ static unsigned int fons__decutf8(unsigned int* state, unsigned int* codep, unsi
 
 	*state = utf8d[256 + *state + type];
 	return *state;
+}
+
+// Same as fons__decutf8() but with a fast path for ASCII bytes outside of multi-byte sequences
+// (for state == FONS_UTF8_ACCEPT and byte < 0x80, fons__decutf8() sets *codep = byte and leaves the state unchanged).
+static inline unsigned int fons__decutf8Fast(unsigned int* state, unsigned int* codep, unsigned int byte)
+{
+	if (*state == FONS_UTF8_ACCEPT && byte < 0x80) {
+		*codep = byte;
+		return FONS_UTF8_ACCEPT;
+	}
+	return fons__decutf8(state, codep, byte);
 }
 
 // Atlas based on Skyline Bin Packer by Jukka Jylänki
@@ -1187,6 +1472,7 @@ void fonsClearState(FONScontext* stash)
 static void fons__freeFont(FONSfont* font)
 {
 	if (font == NULL) return;
+	fons__tt_freeFont(&font->font);
 	if (font->glyphs) FONSfree(font->glyphs);
 	if (font->freeData && font->data) FONSfree(font->data);
 	FONSfree(font);
@@ -1204,6 +1490,9 @@ static int fons__allocFont(FONScontext* stash)
 	font = (FONSfont*)FONSmalloc(sizeof(FONSfont));
 	if (font == NULL) goto error;
 	memset(font, 0, sizeof(FONSfont));
+#if FONS_ASCII_GLYPH_CACHE
+	fons__glyphCacheReset(font);
+#endif
 
 	font->glyphs = (FONSglyph*)FONSmalloc(sizeof(FONSglyph) * FONS_INIT_GLYPHS);
 	if (font->glyphs == NULL) goto error;
@@ -1400,42 +1689,14 @@ static FONSglyph* fons__getGlyph(FONScontext* stash, FONSfont* font, unsigned in
 	stash->nscratch = 0;
 
 	// Find code point and size.
-#if FONS_SEPARATE_CODEPOINT
-	h = fons__hashint(codepoint) & (FONS_HASH_LUT_SIZE-1);
-#else
-	const uint64_t glyphCode = MAKE_GLYPH_CODE(codepoint, isize, iblur);
-	h = fons__hashGlyphCode(glyphCode) & (FONS_HASH_LUT_SIZE - 1);
-#endif
-
-	// TODO: JD: This loop is the hottest part of the function under normal usage (i.e. all required glyphs are already cached).
-	// The alternative hash function helps with glyph distribution in the LUT but we still have enough collisions to make the
-	// loop execute multiple times per call. Larger LUT doesn't seem to help (in fact they seem to hurt perf).
-	// It might help if the jumping around in memory from glyph to glyph was avoided (i.e. glyphs in the same bucket are
-	// stored sequentially in the glyphs array) (No it doesn't!).
-	i = font->lut[h];
-	while (i != -1) {
-#if FONS_SEPARATE_CODEPOINT
-		if (font->glyphs[i].codepoint == codepoint && font->glyphs[i].size == isize && font->glyphs[i].blur == iblur) {
-			glyph = &font->glyphs[i];
-			if (bitmapOption == FONS_GLYPH_BITMAP_OPTIONAL || (glyph->x0 >= 0 && glyph->y0 >= 0)) {
-				return glyph;
-			}
-
-			// At this point, glyph exists but the bitmap data is not yet created.
-			break;
+	i = fons__findGlyph(font, codepoint, isize, iblur, &h);
+	if (i != -1) {
+		glyph = &font->glyphs[i];
+		if (bitmapOption == FONS_GLYPH_BITMAP_OPTIONAL || (glyph->x0 >= 0 && glyph->y0 >= 0)) {
+			return glyph;
 		}
-#else
-		if (font->glyphs[i].glyphCode == glyphCode) {
-			glyph = &font->glyphs[i];
-			if (bitmapOption == FONS_GLYPH_BITMAP_OPTIONAL || (glyph->x0 >= 0 && glyph->y0 >= 0)) {
-				return glyph;
-			}
 
-			// At this point, glyph exists but the bitmap data is not yet created.
-			break;
-		}
-#endif
-		i = font->glyphs[i].next;
+		// At this point, glyph exists but the bitmap data is not yet created.
 	}
 
 	// Could not find glyph, create it.
@@ -1485,8 +1746,7 @@ static FONSglyph* fons__getGlyph(FONScontext* stash, FONSfont* font, unsigned in
 #endif
 
 		// Insert char to hash lookup.
-		glyph->next = font->lut[h];
-		font->lut[h] = font->nglyphs - 1;
+		fons__insertGlyph(font, glyph, codepoint, isize, iblur, h);
 	}
 
 	glyph->index = g;
@@ -1714,7 +1974,7 @@ float fonsDrawText(FONScontext* stash,
 	y += fons__getVertAlign(stash, font, state->align, isize);
 
 	for (; str != end; ++str) {
-		if (fons__decutf8(&utf8state, &codepoint, *(const unsigned char*)str))
+		if (fons__decutf8Fast(&utf8state, &codepoint, *(const unsigned char*)str))
 			continue;
 		glyph = fons__getGlyph(stash, font, codepoint, isize, iblur, FONS_GLYPH_BITMAP_REQUIRED);
 		if (glyph != NULL) {
@@ -1795,7 +2055,7 @@ int fonsTextIterNext(FONScontext* stash, FONStextIter* iter, FONSquad* quad)
 		return 0;
 
 	for (; str != iter->end; str++) {
-		if (fons__decutf8(&iter->utf8state, &iter->codepoint, *(const unsigned char*)str))
+		if (fons__decutf8Fast(&iter->utf8state, &iter->codepoint, *(const unsigned char*)str))
 			continue;
 		str++;
 		// Get glyph and quad
@@ -1899,7 +2159,7 @@ float fonsTextBounds(FONScontext* stash,
 		end = str + strlen(str);
 
 	for (; str != end; ++str) {
-		if (fons__decutf8(&utf8state, &codepoint, *(const unsigned char*)str))
+		if (fons__decutf8Fast(&utf8state, &codepoint, *(const unsigned char*)str))
 			continue;
 		glyph = fons__getGlyph(stash, font, codepoint, isize, iblur, FONS_GLYPH_BITMAP_OPTIONAL);
 		if (glyph != NULL) {
@@ -2137,6 +2397,9 @@ int fonsResetAtlas(FONScontext* stash, int width, int height)
 		for (j = 0; j < FONS_HASH_LUT_SIZE; j++) {
 			font->lut[j] = -1;
 		}
+#if FONS_ASCII_GLYPH_CACHE
+		fons__glyphCacheReset(font);
+#endif
 	}
 
 	stash->params.width = width;
@@ -2194,24 +2457,41 @@ void fonsResetString(FONScontext* stash, FONSstring* str, const char* text, cons
 	FONSfont* font = stash->fonts[state->font];
 
 	int prevGlyphIndex = -1;
+#if FONS__ASCII_CODEPOINT_KERN
+	// Codepoint of the previous glyph if it's a printable ASCII char (kern_ascii can be indexed
+	// directly by codepoints), otherwise ~0u.
+	unsigned int prevAsciiCP = ~0u;
+	const int asciiKern = font->font.kern_ascii_ready;
+#endif
 
 	unsigned int utf8state = 0;
 	unsigned int* cp = str->m_Codepoints;
 	int* gi = str->m_GlyphIndices;
 	int* ka = str->m_KernAdv;
 	for (unsigned int i = 0;i < len;++i) {
-		if (fons__decutf8(&utf8state, cp, (unsigned char)text[i])) {
+		if (fons__decutf8Fast(&utf8state, cp, (unsigned char)text[i])) {
 			continue;
 		}
 
-		*gi = fons__tt_getGlyphIndex(&font->font, *cp);
+		const unsigned int codepoint = *cp;
+		*gi = fons__tt_getGlyphIndex(&font->font, codepoint);
+#if FONS__ASCII_CODEPOINT_KERN
+		const unsigned int asciiCP = (asciiKern && codepoint - FONS_FIRST_ASCII_CODEPOINT < FONS_NUM_ASCII_TO_GLYPH_INDICES) ? codepoint : ~0u;
+#endif
 		if(prevGlyphIndex == -1) {
 			*ka = 0;
+#if FONS__ASCII_CODEPOINT_KERN
+		} else if (prevAsciiCP != ~0u && asciiCP != ~0u) {
+			*ka = fons__tt_getAsciiCodepointKernAdvance(&font->font, prevAsciiCP, asciiCP);
+#endif
 		} else {
 			*ka = fons__tt_getGlyphKernAdvance(&font->font, prevGlyphIndex, *gi);
 		}
 
 		prevGlyphIndex = *gi;
+#if FONS__ASCII_CODEPOINT_KERN
+		prevAsciiCP = asciiCP;
+#endif
 		++cp;
 		++gi;
 		++ka;
@@ -2230,42 +2510,15 @@ static FONSglyph* fons__bakeGlyph(FONScontext* stash, FONSfont* font, int ascii_
 	const int pad = iblur + 2;
 
 	// Find code point and size.
-#if FONS_SEPARATE_CODEPOINT
-	const unsigned int h = fons__hashint(codepoint) & (FONS_HASH_LUT_SIZE-1);
-#else
-	const uint64_t glyphCode = MAKE_GLYPH_CODE(codepoint, isize, iblur);
-	const unsigned int h = fons__hashGlyphCode(glyphCode) & (FONS_HASH_LUT_SIZE - 1);
-#endif
-
-	// TODO: JD: This loop is the hottest part of the function under normal usage (i.e. all required glyphs are already cached).
-	// The alternative hash function helps with glyph distribution in the LUT but we still have enough collisions to make the
-	// loop execute multiple times per call. Larger LUT doesn't seem to help (in fact they seem to hurt perf).
-	// It might help if the jumping around in memory from glyph to glyph was avoided (i.e. glyphs in the same bucket are
-	// stored sequentially in the glyphs array) (No it doesn't!).
-	int i = font->lut[h];
-	while (i != -1) {
-#if FONS_SEPARATE_CODEPOINT
-		if (font->glyphs[i].codepoint == codepoint && font->glyphs[i].size == isize && font->glyphs[i].blur == iblur) {
-			glyph = &font->glyphs[i];
-			if (glyph->x0 >= 0 && glyph->y0 >= 0) {
-				return glyph;
-			}
-
-			// At this point, glyph exists but the bitmap data is not yet created.
-			break;
+	unsigned int h;
+	int i = fons__findGlyph(font, codepoint, isize, iblur, &h);
+	if (i != -1) {
+		glyph = &font->glyphs[i];
+		if (glyph->x0 >= 0 && glyph->y0 >= 0) {
+			return glyph;
 		}
-#else
-		if (font->glyphs[i].glyphCode == glyphCode) {
-			glyph = &font->glyphs[i];
-			if (glyph->x0 >= 0 && glyph->y0 >= 0) {
-				return glyph;
-			}
 
-			// At this point, glyph exists but the bitmap data is not yet created.
-			break;
-		}
-#endif
-		i = font->glyphs[i].next;
+		// At this point, glyph exists but the bitmap data is not yet created.
 	}
 
 	// Could not find glyph, create it.
@@ -2318,8 +2571,7 @@ static FONSglyph* fons__bakeGlyph(FONScontext* stash, FONSfont* font, int ascii_
 #endif
 
 		// Insert char to hash lookup.
-		glyph->next = font->lut[h];
-		font->lut[h] = font->nglyphs - 1;
+		fons__insertGlyph(font, glyph, codepoint, isize, iblur, h);
 	}
 
 	glyph->index = ascii_to_glyph_index;
