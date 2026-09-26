@@ -45,8 +45,10 @@ struct Bucket
 
 struct BucketAlloc
 {
-	void *freelist;
+	void *freelist;		// Items returned with bucketFree() (reused first, LIFO).
 	Bucket *buckets;
+	unsigned char *cur;	// Next never-used item in the newest bucket.
+	unsigned char *end;	// End of the newest bucket.
 	unsigned int itemSize;
 	unsigned int bucketSize;
 	const char *name;
@@ -57,43 +59,22 @@ static int CreateBucket( struct BucketAlloc* ba )
 {
 	size_t size;
 	Bucket* bucket;
-	void* freelist;
-	unsigned char* head;
-	unsigned char* it;
 
 	// Allocate memory for the bucket
 	size = sizeof(Bucket) + ba->itemSize * ba->bucketSize;
 	bucket = (Bucket*)ba->alloc->memalloc( ba->alloc->userData, (unsigned int)size );
 	if ( !bucket )
 		return 0;
-	bucket->next = 0;
 
 	// Add the bucket into the list of buckets.
 	bucket->next = ba->buckets;
 	ba->buckets = bucket;
 
-	// Add new items to the free list.
-	freelist = ba->freelist;
-	head = (unsigned char*)bucket + sizeof(Bucket);
-	it = head + ba->itemSize * ba->bucketSize;
-	do
-	{
-		it -= ba->itemSize;
-		// Store pointer to next free item.
-		*((void**)it) = freelist;
-		// Pointer to next location containing a free item.
-		freelist = (void*)it;
-	}
-	while ( it != head );
-	// Update pointer to next location containing a free item.
-	ba->freelist = (void*)it;
+	// Items are handed out lazily (bump allocation) from the new bucket, in address order.
+	ba->cur = (unsigned char*)bucket + sizeof(Bucket);
+	ba->end = ba->cur + ba->itemSize * ba->bucketSize;
 
 	return 1;
-}
-
-static void *NextFreeItem( struct BucketAlloc *ba )
-{
-	return *(void**)ba->freelist;
 }
 
 struct BucketAlloc* createBucketAlloc( TESSalloc* alloc, const char* name,
@@ -109,6 +90,8 @@ struct BucketAlloc* createBucketAlloc( TESSalloc* alloc, const char* name,
 	ba->bucketSize = bucketSize;
 	ba->freelist = 0;
 	ba->buckets = 0;
+	ba->cur = 0;
+	ba->end = 0;
 
 	if ( !CreateBucket( ba ) )
 	{
@@ -123,16 +106,23 @@ void* bucketAlloc( struct BucketAlloc *ba )
 {
 	void *it;
 
-	// If running out of memory, allocate new bucket and update the freelist.
-	if ( !ba->freelist || !NextFreeItem( ba ) )
+	// Reuse freed items first.
+	if ( ba->freelist )
+	{
+		it = ba->freelist;
+		ba->freelist = *(void**)it;
+		return it;
+	}
+
+	// Otherwise take the next untouched item, allocating a new bucket when the current one is used up.
+	if ( ba->cur == ba->end )
 	{
 		if ( !CreateBucket( ba ) )
 			return 0;
 	}
 
-	// Pop item from in front of the free list.
-	it = ba->freelist;
-	ba->freelist = NextFreeItem( ba );
+	it = (void*)ba->cur;
+	ba->cur += ba->itemSize;
 
 	return it;
 }
@@ -165,7 +155,7 @@ void bucketFree( struct BucketAlloc *ba, void *ptr )
 	}
 	else
 	{
-		printf("ERROR! pointer 0x%p does not belong to allocator '%s'\n", ba->name);
+		printf("ERROR! pointer 0x%p does not belong to allocator '%s'\n", ptr, ba->name);
 	}
 #else
 	// Add the node in front of the free list.
@@ -187,5 +177,7 @@ void deleteBucketAlloc( struct BucketAlloc *ba )
 	}		
 	ba->freelist = 0;
 	ba->buckets = 0;
+	ba->cur = 0;
+	ba->end = 0;
 	alloc->memfree( alloc->userData, ba );
 }
