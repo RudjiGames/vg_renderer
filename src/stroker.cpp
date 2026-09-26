@@ -1983,6 +1983,7 @@ struct EdgeHash
 	uint32_t* m_Keys;   // (a << 16) | b, UINT32_MAX for empty slots
 	uint32_t* m_Values; // Offset of the triangle's first index
 	uint32_t m_Mask;
+	uint32_t m_Shift;   // 32 - log2(capacity)
 };
 
 static inline uint32_t edgeKey(uint16_t a, uint16_t b)
@@ -1992,7 +1993,9 @@ static inline uint32_t edgeKey(uint16_t a, uint16_t b)
 
 static inline uint32_t* edgeHashSlot(EdgeHash* hash, uint32_t key)
 {
-	uint32_t slot = (key * 2654435761u) & hash->m_Mask;
+	// Fibonacci hashing: the high bits of the product depend on all the bits of the key (the low bits only on
+	// the low bits of the key, i.e. of the edge's 2nd vertex).
+	uint32_t slot = (key * 2654435761u) >> hash->m_Shift;
 	while (hash->m_Keys[slot] != key && hash->m_Keys[slot] != UINT32_MAX) {
 		slot = (slot + 1) & hash->m_Mask;
 	}
@@ -2266,8 +2269,10 @@ static bool fixFlippedTriangles(Stroker* stroker, const Vec2* pos, uint16_t* tri
 
 	// Build the edge hash table (load factor <= 0.5)
 	uint32_t capacity = 16;
+	uint32_t capacityBits = 4;
 	while (capacity < numIndices * 2) {
 		capacity <<= 1;
+		++capacityBits;
 	}
 
 	if (capacity > stroker->m_EdgeHashCapacity) {
@@ -2282,6 +2287,7 @@ static bool fixFlippedTriangles(Stroker* stroker, const Vec2* pos, uint16_t* tri
 	hash.m_Keys = stroker->m_EdgeHash;
 	hash.m_Values = stroker->m_EdgeHash + capacity;
 	hash.m_Mask = capacity - 1;
+	hash.m_Shift = 32 - capacityBits;
 	bx::memSet(hash.m_Keys, 0xFF, sizeof(uint32_t) * capacity);
 	for (uint32_t t = 0; t < numIndices; t += 3) {
 		edgeHashSet(&hash, tris[t + 0], tris[t + 1], t);
