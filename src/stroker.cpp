@@ -1662,7 +1662,7 @@ struct PolygonGrid
 
 	void init(const Vec2& bbMin, const Vec2& bbMax, uint32_t numElements)
 	{
-		// ~2 elements per cell
+		// ~2 elements per cell (at least 1 cell)
 		uint32_t size = 1;
 		while (size < kMaxSize && size * size * 2 < numElements) {
 			++size;
@@ -1779,9 +1779,6 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 		return 0;
 	}
 
-	PolygonGrid grid;
-	grid.init(bbMin, bbMax, n);
-	const uint32_t numCells = grid.m_Size * grid.m_Size;
 
 	// Ear clipping. An ear (p, c, q) must be convex (or c on the segment p-q) and no other vertex may be inside
 	// or on the triangle. In a simple polygon it's enough to test the reflex vertices (if there's a vertex inside
@@ -1794,7 +1791,14 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 	uint16_t reflexHead[PolygonGrid::kMaxCells];
 	uint16_t reflexNext[kMaxSimplePolygonVertices];
 	bool isListed[kMaxSimplePolygonVertices];
-	bx::memSet(reflexHead, 0xff, sizeof(uint16_t) * numCells);
+	uint32_t numReflex = 0; // Reflex vertices of the remaining polygon
+	for (uint32_t i = 0; i < n; ++i) {
+		numReflex += isReflex[i] ? 1 : 0;
+	}
+
+	PolygonGrid grid;
+	grid.init(bbMin, bbMax, n);
+	bx::memSet(reflexHead, 0xff, sizeof(uint16_t) * grid.m_Size * grid.m_Size);
 	for (uint32_t i = 0; i < n; ++i) {
 		prev[i] = (uint16_t)(i == 0 ? n - 1 : i - 1);
 		next[i] = (uint16_t)(i + 1 == n ? 0 : i + 1);
@@ -1826,7 +1830,7 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 		const Vec2& pq = vtx[in];
 		const double o = orient2d(pp, pc, pq);
 		bool isEar = o > 0.0 || (o == 0.0 && ((double)pc.x - pp.x) * ((double)pq.x - pc.x) + ((double)pc.y - pp.y) * ((double)pq.y - pc.y) > 0.0);
-		if (isEar) {
+		if (isEar && numReflex != 0) {
 			const float bbox[4] = {
 				bx::min(pp.x, bx::min(pc.x, pq.x)),
 				bx::min(pp.y, bx::min(pc.y, pq.y)),
@@ -1869,6 +1873,7 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 
 		next[ip] = (uint16_t)in;
 		prev[in] = (uint16_t)ip;
+		numReflex -= isReflex[c] ? 1 : 0;
 		isReflex[c] = false;
 		--numRemaining;
 
@@ -1876,7 +1881,9 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 		const uint32_t neighbors[2] = { ip, in };
 		for (uint32_t k = 0; k < 2; ++k) {
 			const uint32_t iv = neighbors[k];
+			const bool wasReflex = isReflex[iv];
 			isReflex[iv] = !(orient2d(vtx[prev[iv]], vtx[iv], vtx[next[iv]]) > 0.0);
+			numReflex = numReflex + (isReflex[iv] ? 1 : 0) - (wasReflex ? 1 : 0);
 			if (isReflex[iv] && !isListed[iv]) {
 				const uint32_t cell = grid.getCellID(vtx[iv]);
 				reflexNext[iv] = reflexHead[cell];
