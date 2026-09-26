@@ -184,6 +184,9 @@ void pathCubicTo(Path* path, float c1x, float c1y, float c2x, float c2y, float x
 
 	const int MAX_LEVELS = 10;
 	float stack[MAX_LEVELS * 8];
+	int stackLevel[MAX_LEVELS]; // Subdivision level of each pushed sibling
+
+	VG_CHECK(!path->m_CurSubPath->m_IsClosed, "Cannot add new vertices to a closed path");
 
 	const uint32_t lastVertexID = path->m_CurSubPath->m_FirstVertexID + (path->m_CurSubPath->m_NumVertices - 1);
 	const float* lastVertex = &path->m_Vertices[lastVertexID << 1];
@@ -199,81 +202,111 @@ void pathCubicTo(Path* path, float c1x, float c1y, float c2x, float c2y, float x
 
 	const float tessTol = path->m_TesselationTolerance / (path->m_Scale * path->m_Scale);
 
+	// Emitted points are written directly into the vertex buffer (equivalent to pathAddVertex(), incl.
+	// its dedup check against the previous vertex of the sub-path and its capacity growth policy),
+	// keeping the buffer pointer, vertex count, capacity and last vertex in locals. The counts are
+	// committed once at the end.
+	float* vertices = path->m_Vertices;
+	const uint32_t firstNewVertex = path->m_NumVertices;
+	uint32_t numVertices = firstNewVertex;
+	uint32_t vertexCapacity = path->m_VertexCapacity;
+	float lastX = x1;
+	float lastY = y1;
+
+	// NOTE: The subdivision level is tracked explicitly (like NanoVG's recursive version). The number of
+	// pushed siblings is <= the current level, so the stack can never overflow.
+	int level = 0;
 	float* stackPtr = stack;
-	bool done = false;
-	while (!done) {
+	for (;;) {
 		const float dx = x4 - x1;
 		const float dy = y4 - y1;
 		const float d2 = bx::abs((x2 - x4) * dy - (y2 - y4) * dx);
 		const float d3 = bx::abs((x3 - x4) * dy - (y3 - y4) * dx);
 		const float d23 = d2 + d3;
 
-		if (d23 * d23 <= tessTol * (dx * dx + dy * dy)) {
-			pathAddVertex(path, x4, y4);
+		// Emit the end point when the segment is flat enough or when the max subdivision level
+		// has been reached (in the latter case the end point is still emitted, so the vertex isn't lost).
+		const bool isFlat = d23 * d23 <= tessTol * (dx * dx + dy * dy);
+		const bool isMaxLevel = level >= MAX_LEVELS;
+		if (isFlat | isMaxLevel) {
+			// Same as pathAddVertex(path, x4, y4)
+			const float ddx = lastX - x4;
+			const float ddy = lastY - y4;
+			const float distSqr = ddx * ddx + ddy * ddy;
+			if (!(distSqr < VG_EPSILON)) {
+				float* v;
+				if (numVertices == vertexCapacity) {
+					// Buffer full: grow it exactly like pathAddVertex() would.
+					path->m_NumVertices = numVertices;
+					v = pathAllocVertices(path, 1);
+					vertices = path->m_Vertices;
+					vertexCapacity = path->m_VertexCapacity;
+				} else {
+					v = &vertices[numVertices << 1];
+				}
+
+				v[0] = x4;
+				v[1] = y4;
+				++numVertices;
+				lastX = x4;
+				lastY = y4;
+			}
 
 			// Pop sibling off the stack and decrease level...
 			if (stackPtr == stack) {
-				done = true;
-			} else {
-				stackPtr -= 8;
-				y4 = stackPtr[0];
-				x4 = stackPtr[1];
-				y3 = stackPtr[2];
-				x3 = stackPtr[3];
-				y2 = stackPtr[4];
-				x2 = stackPtr[5];
-				y1 = stackPtr[6];
-				x1 = stackPtr[7];
+				break;
 			}
+
+			stackPtr -= 8;
+			level = stackLevel[(stackPtr - stack) / 8];
+			y4 = stackPtr[0];
+			x4 = stackPtr[1];
+			y3 = stackPtr[2];
+			x3 = stackPtr[3];
+			y2 = stackPtr[4];
+			x2 = stackPtr[5];
+			y1 = stackPtr[6];
+			x1 = stackPtr[7];
 		} else {
-			const ptrdiff_t curLevel = (stackPtr - stack); // 8 floats per sub-curve
-			if (curLevel < MAX_LEVELS * 8) {
-				const float x12 = (x1 + x2) * 0.5f;
-				const float y12 = (y1 + y2) * 0.5f;
-				const float x23 = (x2 + x3) * 0.5f;
-				const float y23 = (y2 + y3) * 0.5f;
-				const float x34 = (x3 + x4) * 0.5f;
-				const float y34 = (y3 + y4) * 0.5f;
-				const float x123 = (x12 + x23) * 0.5f;
-				const float y123 = (y12 + y23) * 0.5f;
-				const float x234 = (x23 + x34) * 0.5f;
-				const float y234 = (y23 + y34) * 0.5f;
-				const float x1234 = (x123 + x234) * 0.5f;
-				const float y1234 = (y123 + y234) * 0.5f;
+			const float x12 = (x1 + x2) * 0.5f;
+			const float y12 = (y1 + y2) * 0.5f;
+			const float x23 = (x2 + x3) * 0.5f;
+			const float y23 = (y2 + y3) * 0.5f;
+			const float x34 = (x3 + x4) * 0.5f;
+			const float y34 = (y3 + y4) * 0.5f;
+			const float x123 = (x12 + x23) * 0.5f;
+			const float y123 = (y12 + y23) * 0.5f;
+			const float x234 = (x23 + x34) * 0.5f;
+			const float y234 = (y23 + y34) * 0.5f;
+			const float x1234 = (x123 + x234) * 0.5f;
+			const float y1234 = (y123 + y234) * 0.5f;
 
-				// Push sibling on the stack...
-				stackPtr[0] = y4;
-				stackPtr[1] = x4;
-				stackPtr[2] = y34;
-				stackPtr[3] = x34;
-				stackPtr[4] = y234;
-				stackPtr[5] = x234;
-				stackPtr[6] = y1234;
-				stackPtr[7] = x1234;
-				stackPtr += 8;
+			// Push sibling on the stack...
+			stackPtr[0] = y4;
+			stackPtr[1] = x4;
+			stackPtr[2] = y34;
+			stackPtr[3] = x34;
+			stackPtr[4] = y234;
+			stackPtr[5] = x234;
+			stackPtr[6] = y1234;
+			stackPtr[7] = x1234;
+			++level;
+			stackLevel[(stackPtr - stack) / 8] = level;
+			stackPtr += 8;
 
-//				x1 = x1; // NOP
-//				y1 = y1; // NOP
-				x2 = x12;
-				y2 = y12;
-				x3 = x123;
-				y3 = y123;
-				x4 = x1234;
-				y4 = y1234;
-			} else {
-				// Pop sibling off the stack...
-				stackPtr -= 8;
-				y4 = stackPtr[0];
-				x4 = stackPtr[1];
-				y3 = stackPtr[2];
-				x3 = stackPtr[3];
-				y2 = stackPtr[4];
-				x2 = stackPtr[5];
-				y1 = stackPtr[6];
-				x1 = stackPtr[7];
-			}
+//			x1 = x1; // NOP
+//			y1 = y1; // NOP
+			x2 = x12;
+			y2 = y12;
+			x3 = x123;
+			y3 = y123;
+			x4 = x1234;
+			y4 = y1234;
 		}
 	}
+
+	path->m_NumVertices = numVertices;
+	path->m_CurSubPath->m_NumVertices += numVertices - firstNewVertex;
 }
 
 void pathQuadraticTo(Path* path, float cx, float cy, float x, float y)
