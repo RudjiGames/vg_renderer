@@ -5528,8 +5528,94 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 	cmd->m_NumIndices += numIndices;
 }
 
+// Image pattern UVs are an affine function of the (canvas space) vertex positions (see vs_image_pattern.sc).
+// Returns false if the UVs of the specified vertices might not be representable in the UV vertex format
+// (e.g. repeating patterns with int16 UVs).
+static bool canBakeImagePatternUVs(const ImagePattern* pattern, const float* vtx, uint32_t numVertices, const float* mtx)
+{
+#if VG_CONFIG_UV_INT16
+	if (numVertices == 0) {
+		return true;
+	}
+
+	// UVs at the vertices are bounded by the UVs at the corners of the vertices' bounding box.
+	float minx = vtx[0], miny = vtx[1], maxx = vtx[0], maxy = vtx[1];
+	for (uint32_t i = 1; i < numVertices; ++i) {
+		minx = bx::min<float>(minx, vtx[i * 2 + 0]);
+		miny = bx::min<float>(miny, vtx[i * 2 + 1]);
+		maxx = bx::max<float>(maxx, vtx[i * 2 + 0]);
+		maxy = bx::max<float>(maxy, vtx[i * 2 + 1]);
+	}
+
+	const float corners[8] = { minx, miny, maxx, miny, maxx, maxy, minx, maxy };
+	const float* m = pattern->m_Matrix;
+	for (uint32_t i = 0; i < 4; ++i) {
+		float pos[2] = { corners[i * 2 + 0], corners[i * 2 + 1] };
+		if (mtx) {
+			vgutil::transformPos2D(corners[i * 2 + 0], corners[i * 2 + 1], mtx, pos);
+		}
+
+		const float u = m[0] * pos[0] + m[3] * pos[1] + m[6];
+		const float v = m[1] * pos[0] + m[4] * pos[1] + m[7];
+		if (!(u >= -1.0f && u <= 1.0f && v >= -1.0f && v <= 1.0f)) {
+			return false;
+		}
+	}
+#else
+	BX_UNUSED(pattern, vtx, numVertices, mtx);
+#endif
+
+	return true;
+}
+
 static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle imgPatternHandle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx)
 {
+	const ImagePattern* pattern = &ctx->m_ImagePatterns[imgPatternHandle.idx];
+
+	// Calculate the pattern's UVs on the CPU and draw it as a regular textured mesh. This way
+	// consecutive draws using the same image (or the font atlas) can be batched together.
+	if (canBakeImagePatternUVs(pattern, vtx, numVertices, mtx)) {
+		DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::Textured, pattern->m_ImageHandle.idx);
+
+		VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
+		const uint32_t vbOffset = cmd->m_FirstVertexID + cmd->m_NumVertices;
+
+		float* dstPos = &vb->m_Pos[vbOffset << 1];
+		writePositions(dstPos, vtx, numVertices, mtx);
+
+		const float* m = pattern->m_Matrix;
+		uv_t* dstUV = &vb->m_UV[vbOffset << 1];
+		for (uint32_t i = 0; i < numVertices; ++i) {
+			const float x = dstPos[i * 2 + 0];
+			const float y = dstPos[i * 2 + 1];
+			const float u = m[0] * x + m[3] * y + m[6];
+			const float v = m[1] * x + m[4] * y + m[7];
+#if VG_CONFIG_UV_INT16
+			dstUV[i * 2 + 0] = (int16_t)(u * INT16_MAX);
+			dstUV[i * 2 + 1] = (int16_t)(v * INT16_MAX);
+#else
+			dstUV[i * 2 + 0] = u;
+			dstUV[i * 2 + 1] = v;
+#endif
+		}
+
+		uint32_t* dstColor = &vb->m_Color[vbOffset];
+		if (numColors == numVertices) {
+			bx::memCopy(dstColor, colors, sizeof(uint32_t) * numVertices);
+		} else {
+			VG_CHECK(numColors == 1, "Invalid size of color array passed.");
+			vgutil::memset32(dstColor, numVertices, colors);
+		}
+
+		IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
+		uint16_t* dstIndex = &ib->m_Indices[cmd->m_FirstIndexID + cmd->m_NumIndices];
+		vgutil::batchTransformDrawIndices(indices, numIndices, dstIndex, (uint16_t)cmd->m_NumVertices);
+
+		cmd->m_NumVertices += numVertices;
+		cmd->m_NumIndices += numIndices;
+		return;
+	}
+
 	DrawCommand* cmd = allocDrawCommand(ctx, numVertices, numIndices, DrawCommand::Type::ImagePattern, imgPatternHandle.idx);
 
 	VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
