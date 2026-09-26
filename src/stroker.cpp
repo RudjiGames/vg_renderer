@@ -317,6 +317,10 @@ struct RoundJoinArc
 	uint32_t m_NumArcPoints;
 };
 
+// Max number of vertices of a concave polygon to triangulate by ear clipping instead of libtess2
+// (see triangulateSimplePolygon()).
+static const uint32_t kMaxSimplePolygonVertices = 256;
+
 struct Stroker
 {
 	bx::AllocatorI* m_Allocator;
@@ -335,6 +339,9 @@ struct Stroker
 	uint32_t m_EdgeHashCapacity;  // Number of slots in m_EdgeHash
 	uint32_t* m_ClampScratch;     // Scratch memory used by clampInset(). Grow-only.
 	uint32_t m_ClampScratchCapacity;
+	Vec2 m_SimplePolyVertices[kMaxSimplePolygonVertices];                  // See triangulateSimplePolygon()
+	uint16_t m_SimplePolyTriangles[(kMaxSimplePolygonVertices - 2) * 3];
+	uint16_t m_SimplePolyBoundary[kMaxSimplePolygonVertices + 2];           // Boundary vertex IDs + contour (first, count)
 	Vec2* m_ContourVertices;      // Copy of the contours added with strokerConcaveFillAddContour()
 	uint32_t m_NumContourVertices;
 	uint32_t m_ContourVertexCapacity;
@@ -471,21 +478,37 @@ static void endGeometry(Stroker* stroker, const GeometryOutput* out, const Vec2*
 	mesh->m_NumIndices = numIndices;
 }
 
+// Inner bevels: the inner corner of a join is the intersection of the inner edges of its 2 segments, which is
+// projDist = |dot(d12, v_s)| behind the join along both segments (v_s is the extrusion vector scaled by the half
+// stroke width). If one of the segments is shorter than that (sharp turns of thick strokes), the intersection is far
+// away from the stroke and the join geometry creates a long spike. Such joins use 2 inner vertices instead (the inner
+// corners of the 2 segments, like NanoVG's inner bevels), connected through the join point. The inner sides of the 2
+// segments overlap in that case.
+static BX_FORCE_INLINE bool needsInnerBevel(const Vec2* vtx, uint32_t numVertices, uint32_t i, float projDist)
+{
+	const Vec2 d01 = vec2Sub(vtx[i], vtx[i != 0 ? i - 1 : numVertices - 1]);
+	const Vec2 d12 = vec2Sub(vtx[i + 1 < numVertices ? i + 1 : 0], vtx[i]);
+	return projDist * projDist > bx::min(d01.x * d01.x + d01.y * d01.y, d12.x * d12.x + d12.y * d12.y);
+}
+
 // Calculates the direction of each segment of the polyline: dirs[i] = vec2Dir(vtx[i], vtx[i + 1]) for
 // i in [0, numVertices - 1) and, for closed paths, the closing segment dirs[numVertices - 1] = vec2Dir(vtx[numVertices - 1], vtx[0]).
 // Also calculates the extrusion vector of each join: ext[i] = calcExtrusionVector(dirs[i - 1], dirs[i]) for
 // i in [1, numVertices - 1) and, for closed paths, ext[numVertices - 1] and ext[0] (using the closing segment).
 // The results are bit-identical to calling vec2Dir()/calcExtrusionVector() for each segment/join (the SIMD
 // version performs exactly the same IEEE operations, 4 segments at a time; bx::rsqrt() is 1.0f / sqrt() on SSE).
-// Both arrays point into the stroker's scratch buffer (valid until the next call).
-static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint32_t numVertices, bool closed, const Vec2** dirsOut, const Vec2** extOut)
+// Also decides which joins need an inner bevel (innerBevel[i] != 0, see needsInnerBevel()) for the given half stroke
+// width (the one the join loops scale the extrusion vectors with to find the inner corner) and returns their number.
+// The flags are calculated once and used both for the geometry budget and by the join loops, so they always match.
+// All arrays point into the stroker's scratch buffer (valid until the next call).
+static uint32_t calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint32_t numVertices, bool closed, float innerBevelHsw, const Vec2** dirsOut, const Vec2** extOut, const uint8_t** innerBevelOut)
 {
 	VG_CHECK(numVertices >= 2, "Invalid number of vertices");
 	const uint32_t numDirs = closed ? numVertices : numVertices - 1;
 
-	// Layout: [dirs[0 .. numDirs) + 4 padding] [ext[0 .. numDirs) + 4 padding]
+	// Layout: [dirs[0 .. numDirs) + 4 padding] [ext[0 .. numDirs) + 4 padding] [innerBevel[0 .. numDirs) + 4 padding]
 	// The padding allows the SIMD code to always write 4 elements at a time.
-	const uint32_t required = numDirs * 2 + 8;
+	const uint32_t required = numDirs * 2 + 8 + (numDirs + 4 + 7) / 8;
 	if (required > stroker->m_SegmentCapacity) {
 		const uint32_t newCapacity = bx::max<uint32_t>(required, stroker->m_SegmentCapacity + (stroker->m_SegmentCapacity >> 1));
 		// The old contents aren't needed so free the old buffer first.
@@ -498,6 +521,8 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 
 	Vec2* dirs = stroker->m_SegmentBuffer;
 	Vec2* ext = dirs + numDirs + 4;
+	uint8_t* innerBevel = (uint8_t*)(ext + numDirs + 4);
+	uint32_t numInnerBevelJoins = 0;
 
 #if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86
 	const __m128 xmm_one = _mm_set1_ps(1.0f);
@@ -511,6 +536,12 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 	const Vec2 closingDir = closed ? vec2Dir(vtx[numVertices - 1], vtx[0]) : Vec2{ 0.0f, 0.0f };
 	__m128 prevDirX = _mm_set1_ps(closingDir.x);
 	__m128 prevDirY = _mm_set1_ps(closingDir.y);
+
+	// Squared length of the previous segment (for the inner bevel test). There's no join at the first vertex of an
+	// open path (its flag is cleared below).
+	const Vec2 closingSeg = vec2Sub(vtx[0], vtx[numVertices - 1]);
+	__m128 prevLenSqr = _mm_set1_ps(closingSeg.x * closingSeg.x + closingSeg.y * closingSeg.y);
+	const __m128 xmm_hsw = _mm_set1_ps(innerBevelHsw);
 
 	for (uint32_t i = 0; i < numDirs; i += 4) {
 		// Load the start (a) and end (b) points of the 4 segments (SoA).
@@ -571,8 +602,28 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 		_mm_storeu_ps(dstExt, _mm_unpacklo_ps(vx, vy));
 		_mm_storeu_ps(dstExt + 4, _mm_unpackhi_ps(vx, vy));
 
+		// Inner bevels (needsInnerBevel()): projDist = dot(d12, v * hsw), limit = min(lenSqr[i - 1], lenSqr[i])
+		const __m128 projDist = _mm_add_ps(_mm_mul_ps(d12x, _mm_mul_ps(vx, xmm_hsw)), _mm_mul_ps(d12y, _mm_mul_ps(vy, xmm_hsw)));
+		const __m128 tl = _mm_shuffle_ps(prevLenSqr, lenSqr, _MM_SHUFFLE(0, 0, 3, 3));
+		const __m128 lenSqr01 = _mm_shuffle_ps(tl, lenSqr, _MM_SHUFFLE(2, 1, 2, 0));
+		uint32_t bevelMask = (uint32_t)_mm_movemask_ps(_mm_cmpgt_ps(_mm_mul_ps(projDist, projDist), _mm_min_ps(lenSqr01, lenSqr)));
+		if (i == 0 && !closed) {
+			bevelMask &= ~1u; // No join at the first vertex of an open path
+		}
+		if (i + 4 > numDirs) {
+			bevelMask &= (1u << (numDirs - i)) - 1; // Past the last segment
+		}
+		static const uint32_t kMaskToBytes[16] = {
+			0x00000000, 0x00000001, 0x00000100, 0x00000101, 0x00010000, 0x00010001, 0x00010100, 0x00010101,
+			0x01000000, 0x01000001, 0x01000100, 0x01000101, 0x01010000, 0x01010001, 0x01010100, 0x01010101
+		};
+		static const uint8_t kMaskBits[16] = { 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4 };
+		memcpy(&innerBevel[i], &kMaskToBytes[bevelMask], 4); // little endian (x86): byte k = lane k
+		numInnerBevelJoins += kMaskBits[bevelMask];
+
 		prevDirX = d12x;
 		prevDirY = d12y;
+		prevLenSqr = lenSqr;
 	}
 #else
 	for (uint32_t i = 0; i < numDirs; ++i) {
@@ -586,16 +637,64 @@ static void calcSegmentDirsAndExtrusions(Stroker* stroker, const Vec2* vtx, uint
 	for (uint32_t i = 1; i < numDirs; ++i) {
 		ext[i] = calcExtrusionVector(dirs[i - 1], dirs[i]);
 	}
+
+	innerBevel[0] = 0; // No join at the first vertex of an open path
+	for (uint32_t i = closed ? 0 : 1; i < numDirs; ++i) {
+		const Vec2 v_s = vec2Scale(ext[i], innerBevelHsw);
+		const float projDist = dirs[i].x * v_s.x + dirs[i].y * v_s.y;
+		innerBevel[i] = needsInnerBevel(vtx, numVertices, i, projDist) ? 1 : 0;
+		numInnerBevelJoins += innerBevel[i];
+	}
 #endif
 
 	*dirsOut = dirs;
 	*extOut = ext;
+	*innerBevelOut = innerBevel;
+	return numInnerBevelJoins;
 }
 
 // Calculates the arc of each round join in [firstJoin, lastJoin) (the calculations the join loops used to perform
 // for each join) so that the exact amount of geometry is known before generating it. projScale is the scale
 // of the extrusion vector used to determine the inner corner (hsw or hsw_aa, see the join loops). Returns the
 // arcs (indexed by join/segment ID) and the total number of arc points.
+// Returns how many of the inner bevel joins (see calcSegmentDirsAndExtrusions()) are bevel/round joins (miter joins
+// and round joins generated as miters use the miter geometry).
+static uint32_t countInnerBevelFanJoins(const uint8_t* innerBevel, uint32_t numInnerBevelJoins, uint32_t firstJoin, uint32_t lastJoin, LineJoin::Enum lineJoin, const RoundJoinArc* arcs)
+{
+	if (numInnerBevelJoins == 0 || lineJoin == LineJoin::Miter) {
+		return 0;
+	}
+
+	if (lineJoin == LineJoin::Bevel) {
+		return numInnerBevelJoins;
+	}
+
+	uint32_t numFan = 0;
+	for (uint32_t i = firstJoin; i < lastJoin; ++i) {
+		numFan += (innerBevel[i] && arcs[i].m_NumArcPoints != 0) ? 1 : 0;
+	}
+	return numFan;
+}
+
+// Indices connecting the end of the previous segment (IDs p*) to the start of a join (IDs t*).
+static BX_FORCE_INLINE uint16_t* connectJoin2(uint16_t* dst, uint16_t pL, uint16_t pR, uint16_t tL, uint16_t tR)
+{
+	const uint16_t id[6] = { pL, pR, tR, pL, tR, tL };
+	return copyIndices<6>(dst, id);
+}
+
+static BX_FORCE_INLINE uint16_t* connectJoin3(uint16_t* dst, uint16_t pLA, uint16_t pM, uint16_t pRA, uint16_t tLA, uint16_t tM, uint16_t tRA)
+{
+	const uint16_t id[12] = { pLA, pM, tM, pLA, tM, tLA, pM, pRA, tRA, pM, tRA, tM };
+	return copyIndices<12>(dst, id);
+}
+
+static BX_FORCE_INLINE uint16_t* connectJoin4(uint16_t* dst, uint16_t pLA, uint16_t pL, uint16_t pR, uint16_t pRA, uint16_t tLA, uint16_t tL, uint16_t tR, uint16_t tRA)
+{
+	const uint16_t id[18] = { pLA, pL, tL, pLA, tL, tLA, pL, pR, tR, pL, tR, tL, pR, pRA, tRA, pR, tRA, tR };
+	return copyIndices<18>(dst, id);
+}
+
 static const RoundJoinArc* calcRoundJoinArcs(Stroker* stroker, const Vec2* dirs, const Vec2* ext, uint32_t numDirs, uint32_t firstJoin, uint32_t lastJoin, float projScale, float da, uint32_t* totalArcPoints)
 {
 	if (lastJoin > stroker->m_JoinCapacity) {
@@ -607,6 +706,11 @@ static const RoundJoinArc* calcRoundJoinArcs(Stroker* stroker, const Vec2* dirs,
 		stroker->m_JoinCapacity = newCapacity;
 	}
 
+	// Joins which turn by at most da are generated as miter joins (m_NumArcPoints = 0): the miter point is at most
+	// r / cos(da / 2) - r = tesselation tolerance away from the arc (see the calculation of da), and a miter join has
+	// half the geometry of the smallest round join. This is the common case for flattened curves.
+	const float cosDa = bx::cos(da);
+
 	RoundJoinArc* arcs = stroker->m_JoinBuffer;
 	uint32_t total = 0;
 	for (uint32_t iJoin = firstJoin; iJoin < lastJoin; ++iJoin) {
@@ -615,6 +719,10 @@ static const RoundJoinArc* calcRoundJoinArcs(Stroker* stroker, const Vec2* dirs,
 		const Vec2 v_s = vec2Scale(ext[iJoin], projScale);
 
 		RoundJoinArc* arc = &arcs[iJoin];
+		if (vec2Dot(d01, d12) >= cosDa) {
+			arc->m_NumArcPoints = 0;
+			continue;
+		}
 		const float leftPointProjDist = d12.x * v_s.x + d12.y * v_s.y;
 		if (leftPointProjDist >= 0.0f) {
 			// The left point is the inner corner. CCW angle from r01 to r12 in [0, 2*Pi)
@@ -1327,7 +1435,7 @@ static void resetTesselator(Stroker* stroker)
 
 bool strokerConcaveFillBegin(Stroker* stroker)
 {
-	resetTesselator(stroker);
+	// The tesselator is (re)created only when it's used (see addContoursToTesselator() and tesselateInsetContours()).
 	stroker->m_NumContourVertices = 0;
 	stroker->m_NumContours = 0;
 	return true;
@@ -1335,9 +1443,8 @@ bool strokerConcaveFillBegin(Stroker* stroker)
 
 void strokerConcaveFillAddContour(Stroker* stroker, const float* vertexList, uint32_t numVertices)
 {
-	tessAddContour(stroker->m_Tesselator, 2, vertexList, sizeof(float) * 2, numVertices);
-
-	// Keep a copy of the contours in case strokerConcaveFillEndAA() has to tesselate them again.
+	// The contours are added to the tesselator only if they have to be tesselated (see
+	// strokerConcaveFillEnd()/strokerConcaveFillEndAA()).
 	if (stroker->m_NumContourVertices + numVertices > stroker->m_ContourVertexCapacity) {
 		const uint32_t newCapacity = bx::max<uint32_t>(stroker->m_NumContourVertices + numVertices, stroker->m_ContourVertexCapacity + (stroker->m_ContourVertexCapacity >> 1));
 		stroker->m_ContourVertices = (Vec2*)bx::alignedRealloc(stroker->m_Allocator, stroker->m_ContourVertices, sizeof(Vec2) * newCapacity, 16);
@@ -1354,6 +1461,478 @@ void strokerConcaveFillAddContour(Stroker* stroker, const float* vertexList, uin
 	stroker->m_ContourSizes[stroker->m_NumContours++] = numVertices;
 }
 
+// (Re)creates the tesselator and adds the contours added with strokerConcaveFillAddContour().
+static void addContoursToTesselator(Stroker* stroker)
+{
+	resetTesselator(stroker);
+	const Vec2* contourVertices = stroker->m_ContourVertices;
+	for (uint32_t i = 0; i < stroker->m_NumContours; ++i) {
+		tessAddContour(stroker->m_Tesselator, 2, contourVertices, sizeof(Vec2), (int)stroker->m_ContourSizes[i]);
+		contourVertices += stroker->m_ContourSizes[i];
+	}
+}
+
+static inline double orient2d(const Vec2& a, const Vec2& b, const Vec2& c)
+{
+	return ((double)b.x - (double)a.x) * ((double)c.y - (double)a.y) - ((double)b.y - (double)a.y) * ((double)c.x - (double)a.x);
+}
+
+// Returns true if the segments (a, b) and (c, d) intersect or touch (incl. collinear overlaps).
+static bool segmentsIntersect(const Vec2& a, const Vec2& b, const Vec2& c, const Vec2& d)
+{
+	if (bx::max(a.x, b.x) < bx::min(c.x, d.x) || bx::max(c.x, d.x) < bx::min(a.x, b.x)
+	||  bx::max(a.y, b.y) < bx::min(c.y, d.y) || bx::max(c.y, d.y) < bx::min(a.y, b.y)) {
+		return false;
+	}
+
+	const double o1 = orient2d(a, b, c);
+	const double o2 = orient2d(a, b, d);
+	const double o3 = orient2d(c, d, a);
+	const double o4 = orient2d(c, d, b);
+	if (((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0)) && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))) {
+		return true;
+	}
+
+	// Touching (the bounding boxes overlap, so a zero orientation means the point is on the other segment)
+	return o1 == 0.0 || o2 == 0.0 || o3 == 0.0 || o4 == 0.0;
+}
+
+// Fast path for concave fills: if the only contour is a simple polygon (no self intersections, no touching edges,
+// no duplicate vertices) with at most kMaxSimplePolygonVertices vertices, it's triangulated by ear clipping, which is
+// much faster than libtess2 for small polygons. Both fill rules fill the interior of a simple polygon. The vertices
+// are stored in CCW order in m_SimplePolyVertices (so the boundary contour is 0..n-1, like the tesselator's boundary
+// contours, with the interior on the left) and the n - 2 CCW triangles in m_SimplePolyTriangles.
+// Returns the number of vertices, or 0 if the fast path can't be used (the contours have to be tesselated).
+// Returns a 32-bit key with the same order as the float (NaNs excluded).
+static inline uint32_t floatSortKey(float f)
+{
+	const uint32_t u = bx::floatToBits(f);
+	return (u & 0x80000000u) != 0 ? ~u : (u | 0x80000000u);
+}
+
+// Sorts the n (unique) keys. Uses a natural merge sort for larger arrays (the keys of the edges of a polygon form
+// long monotone runs). Returns the sorted keys (either keys or temp).
+static uint64_t* sortPolygonKeys(uint64_t* keys, uint64_t* temp, uint32_t n)
+{
+	if (n <= 32) {
+		for (uint32_t i = 1; i < n; ++i) {
+			const uint64_t key = keys[i];
+			uint32_t k = i;
+			for (; k > 0 && keys[k - 1] > key; --k) {
+				keys[k] = keys[k - 1];
+			}
+			keys[k] = key;
+		}
+
+		return keys;
+	}
+
+	// Find the runs and make them all ascending
+	uint16_t runStart[kMaxSimplePolygonVertices + 1];
+	uint32_t numRuns = 0;
+	for (uint32_t i = 0; i < n; ) {
+		uint32_t j = i + 1;
+		if (j < n && keys[j] < keys[i]) {
+			while (j < n && keys[j] < keys[j - 1]) {
+				++j;
+			}
+
+			for (uint32_t l = i, r = j - 1; l < r; ++l, --r) {
+				const uint64_t tmp = keys[l];
+				keys[l] = keys[r];
+				keys[r] = tmp;
+			}
+		} else {
+			while (j < n && keys[j] > keys[j - 1]) {
+				++j;
+			}
+		}
+
+		runStart[numRuns++] = (uint16_t)i;
+		i = j;
+	}
+	runStart[numRuns] = (uint16_t)n;
+
+	uint64_t* src = keys;
+	uint64_t* dst = temp;
+	while (numRuns > 1) {
+		uint32_t numMerged = 0;
+		for (uint32_t r = 0; r < numRuns; r += 2) {
+			const uint32_t begin = runStart[r];
+			const uint32_t mid = runStart[bx::min(r + 1, numRuns)];
+			const uint32_t end = runStart[bx::min(r + 2, numRuns)];
+			uint32_t a = begin;
+			uint32_t b = mid;
+			uint32_t k = begin;
+			while (a < mid && b < end) {
+				dst[k++] = src[a] < src[b] ? src[a++] : src[b++];
+			}
+			while (a < mid) {
+				dst[k++] = src[a++];
+			}
+			while (b < end) {
+				dst[k++] = src[b++];
+			}
+
+			runStart[numMerged++] = (uint16_t)begin;
+		}
+		runStart[numMerged] = (uint16_t)n;
+		numRuns = numMerged;
+
+		uint64_t* tmp = src;
+		src = dst;
+		dst = tmp;
+	}
+
+	return src;
+}
+
+// Returns true if all the edges of the polygon turn CCW around point c and the polygon winds around it exactly once,
+// i.e. the polygon is star-shaped wrt c (c is in its kernel), so it's simple.
+static bool windsOnceAround(const Vec2* vtx, uint32_t n, const Vec2& c)
+{
+	uint32_t numCrossings = 0; // Edges crossing the ray from c towards +X (from below)
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& a = vtx[i];
+		const Vec2& b = vtx[i + 1 == n ? 0 : i + 1];
+		if (!(orient2d(c, a, b) > 0.0)) {
+			return false;
+		}
+
+		numCrossings += (a.y < c.y && b.y >= c.y) ? 1 : 0;
+	}
+
+	return numCrossings == 1;
+}
+
+// Returns the number of times the edge direction of the polygon turns around (+1 for simple CCW polygons, -1 for
+// simple CW polygons). Counts the (exact) crossings of the +X direction.
+static int32_t calcTurningNumber(const Vec2* vtx, uint32_t n)
+{
+	int32_t turningNumber = 0;
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p0 = vtx[i == 0 ? n - 1 : i - 1];
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		const double o = orient2d(p0, p1, p2);
+		const double dy01 = (double)p1.y - (double)p0.y;
+		const double dy12 = (double)p2.y - (double)p1.y;
+		turningNumber += (dy01 < 0.0 && dy12 >= 0.0 && o > 0.0) ? 1 : 0;
+		turningNumber -= (dy01 >= 0.0 && dy12 < 0.0 && o < 0.0) ? 1 : 0;
+	}
+
+	return turningNumber;
+}
+
+// Returns true if any 2 non-adjacent edges of the polygon intersect or touch. Uses a sweep along the X or Y axis:
+// the edges are sorted by their min coordinate and each edge is tested only against the following edges whose range
+// overlaps with its own.
+static bool hasIntersectingEdges(const Vec2* vtx, uint32_t n, bool sweepY)
+{
+	float edgeMin[kMaxSimplePolygonVertices];
+	float edgeMax[kMaxSimplePolygonVertices];
+	uint64_t sortKeys[kMaxSimplePolygonVertices];
+	uint64_t sortTemp[kMaxSimplePolygonVertices];
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		const float c1 = sweepY ? p1.y : p1.x;
+		const float c2 = sweepY ? p2.y : p2.x;
+		edgeMin[i] = bx::min(c1, c2);
+		edgeMax[i] = bx::max(c1, c2);
+		sortKeys[i] = ((uint64_t)floatSortKey(edgeMin[i]) << 32) | i;
+	}
+
+	const uint64_t* sortedEdges = sortPolygonKeys(sortKeys, sortTemp, n);
+	for (uint32_t i = 0; i < n; ++i) {
+		const uint32_t ea = (uint32_t)sortedEdges[i];
+		const float maxC = edgeMax[ea];
+		const Vec2& a = vtx[ea];
+		const Vec2& b = vtx[ea + 1 == n ? 0 : ea + 1];
+		for (uint32_t j = i + 1; j < n; ++j) {
+			const uint32_t eb = (uint32_t)sortedEdges[j];
+			if (edgeMin[eb] > maxC) {
+				break;
+			}
+
+			const uint32_t d = ea > eb ? ea - eb : eb - ea;
+			if (d == 1 || d == n - 1) {
+				continue; // Adjacent
+			}
+
+			if (segmentsIntersect(a, b, vtx[eb], vtx[eb + 1 == n ? 0 : eb + 1])) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+// Uniform grid over the bounding box of a polygon (see triangulateSimplePolygon()).
+struct PolygonGrid
+{
+	static const uint32_t kMaxSize = 16;
+	static const uint32_t kMaxCells = kMaxSize * kMaxSize;
+
+	Vec2 m_Min;
+	Vec2 m_InvCellSize;
+	uint32_t m_Size; // Number of cells along each axis
+
+	void init(const Vec2& bbMin, const Vec2& bbMax, uint32_t numElements)
+	{
+		// ~2 elements per cell (at least 1 cell)
+		uint32_t size = 1;
+		while (size < kMaxSize && size * size * 2 < numElements) {
+			++size;
+		}
+
+		m_Size = size;
+		m_Min = bbMin;
+		m_InvCellSize.x = bbMax.x > bbMin.x ? (float)size / (bbMax.x - bbMin.x) : 0.0f;
+		m_InvCellSize.y = bbMax.y > bbMin.y ? (float)size / (bbMax.y - bbMin.y) : 0.0f;
+	}
+
+	// NOTE: Monotonic, so the cell range of a bounding box includes the cells of all the points inside it.
+	uint32_t getCell(float v, float vmin, float invCellSize) const
+	{
+		const float c = (v - vmin) * invCellSize;
+		return c <= 0.0f ? 0 : bx::min((uint32_t)c, m_Size - 1);
+	}
+
+	uint32_t getCellID(const Vec2& p) const
+	{
+		return getCell(p.y, m_Min.y, m_InvCellSize.y) * m_Size + getCell(p.x, m_Min.x, m_InvCellSize.x);
+	}
+
+	// Cell range (minX, minY, maxX, maxY) overlapped by bbox (minX, minY, maxX, maxY)
+	void getCellRange(const float* bbox, uint8_t* range) const
+	{
+		range[0] = (uint8_t)getCell(bbox[0], m_Min.x, m_InvCellSize.x);
+		range[1] = (uint8_t)getCell(bbox[1], m_Min.y, m_InvCellSize.y);
+		range[2] = (uint8_t)getCell(bbox[2], m_Min.x, m_InvCellSize.x);
+		range[3] = (uint8_t)getCell(bbox[3], m_Min.y, m_InvCellSize.y);
+	}
+};
+
+// Returns true if the reflex vertex ir is inside or on the ear (ip, ic, in) with the bounding box bbox.
+static inline bool blocksEar(const Vec2* vtx, uint32_t ir, uint32_t ip, uint32_t ic, uint32_t in, const float* bbox)
+{
+	const Vec2& r = vtx[ir];
+	if (ir == ip || ir == ic || ir == in || r.x < bbox[0] || r.y < bbox[1] || r.x > bbox[2] || r.y > bbox[3]) {
+		return false;
+	}
+
+	const Vec2& p = vtx[ip];
+	const Vec2& c = vtx[ic];
+	const Vec2& q = vtx[in];
+	return orient2d(p, c, r) >= 0.0 && orient2d(c, q, r) >= 0.0 && orient2d(q, p, r) >= 0.0;
+}
+
+static uint32_t triangulateSimplePolygon(Stroker* stroker)
+{
+	if (stroker->m_NumContours != 1) {
+		return 0;
+	}
+
+	const uint32_t n = stroker->m_ContourSizes[0];
+	if (n < 3 || n > kMaxSimplePolygonVertices) {
+		return 0;
+	}
+
+	const Vec2* src = stroker->m_ContourVertices;
+
+	// Orientation (and degenerate polygons)
+	double area2 = 0.0;
+	for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
+		area2 += (double)src[j].x * (double)src[i].y - (double)src[i].x * (double)src[j].y;
+	}
+	if (!(bx::abs(area2) > 1e-6) || area2 != area2) {
+		return 0;
+	}
+
+	Vec2* vtx = stroker->m_SimplePolyVertices;
+	if (area2 > 0.0) {
+		bx::memCopy(vtx, src, n * sizeof(Vec2));
+	} else {
+		for (uint32_t i = 0; i < n; ++i) {
+			vtx[i] = src[n - 1 - i];
+		}
+	}
+
+	// Simplicity: adjacent edges must not fold back onto each other, other edges must not intersect or touch
+	// (this also rejects duplicate vertices).
+	bool isReflex[kMaxSimplePolygonVertices]; // Reflex or flat vertices (see ear clipping below)
+	float sumDx = 0.0f;
+	float sumDy = 0.0f;
+	double sumX = 0.0;
+	double sumY = 0.0;
+	Vec2 bbMin = vtx[0];
+	Vec2 bbMax = vtx[0];
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p0 = vtx[i == 0 ? n - 1 : i - 1];
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		if (p0.x == p1.x && p0.y == p1.y) {
+			return 0;
+		}
+		const double o = orient2d(p0, p1, p2);
+		if (o == 0.0 && ((double)p1.x - p0.x) * ((double)p2.x - p1.x) + ((double)p1.y - p0.y) * ((double)p2.y - p1.y) <= 0.0) {
+			return 0;
+		}
+
+		isReflex[i] = !(o > 0.0);
+		sumDx += bx::abs(p2.x - p1.x);
+		sumDy += bx::abs(p2.y - p1.y);
+		sumX += p1.x;
+		sumY += p1.y;
+		bbMin = { bx::min(bbMin.x, p1.x), bx::min(bbMin.y, p1.y) };
+		bbMax = { bx::max(bbMax.x, p1.x), bx::max(bbMax.y, p1.y) };
+	}
+
+	// Star-shaped polygons (e.g. stars, circles, rounded shapes) are simple if they wind exactly once around a point
+	// of their kernel (the average of the vertices is tried). Other polygons are tested with a sweep, unless they
+	// can't be simple because their edge direction doesn't turn around exactly once (Umlaufsatz; cheap).
+	const Vec2 center = { (float)(sumX / n), (float)(sumY / n) };
+	if (!windsOnceAround(vtx, n, center)) {
+		if (calcTurningNumber(vtx, n) != 1
+		||  hasIntersectingEdges(vtx, n, sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x))) {
+			return 0;
+		}
+	}
+
+
+	// Ear clipping. An ear (p, c, q) must be convex (or c on the segment p-q) and no other vertex may be inside
+	// or on the triangle. In a simple polygon it's enough to test the reflex vertices (if there's a vertex inside
+	// the triangle, there's also a reflex one). Flat vertices are tested as well.
+	// The reflex vertices are binned into the grid (a linked list per cell: reflexHead[cell] -> reflexNext[vertex]
+	// -> ... -> UINT16_MAX) so each ear is tested only against the reflex vertices in the cells its bounding box
+	// overlaps. Vertices which become reflex later (only possible due to numerical issues) are added then.
+	uint16_t prev[kMaxSimplePolygonVertices];
+	uint16_t next[kMaxSimplePolygonVertices];
+	uint16_t reflexHead[PolygonGrid::kMaxCells];
+	uint16_t reflexNext[kMaxSimplePolygonVertices];
+	bool isListed[kMaxSimplePolygonVertices];
+	uint32_t numReflex = 0; // Reflex vertices of the remaining polygon
+	for (uint32_t i = 0; i < n; ++i) {
+		numReflex += isReflex[i] ? 1 : 0;
+	}
+
+	PolygonGrid grid;
+	grid.init(bbMin, bbMax, n);
+	bx::memSet(reflexHead, 0xff, sizeof(uint16_t) * grid.m_Size * grid.m_Size);
+	for (uint32_t i = 0; i < n; ++i) {
+		prev[i] = (uint16_t)(i == 0 ? n - 1 : i - 1);
+		next[i] = (uint16_t)(i + 1 == n ? 0 : i + 1);
+		isListed[i] = isReflex[i];
+		if (isReflex[i]) {
+			const uint32_t cell = grid.getCellID(vtx[i]);
+			reflexNext[i] = reflexHead[cell];
+			reflexHead[cell] = (uint16_t)i;
+		}
+	}
+
+	// Bail out (and let libtess2 handle the polygon) if ear clipping takes too long.
+	int32_t budget = (int32_t)(n * 64 + 256);
+
+	uint16_t* tri = stroker->m_SimplePolyTriangles;
+	uint32_t numRemaining = n;
+	uint32_t c = 0;
+	uint32_t numTested = 0;
+	while (numRemaining > 3) {
+		if (numTested == numRemaining || budget < 0) {
+			return 0; // No ear found (numerical problems) or too slow
+		}
+		--budget;
+
+		const uint32_t ip = prev[c];
+		const uint32_t in = next[c];
+		const Vec2& pp = vtx[ip];
+		const Vec2& pc = vtx[c];
+		const Vec2& pq = vtx[in];
+		const double o = orient2d(pp, pc, pq);
+		bool isEar = o > 0.0 || (o == 0.0 && ((double)pc.x - pp.x) * ((double)pq.x - pc.x) + ((double)pc.y - pp.y) * ((double)pq.y - pc.y) > 0.0);
+		if (isEar && numReflex != 0) {
+			const float bbox[4] = {
+				bx::min(pp.x, bx::min(pc.x, pq.x)),
+				bx::min(pp.y, bx::min(pc.y, pq.y)),
+				bx::max(pp.x, bx::max(pc.x, pq.x)),
+				bx::max(pp.y, bx::max(pc.y, pq.y))
+			};
+			uint8_t cellRange[4];
+			grid.getCellRange(bbox, cellRange);
+			for (uint32_t cy = cellRange[1]; cy <= cellRange[3] && isEar; ++cy) {
+				for (uint32_t cx = cellRange[0]; cx <= cellRange[2] && isEar; ++cx) {
+					--budget;
+					uint16_t* link = &reflexHead[cy * grid.m_Size + cx];
+					while (*link != UINT16_MAX && isEar) {
+						--budget;
+						const uint32_t ir = *link;
+						if (!isReflex[ir]) {
+							// Clipped or not reflex anymore: remove it from the grid
+							*link = reflexNext[ir];
+							isListed[ir] = false;
+							continue;
+						}
+
+						isEar = !blocksEar(vtx, ir, ip, c, in, bbox);
+						link = &reflexNext[ir];
+					}
+				}
+			}
+		}
+
+		if (!isEar) {
+			c = in;
+			++numTested;
+			continue;
+		}
+
+		tri[0] = (uint16_t)ip;
+		tri[1] = (uint16_t)c;
+		tri[2] = (uint16_t)in;
+		tri += 3;
+
+		next[ip] = (uint16_t)in;
+		prev[in] = (uint16_t)ip;
+		numReflex -= isReflex[c] ? 1 : 0;
+		isReflex[c] = false;
+		--numRemaining;
+
+		// The neighbors' angles changed.
+		const uint32_t neighbors[2] = { ip, in };
+		for (uint32_t k = 0; k < 2; ++k) {
+			const uint32_t iv = neighbors[k];
+			const bool wasReflex = isReflex[iv];
+			isReflex[iv] = !(orient2d(vtx[prev[iv]], vtx[iv], vtx[next[iv]]) > 0.0);
+			numReflex = numReflex + (isReflex[iv] ? 1 : 0) - (wasReflex ? 1 : 0);
+			if (isReflex[iv] && !isListed[iv]) {
+				const uint32_t cell = grid.getCellID(vtx[iv]);
+				reflexNext[iv] = reflexHead[cell];
+				reflexHead[cell] = (uint16_t)iv;
+				isListed[iv] = true;
+			}
+		}
+
+		c = in;
+		numTested = 0;
+	}
+
+	tri[0] = prev[c];
+	tri[1] = (uint16_t)c;
+	tri[2] = next[c];
+
+	// Boundary: vertices 0..n-1, a single contour (first = 0, count = n)
+	uint16_t* boundary = stroker->m_SimplePolyBoundary;
+	for (uint32_t i = 0; i < n; ++i) {
+		boundary[i] = (uint16_t)i;
+	}
+	boundary[n + 0] = 0;
+	boundary[n + 1] = (uint16_t)n;
+
+	return n;
+}
+
 bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule)
 {
 	const int windingRule = fillRule == vg::FillRule::NonZero ? TESS_WINDING_NONZERO : TESS_WINDING_ODD;
@@ -1363,6 +1942,18 @@ bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule
 	// in XY space (previously the winding depended on the input). NonZero and EvenOdd are symmetric wrt the
 	// sign of the winding number, so the filled region is the same either way (the sweep direction might
 	// differ, so the exact triangulation can differ on degenerate input).
+	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker);
+	if (numSimplePolyVertices != 0) {
+		mesh->m_PosBuffer = &stroker->m_SimplePolyVertices[0].x;
+		mesh->m_ColorBuffer = nullptr;
+		mesh->m_IndexBuffer = stroker->m_SimplePolyTriangles;
+		mesh->m_NumVertices = numSimplePolyVertices;
+		mesh->m_NumIndices = (numSimplePolyVertices - 2) * 3;
+		return true;
+	}
+
+	addContoursToTesselator(stroker);
+
 	const float normal[3] = { 0.0f, 0.0f, 1.0f };
 	if (!tessTesselate(stroker->m_Tesselator, windingRule, TESS_POLYGONS, 3, 2, &normal[0])) {
 		return false;
@@ -1455,6 +2046,7 @@ struct EdgeHash
 	uint32_t* m_Keys;   // (a << 16) | b, UINT32_MAX for empty slots
 	uint32_t* m_Values; // Offset of the triangle's first index
 	uint32_t m_Mask;
+	uint32_t m_Shift;   // 32 - log2(capacity)
 };
 
 static inline uint32_t edgeKey(uint16_t a, uint16_t b)
@@ -1464,7 +2056,9 @@ static inline uint32_t edgeKey(uint16_t a, uint16_t b)
 
 static inline uint32_t* edgeHashSlot(EdgeHash* hash, uint32_t key)
 {
-	uint32_t slot = (key * 2654435761u) & hash->m_Mask;
+	// Fibonacci hashing: the high bits of the product depend on all the bits of the key (the low bits only on
+	// the low bits of the key, i.e. of the edge's 2nd vertex).
+	uint32_t slot = (key * 2654435761u) >> hash->m_Shift;
 	while (hash->m_Keys[slot] != key && hash->m_Keys[slot] != UINT32_MAX) {
 		slot = (slot + 1) & hash->m_Mask;
 	}
@@ -1544,7 +2138,7 @@ static uint32_t findNeighbor(const uint16_t* tris, EdgeHash* hash, uint16_t a, u
 
 static const uint32_t kMaxCavityTris = 32;
 
-// Retriangulates a cavity (the triangle 'tri' and up to 2 rings of its neighbors, at most kMaxCavityTris triangles)
+// Retriangulates a cavity (the triangle 'tri' and 2 rings of its neighbors, at most kMaxCavityTris triangles)
 // so that all its triangles are CCW. The cavity must be a topological disk; its boundary cycle is retriangulated by
 // ear clipping (only CCW ears, not containing other boundary vertices). Any triangulation of the boundary cycle has
 // the same signed coverage as the original triangles (as with edge flips). Cavity vertices which aren't on its
@@ -1580,6 +2174,12 @@ static bool retriangulateCavity(const Vec2* pos, uint16_t* tris, EdgeHash* hash,
 		ringStart = ringEnd;
 		if (numCavityTris == ringEnd) {
 			return false; // No new neighbors
+		}
+
+		// The triangle and its direct neighbors can't be retriangulated any better than by edge flips, so only try
+		// after adding the second ring.
+		if (ring == 0) {
+			continue;
 		}
 
 		// Boundary edges: edges of the cavity triangles whose twin isn't in the cavity.
@@ -1732,8 +2332,10 @@ static bool fixFlippedTriangles(Stroker* stroker, const Vec2* pos, uint16_t* tri
 
 	// Build the edge hash table (load factor <= 0.5)
 	uint32_t capacity = 16;
+	uint32_t capacityBits = 4;
 	while (capacity < numIndices * 2) {
 		capacity <<= 1;
+		++capacityBits;
 	}
 
 	if (capacity > stroker->m_EdgeHashCapacity) {
@@ -1748,6 +2350,7 @@ static bool fixFlippedTriangles(Stroker* stroker, const Vec2* pos, uint16_t* tri
 	hash.m_Keys = stroker->m_EdgeHash;
 	hash.m_Values = stroker->m_EdgeHash + capacity;
 	hash.m_Mask = capacity - 1;
+	hash.m_Shift = 32 - capacityBits;
 	bx::memSet(hash.m_Keys, 0xFF, sizeof(uint32_t) * capacity);
 	for (uint32_t t = 0; t < numIndices; t += 3) {
 		edgeHashSet(&hash, tris[t + 0], tris[t + 1], t);
@@ -1837,10 +2440,10 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 	const uint32_t numOccurrences = numFringeVertices / 2;
 	const uint32_t numTris = numIndices / 3;
 
-	// Scratch memory: scale (float) and first incident triangle (uint32) per occurrence, incident triangles
-	// (numIndices), worklist (numTris), in-worklist flags (numTris), angle sum per vertex (float, numVertices),
-	// original fringe vertices of each occurrence (2 Vec2, restored exactly on failure).
-	const uint32_t numScratch = numOccurrences * 2 + 1 + numIndices + numTris * 2 + numVertices + numOccurrences * 4;
+	// Scratch memory: scale (float), original fringe vertices (2 Vec2, restored exactly on failure) and changed
+	// occurrences list per occurrence; first incident triangle and a mark per vertex; incident triangles (numIndices);
+	// worklist and in-worklist flags per triangle.
+	const uint32_t numScratch = numOccurrences * 6 + numVertices * 2 + 1 + numIndices + numTris * 2;
 	if (numScratch > stroker->m_ClampScratchCapacity) {
 		if (stroker->m_ClampScratch) {
 			bx::alignedFree(stroker->m_Allocator, stroker->m_ClampScratch, 16);
@@ -1850,34 +2453,32 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 	}
 
 	float* scale = (float*)stroker->m_ClampScratch;
-	uint32_t* first = stroker->m_ClampScratch + numOccurrences;
-	uint32_t* incident = first + numOccurrences + 1;
+	Vec2* original = (Vec2*)(scale + numOccurrences);
+	uint32_t* changedList = (uint32_t*)(original + numOccurrences * 2);
+	uint32_t* first = changedList + numOccurrences;
+	uint32_t* mark = first + numVertices + 1;
+	uint32_t* incident = mark + numVertices;
 	uint32_t* worklist = incident + numIndices;
 	uint32_t* inWorklist = worklist + numTris;
-	float* angleSum = (float*)(inWorklist + numTris);
-	Vec2* original = (Vec2*)(angleSum + numVertices);
 
-	// Incident triangles of each occurrence (only inner fringe vertices move).
-	bx::memSet(first, 0, sizeof(uint32_t) * (numOccurrences + 1));
+	// Incident triangles of each vertex.
+	bx::memSet(first, 0, sizeof(uint32_t) * (numVertices + 1));
 	for (uint32_t i = 0; i < numIndices; ++i) {
-		if (tris[i] < numFringeVertices) {
-			++first[(tris[i] >> 1) + 1];
-		}
+		++first[tris[i] + 1];
 	}
-	for (uint32_t k = 0; k < numOccurrences; ++k) {
-		first[k + 1] += first[k];
+	for (uint32_t v = 0; v < numVertices; ++v) {
+		first[v + 1] += first[v];
 	}
 	for (uint32_t i = 0; i < numIndices; ++i) {
-		if (tris[i] < numFringeVertices) {
-			incident[first[tris[i] >> 1]++] = i / 3;
-		}
+		incident[first[tris[i]]++] = i / 3;
 	}
-	for (uint32_t k = numOccurrences; k > 0; --k) {
-		first[k] = first[k - 1];
+	for (uint32_t v = numVertices; v > 0; --v) {
+		first[v] = first[v - 1];
 	}
 	first[0] = 0;
 
 	uint32_t numWork = 0;
+	uint32_t numChanged = 0;
 	for (uint32_t k = 0; k < numOccurrences; ++k) {
 		scale[k] = 1.0f;
 	}
@@ -1900,11 +2501,12 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 
 		bool changed = false;
 		for (uint32_t j = 0; j < 3; ++j) {
-			if (tri[j] >= numFringeVertices) {
+			const uint32_t id = tri[j];
+			if (id >= numFringeVertices) {
 				continue; // Interior vertex
 			}
 
-			const uint32_t k = tri[j] >> 1;
+			const uint32_t k = id >> 1;
 			const float s = scale[k];
 			if (s == 0.0f) {
 				continue;
@@ -1913,6 +2515,7 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 			if (s == 1.0f) {
 				original[k * 2 + 0] = pos[k * 2 + 0];
 				original[k * 2 + 1] = pos[k * 2 + 1];
+				changedList[numChanged++] = k;
 			}
 
 			// inner = p + s * v, outer = inner - 2 * v (v is the inset vector, i.e. half the fringe).
@@ -1921,7 +2524,7 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 			scale[k] = newScale;
 			changed = true;
 
-			for (uint32_t n = first[k]; n < first[k + 1]; ++n) {
+			for (uint32_t n = first[id]; n < first[id + 1]; ++n) {
 				const uint32_t u = incident[n];
 				if (!inWorklist[u]) {
 					inWorklist[u] = 1;
@@ -1935,33 +2538,43 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 		}
 	}
 
-	// Check for folds (see above).
+	// Check for folds (see above). Only the triangles of the moved vertices changed, so only the vertices of those
+	// triangles have to be checked.
 	bool valid = numWork == 0;
 	if (valid) {
-		bx::memSet(angleSum, 0, sizeof(float) * numVertices);
-		for (uint32_t i = 0; i < numIndices; i += 3) {
-			for (uint32_t j = 0; j < 3; ++j) {
-				const Vec2 a = pos[tris[i + j]];
-				const Vec2 b = pos[tris[i + (j + 1) % 3]];
-				const Vec2 c = pos[tris[i + (j + 2) % 3]];
-				const Vec2 ab = vec2Sub(b, a);
-				const Vec2 ac = vec2Sub(c, a);
-				angleSum[tris[i + j]] += bx::atan2(ab.x * ac.y - ab.y * ac.x, ab.x * ac.x + ab.y * ac.y);
-			}
-		}
+		bx::memSet(mark, 0, sizeof(uint32_t) * numVertices);
+		for (uint32_t c = 0; c < numChanged && valid; ++c) {
+			const uint32_t movedID = changedList[c] * 2;
+			for (uint32_t n = first[movedID]; n < first[movedID + 1] && valid; ++n) {
+				const uint16_t* tri = &tris[incident[n] * 3];
+				for (uint32_t j = 0; j < 3 && valid; ++j) {
+					const uint32_t id = tri[j];
+					if (mark[id]) {
+						continue;
+					}
+					mark[id] = 1;
 
-		for (uint32_t i = 0; i < numVertices && valid; ++i) {
-			valid = angleSum[i] < bx::kPi2 + 1e-3f;
+					float angleSum = 0.0f;
+					for (uint32_t m = first[id]; m < first[id + 1]; ++m) {
+						const uint16_t* t = &tris[incident[m] * 3];
+						const uint32_t corner = t[0] == id ? 0 : (t[1] == id ? 1 : 2);
+						const Vec2 a = pos[id];
+						const Vec2 ab = vec2Sub(pos[t[(corner + 1) % 3]], a);
+						const Vec2 ac = vec2Sub(pos[t[(corner + 2) % 3]], a);
+						angleSum += bx::atan2(ab.x * ac.y - ab.y * ac.x, ab.x * ac.x + ab.y * ac.y);
+					}
+					valid = angleSum < bx::kPi2 + 1e-3f;
+				}
+			}
 		}
 	}
 
 	if (!valid) {
 		// Restore the original inset.
-		for (uint32_t k = 0; k < numOccurrences; ++k) {
-			if (scale[k] != 1.0f) {
-				pos[k * 2 + 0] = original[k * 2 + 0];
-				pos[k * 2 + 1] = original[k * 2 + 1];
-			}
+		for (uint32_t c = 0; c < numChanged; ++c) {
+			const uint32_t k = changedList[c];
+			pos[k * 2 + 0] = original[k * 2 + 0];
+			pos[k * 2 + 1] = original[k * 2 + 1];
 		}
 	}
 
@@ -1973,6 +2586,7 @@ static bool clampInset(Stroker* stroker, Vec2* pos, const uint16_t* tris, uint32
 // buffers. NOTE: Invalidates the current output of the tesselator.
 static bool tesselateInsetContours(Stroker* stroker, const TESSindex* contours, uint32_t numContours, uint32_t numFringeVertices, uint32_t numFringeIndices, int windingRule, Color color)
 {
+	resetTesselator(stroker);
 	TESStesselator* tess = stroker->m_Tesselator;
 	for (uint32_t iContour = 0; iContour < numContours; ++iContour) {
 		const uint32_t first = contours[iContour * 2 + 0];
@@ -2034,13 +2648,8 @@ static void setMeshFromStrokerBuffers(Stroker* stroker, Mesh* mesh)
 static bool concaveFillEndAATwoSweeps(Stroker* stroker, Mesh* mesh, uint32_t color, int windingRule)
 {
 	// The tesselator's mesh has been consumed. Tesselate the contours again.
-	resetTesselator(stroker);
+	addContoursToTesselator(stroker);
 	TESStesselator* tess = stroker->m_Tesselator;
-	const Vec2* contourVertices = stroker->m_ContourVertices;
-	for (uint32_t i = 0; i < stroker->m_NumContours; ++i) {
-		tessAddContour(tess, 2, contourVertices, sizeof(Vec2), (int)stroker->m_ContourSizes[i]);
-		contourVertices += stroker->m_ContourSizes[i];
-	}
 
 	const float normal[3] = { 0.0f, 0.0f, 1.0f };
 	if (!tessTesselate(tess, windingRule, TESS_BOUNDARY_CONTOURS, 1, 2, &normal[0])) {
@@ -2078,27 +2687,51 @@ bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillR
 	// around the boundary contours ([-fringeWidth/2, +fringeWidth/2] around each contour) and the interior
 	// triangles use the inner fringe vertices instead of the boundary vertices, i.e. the interior is inset by
 	// half the fringe width (the same area the tesselation of the inset boundary contours covers).
-	const float normal[3] = { 0.0f, 0.0f, 1.0f };
-	TESStesselator* tess = stroker->m_Tesselator;
-	if (!tessTesselate(tess, windingRule, TESS_POLYGONS_AND_BOUNDARY, 3, 2, &normal[0])) {
-		// Triangulating the interior requires more memory than extracting the boundary contours. Try the 2 sweep
-		// version.
-		return concaveFillEndAATwoSweeps(stroker, mesh, color, windingRule);
-	}
+	// Simple polygons are triangulated by ear clipping (see triangulateSimplePolygon()); the result has the same
+	// form as the tesselator's output: the boundary contour is the polygon itself and each triangle corner is a
+	// boundary vertex (corner = vertex ID).
+	uint32_t numContours, numTessVertices, numTriangleIndices, numBoundaryVertices;
+	const Vec2* tessVertices;
+	const TESSindex* triangles;
+	const TESSindex* corners;
+	const TESSindex* contours;
+	const TESSindex* boundaryVertices;
+	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker);
+	if (numSimplePolyVertices != 0) {
+		numContours = 1;
+		tessVertices = stroker->m_SimplePolyVertices;
+		numTessVertices = numSimplePolyVertices;
+		triangles = stroker->m_SimplePolyTriangles;
+		numTriangleIndices = (numSimplePolyVertices - 2) * 3;
+		corners = stroker->m_SimplePolyTriangles;
+		boundaryVertices = stroker->m_SimplePolyBoundary;
+		contours = &stroker->m_SimplePolyBoundary[numSimplePolyVertices];
+		numBoundaryVertices = numSimplePolyVertices;
+	} else {
+		addContoursToTesselator(stroker);
 
-	const uint32_t numContours = (uint32_t)tessGetBoundaryContourCount(tess);
-	if (numContours == 0) {
-		return false;
-	}
+		const float normal[3] = { 0.0f, 0.0f, 1.0f };
+		TESStesselator* tess = stroker->m_Tesselator;
+		if (!tessTesselate(tess, windingRule, TESS_POLYGONS_AND_BOUNDARY, 3, 2, &normal[0])) {
+			// Triangulating the interior requires more memory than extracting the boundary contours. Try the 2
+			// sweep version.
+			return concaveFillEndAATwoSweeps(stroker, mesh, color, windingRule);
+		}
 
-	const Vec2* tessVertices = (const Vec2*)tessGetVertices(tess);
-	const uint32_t numTessVertices = (uint32_t)tessGetVertexCount(tess);
-	const TESSindex* triangles = tessGetElements(tess);
-	const uint32_t numTriangleIndices = (uint32_t)tessGetElementCount(tess) * 3;
-	const TESSindex* corners = tessGetElementCorners(tess);
-	const TESSindex* contours = tessGetBoundaryContours(tess);
-	const TESSindex* boundaryVertices = tessGetBoundaryVertices(tess);
-	const uint32_t numBoundaryVertices = (uint32_t)tessGetBoundaryVertexCount(tess);
+		numContours = (uint32_t)tessGetBoundaryContourCount(tess);
+		if (numContours == 0) {
+			return false;
+		}
+
+		tessVertices = (const Vec2*)tessGetVertices(tess);
+		numTessVertices = (uint32_t)tessGetVertexCount(tess);
+		triangles = tessGetElements(tess);
+		numTriangleIndices = (uint32_t)tessGetElementCount(tess) * 3;
+		corners = tessGetElementCorners(tess);
+		contours = tessGetBoundaryContours(tess);
+		boundaryVertices = tessGetBoundaryVertices(tess);
+		numBoundaryVertices = (uint32_t)tessGetBoundaryVertexCount(tess);
+	}
 
 	// Output vertices: 2 fringe vertices (inner, outer) for each boundary vertex occurrence (in contour order),
 	// followed by the interior vertices (tesselator vertices which aren't on the boundary).
@@ -2202,7 +2835,8 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 	// Precalculate all segment directions and join extrusion vectors.
 	const Vec2* segmentDirs;
 	const Vec2* extrusionVecs;
-	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, &segmentDirs, &extrusionVecs);
+	const uint8_t* innerBevelFlags;
+	const uint32_t numInnerBevelJoins = calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, hsw, &segmentDirs, &extrusionVecs, &innerBevelFlags);
 
 	const uint32_t firstSegmentID = _Closed ? 0 : 1;
 	const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
@@ -2229,6 +2863,13 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 	} else {
 		numVertices = numJoins * 2 + totalArcPoints;
 		numIndices = numJoins * 6 + totalArcPoints * 3;
+	}
+
+	// Inner bevel joins: miter +1 vertex, bevel/round +2 vertices, +3 indices (see needsInnerBevel()).
+	{
+		const uint32_t numFanJoins = countInnerBevelFanJoins(innerBevelFlags, numInnerBevelJoins, firstSegmentID, numSegments, _LineJoin, roundJoinArcs);
+		numVertices += numInnerBevelJoins + numFanJoins;
+		numIndices += numInnerBevelJoins * 3;
 	}
 
 	if (!_Closed) {
@@ -2312,11 +2953,80 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 
 		// Check which one of the points is the inner corner.
 		float leftPointProjDist = d12.x * v_hsw.x + d12.y * v_hsw.y;
+		if (innerBevelFlags[iSegment]) {
+			// Inner bevel: [X0, X1] (inner corners of the 2 segments), then the outer side: [miter point] or
+			// [join point, arc/bevel points...]. X0-M-X1 (miter) or the fan around the join point and X0-P-X1 cover
+			// the join.
+			const bool leftInner = leftPointProjDist >= 0.0f;
+			const float innerHsw = leftInner ? hsw : -hsw;
+			const Vec2 l01 = vec2PerpCCW(d01);
+			const Vec2 l12 = vec2PerpCCW(d12);
+			const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
+			const uint16_t x0 = firstVertexID;
+			const uint16_t x1 = (uint16_t)(firstVertexID + 1);
+			dstPos[0] = vec2Add(p1, vec2Scale(l01, innerHsw));
+			dstPos[1] = vec2Add(p1, vec2Scale(l12, innerHsw));
+			dstPos += 2;
+
+			uint16_t outerFirst, outerLast;
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
+				*dstPos++ = leftInner ? vec2Sub(p1, v_hsw) : vec2Add(p1, v_hsw);
+				outerFirst = outerLast = (uint16_t)(firstVertexID + 2);
+
+				const uint16_t id[3] = { x0, outerFirst, x1 };
+				dstIndex = copyIndices<3>(dstIndex, id);
+			} else {
+				Vec2 arcDir = { 0.0f, 0.0f };
+				float cosArcDa = 1.0f, sinArcDa = 0.0f;
+				uint32_t numArcPoints = 1;
+				if (_LineJoin == LineJoin::Round) {
+					const RoundJoinArc& arc = roundJoinArcs[iSegment];
+					arcDir = arc.m_ArcDir;
+					cosArcDa = arc.m_CosDa;
+					sinArcDa = arc.m_SinDa;
+					numArcPoints = arc.m_NumArcPoints;
+				}
+
+				const uint16_t center = (uint16_t)(firstVertexID + 2);
+				*dstPos++ = p1;
+				*dstPos++ = vec2Sub(p1, vec2Scale(l01, innerHsw));
+				for (uint32_t iArcPoint = 1; iArcPoint < numArcPoints; ++iArcPoint) {
+					arcDir = vec2Rotate(arcDir, cosArcDa, sinArcDa);
+					*dstPos++ = { p1.x + hsw * arcDir.x, p1.y + hsw * arcDir.y };
+				}
+				*dstPos++ = vec2Sub(p1, vec2Scale(l12, innerHsw));
+				outerFirst = (uint16_t)(firstVertexID + 3);
+				outerLast = (uint16_t)(outerFirst + numArcPoints);
+
+				for (uint32_t iArcPoint = 0; iArcPoint < numArcPoints; ++iArcPoint) {
+					const uint16_t id[3] = { center, (uint16_t)(outerFirst + iArcPoint), (uint16_t)(outerFirst + iArcPoint + 1) };
+					dstIndex = copyIndices<3>(dstIndex, id);
+				}
+
+				const uint16_t id[3] = { center, x0, x1 };
+				dstIndex = copyIndices<3>(dstIndex, id);
+			}
+
+			const uint16_t tL = leftInner ? x0 : outerFirst;
+			const uint16_t tR = leftInner ? outerFirst : x0;
+			if (prevSegmentLeftID != 0xFFFF) {
+				dstIndex = connectJoin2(dstIndex, prevSegmentLeftID, prevSegmentRightID, tL, tR);
+			} else {
+				firstSegmentLeftID = tL;
+				firstSegmentRightID = tR;
+			}
+
+			prevSegmentLeftID = leftInner ? x1 : outerLast;
+			prevSegmentRightID = leftInner ? outerLast : x1;
+			d01 = d12;
+			continue;
+		}
+
 		if (leftPointProjDist >= 0.0f) {
 			// The left point is the inner corner.
 			const Vec2 innerCorner = vec2Add(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
@@ -2403,7 +3113,7 @@ void polylineStroke(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t numP
 			// The right point is the inner corner.
 			const Vec2 innerCorner = vec2Sub(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[2] = {
@@ -2576,7 +3286,8 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 	// Precalculate all segment directions and join extrusion vectors.
 	const Vec2* segmentDirs;
 	const Vec2* extrusionVecs;
-	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, &segmentDirs, &extrusionVecs);
+	const uint8_t* innerBevelFlags;
+	const uint32_t numInnerBevelJoins = calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, _Closed, hsw_aa, &segmentDirs, &extrusionVecs, &innerBevelFlags);
 
 	const uint32_t firstSegmentID = _Closed ? 0 : 1;
 	const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
@@ -2606,6 +3317,13 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 	} else {
 		numVertices = numJoins * 4 + totalArcPoints * 2;
 		numIndices = numJoins * 18 + totalArcPoints * 9;
+	}
+
+	// Inner bevel joins: miter +2 vertices, bevel/round +3 vertices, +9 indices (see needsInnerBevel()).
+	{
+		const uint32_t numFanJoins = countInnerBevelFanJoins(innerBevelFlags, numInnerBevelJoins, firstSegmentID, numSegments, _LineJoin, roundJoinArcs);
+		numVertices += numInnerBevelJoins * 2 + numFanJoins;
+		numIndices += numInnerBevelJoins * 9;
 	}
 
 	if (!_Closed) {
@@ -2729,13 +3447,123 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 
 		// Check which one of the points is the inner corner.
 		float leftPointAAProjDist = d12.x * v_hsw_aa.x + d12.y * v_hsw_aa.y;
+		if (innerBevelFlags[iSegment]) {
+			// Inner bevel (see polylineStroke()): [X0aa, X0, X1, X1aa], then the outer side: [M, Maa] or
+			// [join point, (arc/bevel point, AA point)...]. The inner fringe is a quad over X0-X1.
+			const bool leftInner = leftPointAAProjDist >= 0.0f;
+			const float innerSign = leftInner ? 1.0f : -1.0f;
+			const Vec2 nI01 = vec2Scale(vec2PerpCCW(d01), innerSign);
+			const Vec2 nI12 = vec2Scale(vec2PerpCCW(d12), innerSign);
+			const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
+			const uint16_t x0aa = firstVertexID;
+			const uint16_t x0 = (uint16_t)(firstVertexID + 1);
+			const uint16_t x1 = (uint16_t)(firstVertexID + 2);
+			const uint16_t x1aa = (uint16_t)(firstVertexID + 3);
+			dstPos[0] = vec2Add(p1, vec2Scale(nI01, hsw_aa));
+			dstPos[1] = vec2Add(p1, vec2Scale(nI01, hsw));
+			dstPos[2] = vec2Add(p1, vec2Scale(nI12, hsw));
+			dstPos[3] = vec2Add(p1, vec2Scale(nI12, hsw_aa));
+			dstPos += 4;
+			dstColor = copyColor<4>(dstColor, &c0_c_c_c0[0]);
+
+			uint16_t outerFirst, outerLast;
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
+				const Vec2 v_hsw = vec2Scale(v, hsw);
+				dstPos[0] = vec2Sub(p1, vec2Scale(v_hsw, innerSign));
+				dstPos[1] = vec2Sub(p1, vec2Scale(v_hsw_aa, innerSign));
+				dstPos += 2;
+				dstColor = copyColor<2>(dstColor, &c0_c_c_c0[2]);
+				outerFirst = outerLast = (uint16_t)(firstVertexID + 4);
+
+				const uint16_t id[3] = { x0, outerFirst, x1 };
+				dstIndex = copyIndices<3>(dstIndex, id);
+			} else {
+				Vec2 arcDir = { 0.0f, 0.0f };
+				float cosArcDa = 1.0f, sinArcDa = 0.0f;
+				uint32_t numArcPoints = 1;
+				if (_LineJoin == LineJoin::Round) {
+					const RoundJoinArc& arc = roundJoinArcs[iSegment];
+					arcDir = arc.m_ArcDir;
+					cosArcDa = arc.m_CosDa;
+					sinArcDa = arc.m_SinDa;
+					numArcPoints = arc.m_NumArcPoints;
+				}
+
+				const uint16_t center = (uint16_t)(firstVertexID + 4);
+				*dstPos++ = p1;
+				*dstColor++ = color;
+
+				const Vec2 nO01 = vec2Scale(nI01, -1.0f);
+				const Vec2 nO12 = vec2Scale(nI12, -1.0f);
+				const float bevelOffset = _LineJoin == LineJoin::Bevel ? bx::abs(vec2Dot(nO01, nO12)) * stroker->m_FringeWidth : 0.0f;
+				dstPos[0] = vec2Sub(vec2Add(p1, vec2Scale(nO01, hsw)), vec2Scale(d01, bevelOffset));
+				dstPos[1] = vec2Add(p1, vec2Scale(nO01, hsw_aa));
+				dstPos += 2;
+				dstColor = copyColor<2>(dstColor, &c0_c_c_c0[2]);
+				for (uint32_t iArcPoint = 1; iArcPoint < numArcPoints; ++iArcPoint) {
+					arcDir = vec2Rotate(arcDir, cosArcDa, sinArcDa);
+					dstPos[0] = vec2Add(p1, vec2Scale(arcDir, hsw));
+					dstPos[1] = vec2Add(p1, vec2Scale(arcDir, hsw_aa));
+					dstPos += 2;
+					dstColor = copyColor<2>(dstColor, &c0_c_c_c0[2]);
+				}
+				dstPos[0] = vec2Add(vec2Add(p1, vec2Scale(nO12, hsw)), vec2Scale(d12, bevelOffset));
+				dstPos[1] = vec2Add(p1, vec2Scale(nO12, hsw_aa));
+				dstPos += 2;
+				dstColor = copyColor<2>(dstColor, &c0_c_c_c0[2]);
+				outerFirst = (uint16_t)(firstVertexID + 5);
+				outerLast = (uint16_t)(outerFirst + numArcPoints * 2);
+
+				uint16_t arcID = outerFirst;
+				for (uint32_t iArcPoint = 0; iArcPoint < numArcPoints; ++iArcPoint) {
+					const uint16_t id[9] = {
+						center, arcID, (uint16_t)(arcID + 2),
+						arcID, (uint16_t)(arcID + 1), (uint16_t)(arcID + 3),
+						arcID, (uint16_t)(arcID + 3), (uint16_t)(arcID + 2)
+					};
+					dstIndex = copyIndices<9>(dstIndex, id);
+					arcID += 2;
+				}
+
+				const uint16_t id[3] = { center, x0, x1 };
+				dstIndex = copyIndices<3>(dstIndex, id);
+			}
+
+			{
+				const uint16_t id[6] = { x0aa, x0, x1, x0aa, x1, x1aa };
+				dstIndex = copyIndices<6>(dstIndex, id);
+			}
+
+			// Outer IDs: solid vertex, AA vertex = solid vertex + 1
+			const uint16_t tLA = leftInner ? x0aa : (uint16_t)(outerFirst + 1);
+			const uint16_t tL = leftInner ? x0 : outerFirst;
+			const uint16_t tR = leftInner ? outerFirst : x0;
+			const uint16_t tRA = leftInner ? (uint16_t)(outerFirst + 1) : x0aa;
+			if (prevSegmentLeftAAID != 0xFFFF) {
+				dstIndex = connectJoin4(dstIndex, prevSegmentLeftAAID, prevSegmentLeftID, prevSegmentRightID, prevSegmentRightAAID, tLA, tL, tR, tRA);
+			} else {
+				VG_CHECK(_Closed, "Invalid previous segment");
+				firstSegmentLeftAAID = tLA;
+				firstSegmentLeftID = tL;
+				firstSegmentRightID = tR;
+				firstSegmentRightAAID = tRA;
+			}
+
+			prevSegmentLeftAAID = leftInner ? x1aa : (uint16_t)(outerLast + 1);
+			prevSegmentLeftID = leftInner ? x1 : outerLast;
+			prevSegmentRightID = leftInner ? outerLast : x1;
+			prevSegmentRightAAID = leftInner ? (uint16_t)(outerLast + 1) : x1aa;
+			d01 = d12;
+			continue;
+		}
+
 		if (leftPointAAProjDist >= 0.0f) {
 			// The left point is the inner corner.
 			const Vec2 v_hsw = vec2Scale(v, hsw);
 			const Vec2 innerCornerAA = vec2Add(p1, v_hsw_aa);
 			const Vec2 innerCorner = vec2Add(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[4] = {
@@ -2888,7 +3716,7 @@ void polylineStrokeAA(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_t nu
 			const Vec2 innerCornerAA = vec2Sub(p1, v_hsw_aa);
 			const Vec2 innerCorner = vec2Sub(p1, v_hsw);
 
-			if (_LineJoin == LineJoin::Miter) {
+			if (_LineJoin == LineJoin::Miter || (_LineJoin == LineJoin::Round && roundJoinArcs[iSegment].m_NumArcPoints == 0)) {
 				const uint16_t firstFanVertexID = (uint16_t)(dstPos - posStart);
 
 				Vec2 p[4] = {
@@ -3151,7 +3979,8 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 	// Precalculate all segment directions and join extrusion vectors.
 	const Vec2* segmentDirs;
 	const Vec2* extrusionVecs;
-	calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, closed, &segmentDirs, &extrusionVecs);
+	const uint8_t* innerBevelFlags;
+	const uint32_t numInnerBevelJoins = calcSegmentDirsAndExtrusions(stroker, vtx, numPathVertices, closed, hsw_aa, &segmentDirs, &extrusionVecs, &innerBevelFlags);
 
 	const uint32_t firstSegmentID = closed ? 0 : 1;
 
@@ -3164,6 +3993,10 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 		const uint32_t numJoins = numSegments > firstSegmentID ? numSegments - firstSegmentID : 0;
 		numVertices = numJoins * (_LineJoin == LineJoin::Miter ? 3 : 4);
 		numIndices = numJoins * (_LineJoin == LineJoin::Miter ? 12 : 15);
+
+		// Inner bevel joins: +1 vertex, +3 indices (see needsInnerBevel()).
+		numVertices += numInnerBevelJoins;
+		numIndices += numInnerBevelJoins * 3;
 		if (!closed) {
 			numVertices += 6;
 			numIndices += 12;
@@ -3232,6 +4065,62 @@ void polylineStrokeAAThin(Stroker* stroker, Mesh* mesh, const Vec2* vtx, uint32_
 
 		// Check which one of the points is the inner corner.
 		float leftPointAAProjDist = d12.x * v_hsw_aa.x + d12.y * v_hsw_aa.y;
+		if (innerBevelFlags[iSegment]) {
+			// Inner bevel (see polylineStroke()): [X0aa, P, X1aa], then the outer side: [Maa] or [O0aa, O1aa].
+			const bool leftInner = leftPointAAProjDist >= 0.0f;
+			const float innerSign = leftInner ? 1.0f : -1.0f;
+			const Vec2 nI01 = vec2Scale(vec2PerpCCW(d01), innerSign);
+			const Vec2 nI12 = vec2Scale(vec2PerpCCW(d12), innerSign);
+			const uint16_t firstVertexID = (uint16_t)(dstPos - posStart);
+			const uint16_t x0aa = firstVertexID;
+			const uint16_t mid = (uint16_t)(firstVertexID + 1);
+			const uint16_t x1aa = (uint16_t)(firstVertexID + 2);
+			dstPos[0] = vec2Add(p1, vec2Scale(nI01, hsw_aa));
+			dstPos[1] = p1;
+			dstPos[2] = vec2Add(p1, vec2Scale(nI12, hsw_aa));
+			dstPos += 3;
+			dstColor = copyColor<3>(dstColor, &c0_c_c0_c0[0]);
+
+			uint16_t outerFirst, outerLast;
+			if (_LineJoin == LineJoin::Miter) {
+				*dstPos++ = vec2Sub(p1, vec2Scale(v_hsw_aa, innerSign));
+				*dstColor++ = c0;
+				outerFirst = outerLast = (uint16_t)(firstVertexID + 3);
+			} else {
+				dstPos[0] = vec2Sub(p1, vec2Scale(nI01, hsw_aa));
+				dstPos[1] = vec2Sub(p1, vec2Scale(nI12, hsw_aa));
+				dstPos += 2;
+				dstColor = copyColor<2>(dstColor, &c0_c_c0_c0[2]);
+				outerFirst = (uint16_t)(firstVertexID + 3);
+				outerLast = (uint16_t)(firstVertexID + 4);
+
+				const uint16_t id[3] = { mid, outerFirst, outerLast };
+				dstIndex = copyIndices<3>(dstIndex, id);
+			}
+
+			{
+				const uint16_t id[3] = { mid, x0aa, x1aa };
+				dstIndex = copyIndices<3>(dstIndex, id);
+			}
+
+			const uint16_t tLA = leftInner ? x0aa : outerFirst;
+			const uint16_t tRA = leftInner ? outerFirst : x0aa;
+			if (prevSegmentLeftAAID != 0xFFFF) {
+				dstIndex = connectJoin3(dstIndex, prevSegmentLeftAAID, prevSegmentMiddleID, prevSegmentRightAAID, tLA, mid, tRA);
+			} else {
+				VG_CHECK(closed, "Invalid previous segment");
+				firstSegmentLeftAAID = tLA;
+				firstSegmentMiddleID = mid;
+				firstSegmentRightAAID = tRA;
+			}
+
+			prevSegmentLeftAAID = leftInner ? x1aa : outerLast;
+			prevSegmentMiddleID = mid;
+			prevSegmentRightAAID = leftInner ? outerLast : x1aa;
+			d01 = d12;
+			continue;
+		}
+
 		if (leftPointAAProjDist >= 0.0f) {
 			// The left point is the inner corner.
 			const Vec2 innerCorner = vec2Add(p1, v_hsw_aa);
