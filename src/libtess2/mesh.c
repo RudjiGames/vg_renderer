@@ -251,6 +251,102 @@ static void KillFace( TESSmesh *mesh, TESSface *fDel, TESSface *newLface )
 }
 
 
+
+/* LoopNotLonger( a, b ) returns TRUE if the face loop of a (a->Lnext...) has at most as many edges as the loop of b.
+* The loops are walked in lockstep, so the cost is proportional to the length of the shorter loop.
+*/
+static int LoopNotLonger( TESShalfEdge *a, TESShalfEdge *b )
+{
+	TESShalfEdge *ea = a->Lnext;
+	TESShalfEdge *eb = b->Lnext;
+	for( ;; ) {
+		if( ea == a ) return TRUE;
+		if( eb == b ) return FALSE;
+		ea = ea->Lnext;
+		eb = eb->Lnext;
+	}
+}
+
+static void SetLoopFace( TESShalfEdge *eStart, TESSface *f )
+{
+	TESShalfEdge *e = eStart;
+	do {
+		e->Lface = f;
+		e = e->Lnext;
+	} while( e != eStart );
+}
+
+static void UnlinkFace( TESSface *f )
+{
+	f->prev->next = f->next;
+	f->next->prev = f->prev;
+}
+
+static void LinkFaceBefore( TESSface *f, TESSface *fNext )
+{
+	TESSface *fPrev = fNext->prev;
+	f->prev = fPrev;
+	fPrev->next = f;
+	f->next = fNext;
+	fNext->prev = f;
+}
+
+/* SplitFace( newFace, eNew, eOld ) is equivalent to MakeFace( newFace, eNew, eOld->Lface ) after a loop has been
+* split in two (eNew and eOld are on different loops, both still pointing to the old face): the loop of eNew gets
+* the new face (inserted before the old face in the face list), the loop of eOld keeps the old face.
+* MakeFace() walks the loop of eNew, which is O(n^2) in total when the new loops are the large ones (e.g. when the
+* sweep splits the loops of long input contours). Instead, only the shorter loop is walked: if it's the loop of
+* eOld, the face objects swap their roles, i.e. the old face object stays with the loop of eNew and becomes the new
+* face (same attributes and position in the face list as MakeFace() would give the new face) and the new face
+* object takes over the loop and the attributes of the old face.
+*/
+static void SplitFace( TESSface *newFace, TESShalfEdge *eNew, TESShalfEdge *eOld )
+{
+	TESSface *fOld = eOld->Lface;
+
+	if( LoopNotLonger( eNew, eOld ) ) {
+		MakeFace( newFace, eNew, fOld );
+		return;
+	}
+
+	/* newFace takes the place of fOld (list position and attributes), fOld becomes the new face before it. */
+	*newFace = *fOld;
+	newFace->prev->next = newFace;
+	newFace->next->prev = newFace;
+	newFace->anEdge = eOld;
+	SetLoopFace( eOld, newFace );
+
+	/* newFace replaced fOld in the face list (fOld's links are stale), so fOld only has to be linked again. */
+	LinkFaceBefore( fOld, newFace );
+	fOld->anEdge = eNew;
+	fOld->trail = NULL;
+	fOld->marked = FALSE;
+	/* fOld->inside is already the same as newFace->inside (MakeFace() copies it) */
+}
+
+/* JoinFaces( mesh, eDel, eKeep ) is equivalent to KillFace( mesh, eDel->Lface, eKeep->Lface ) before two loops are
+* joined: the resulting loop keeps the face of eKeep (attributes and position in the face list). Only the shorter
+* loop is walked (see SplitFace()).
+*/
+static void JoinFaces( TESSmesh *mesh, TESShalfEdge *eDel, TESShalfEdge *eKeep )
+{
+	TESSface *fDel = eDel->Lface;
+	TESSface *fKeep = eKeep->Lface;
+
+	if( LoopNotLonger( eDel, eKeep ) ) {
+		KillFace( mesh, fDel, fKeep );
+		return;
+	}
+
+	/* Relabel the loop of eKeep to fDel, then move fKeep's attributes and list position to fDel. */
+	SetLoopFace( eKeep, fDel );
+	UnlinkFace( fDel );
+	*fDel = *fKeep;
+	fDel->prev->next = fDel;
+	fDel->next->prev = fDel;
+	bucketFree( mesh->faceBucket, fKeep );
+}
+
 /****************** Basic Edge Operations **********************/
 
 /* tessMeshMakeEdge creates one edge, two vertices, and a loop (face).
@@ -319,7 +415,7 @@ int tessMeshSplice( TESSmesh* mesh, TESShalfEdge *eOrg, TESShalfEdge *eDst )
 	if( eDst->Lface != eOrg->Lface ) {
 		/* We are connecting two disjoint loops -- destroy eDst->Lface */
 		joiningLoops = TRUE;
-		KillFace( mesh, eDst->Lface, eOrg->Lface );
+		JoinFaces( mesh, eDst, eOrg );
 	}
 
 	/* Change the edge structure */
@@ -342,7 +438,7 @@ int tessMeshSplice( TESSmesh* mesh, TESShalfEdge *eOrg, TESShalfEdge *eDst )
 		/* We split one loop into two -- the new loop is eDst->Lface.
 		* Make sure the old face points to a valid half-edge.
 		*/
-		MakeFace( newFace, eDst, eOrg->Lface );
+		SplitFace( newFace, eDst, eOrg );
 		eOrg->Lface->anEdge = eOrg;
 	}
 
@@ -496,7 +592,7 @@ TESShalfEdge *tessMeshConnect( TESSmesh *mesh, TESShalfEdge *eOrg, TESShalfEdge 
 	if( eDst->Lface != eOrg->Lface ) {
 		/* We are connecting two disjoint loops -- destroy eDst->Lface */
 		joiningLoops = TRUE;
-		KillFace( mesh, eDst->Lface, eOrg->Lface );
+		JoinFaces( mesh, eDst, eOrg );
 	}
 
 	/* Connect the new edge appropriately */
@@ -516,7 +612,7 @@ TESShalfEdge *tessMeshConnect( TESSmesh *mesh, TESShalfEdge *eOrg, TESShalfEdge 
 		if (newFace == NULL) return NULL;
 
 		/* We split one loop into two -- the new loop is eNew->Lface */
-		MakeFace( newFace, eNew, eOrg->Lface );
+		SplitFace( newFace, eNew, eNewSym );
 	}
 	return eNew;
 }

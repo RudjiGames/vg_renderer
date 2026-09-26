@@ -34,6 +34,7 @@
 #include <setjmp.h>
 #include "bucketalloc.h"
 #include "tess.h"
+#include "tesselator.h"
 #include "mesh.h"
 #include "sweep.h"
 #include "geom.h"
@@ -1104,7 +1105,6 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 		size = 3;
 
 	e = NULL;
-
 	for( i = 0; i < numVertices; ++i )
 	{
 		const TESSreal* coords = (const TESSreal*)src;

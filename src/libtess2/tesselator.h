@@ -152,7 +152,7 @@ typedef struct TESSalloc TESSalloc;
 
 // These two constants define the valid input coordinate range the library is
 // able to operate on. Tesselation will fail if any of the coordinates are not
-// within this range (NaNs included). Clients are responsible for dealing with inputs outside of
+// within this range. Clients are responsible for dealing with inputs outside of
 // this range (e.g. clamping or filtering invalid points, scaling down the
 // coordinate space).
 #define TESS_MAX_VALID_INPUT_VALUE ((TESSreal) (1<<23))
@@ -257,9 +257,9 @@ int tessGetElementCount( TESStesselator *tess );
 const TESSindex* tessGetElements( TESStesselator *tess );
 
 typedef enum TESSstatus {
-	TESS_STATUS_OK,
-	TESS_STATUS_OUT_OF_MEMORY,
-	TESS_STATUS_INVALID_INPUT
+  TESS_STATUS_OK,
+  TESS_STATUS_OUT_OF_MEMORY,
+  TESS_STATUS_INVALID_INPUT
 } TESSstatus;
 
 // Return the success or failure status. If tessTesselate fails (or will fail,

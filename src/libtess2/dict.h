@@ -32,11 +32,13 @@
 #ifndef DICT_LIST_H
 #define DICT_LIST_H
 
-typedef void *DictKey;
+#include "tesselator.h"
+#include "mesh.h"
+
 typedef struct Dict Dict;
 typedef struct DictNode DictNode;
 
-Dict *dictNewDict( TESSalloc* alloc, void *frame, int (*leq)(void *frame, DictKey key1, DictKey key2) );
+Dict *dictNewDict( TESSalloc* alloc, void *frame, int (*leq)(TESStesselator *frame, ActiveRegion *key1, ActiveRegion *key2) );
 
 void dictDeleteDict( TESSalloc* alloc, Dict *dict );
 
@@ -44,8 +46,8 @@ void dictDeleteDict( TESSalloc* alloc, Dict *dict );
 * to the given key.  If there is no such key, returns a node whose
 * key is NULL.  Similarly, Succ(Max(d)) has a NULL key, etc.
 */
-DictNode *dictSearch( Dict *dict, DictKey key );
-DictNode *dictInsertBefore( Dict *dict, DictNode *node, DictKey key );
+DictNode *dictSearch( Dict *dict, ActiveRegion *key );
+DictNode *dictInsertBefore( Dict *dict, DictNode *node, ActiveRegion *key );
 void dictDelete( Dict *dict, DictNode *node );
 
 #define dictKey(n)	((n)->key)
@@ -58,17 +60,37 @@ void dictDelete( Dict *dict, DictNode *node );
 
 /*** Private data structures ***/
 
+/* The dictionary is a sorted doubly-linked list (level 0: next/prev) with a skip list index on top of it, so that
+* dictSearch() is O(log n) instead of O(n). About 1 in 4 nodes has a tower with links on levels
+* 1..height-1 (level L links all the nodes whose height is greater than L). All the users of the dictionary only
+* see the level 0 list.
+*/
+#define DICT_MAX_LEVELS 16
+
+typedef struct DictTower DictTower;
+
+struct DictTower {
+	int height;
+	DictNode *next[DICT_MAX_LEVELS]; /* [0] is unused (level 0 links are in DictNode) */
+	DictNode *prev[DICT_MAX_LEVELS];
+};
+
 struct DictNode {
-	DictKey	key;
+	ActiveRegion *key;
 	DictNode *next;
 	DictNode *prev;
+	DictTower *tower; /* NULL if the node is only on level 0 */
 };
 
 struct Dict {
 	DictNode head;
+	DictTower headTower;
+	int maxHeight;
+	unsigned int rng;
 	void *frame;
 	struct BucketAlloc *nodePool;
-	int (*leq)(void *frame, DictKey key1, DictKey key2);
+	struct BucketAlloc *towerPool;
+	int (*leq)(TESStesselator *frame, ActiveRegion *key1, ActiveRegion *key2);
 };
 
 #endif
