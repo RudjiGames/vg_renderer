@@ -12,6 +12,18 @@
 #	define VG_CONFIG_ENABLE_SHAPE_CACHING 1
 #endif
 
+// Laid out glyph quads of text() strings are cached across frames (keyed by font, size and string), so drawing
+// the same strings again skips decoding, kerning and glyph lookups. The cache holds at most
+// VG_CONFIG_TEXT_CACHE_MAX_STRINGS strings with a total of VG_CONFIG_TEXT_CACHE_MAX_GLYPHS glyphs; it's cleared
+// when it's full. 0 = disabled.
+#ifndef VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+#	define VG_CONFIG_TEXT_CACHE_MAX_STRINGS 1024
+#endif
+
+#ifndef VG_CONFIG_TEXT_CACHE_MAX_GLYPHS
+#	define VG_CONFIG_TEXT_CACHE_MAX_GLYPHS 32768
+#endif
+
 // Draw anti-aliased solid color fills and strokes of rectangles, rounded rectangles and circles (with a similarity
 // transform, i.e. translation, rotation and uniform scale) as single quads whose coverage is computed in the fragment
 // shader, instead of generating their geometry on the CPU. Only used if the shader program is available for the

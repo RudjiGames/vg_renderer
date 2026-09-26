@@ -182,6 +182,8 @@ void fonsDeleteInternal(FONScontext* s);
 void fonsSetErrorCallback(FONScontext* s, void (*callback)(void* uptr, int error, int val), void* uptr);
 // Returns current atlas size.
 void fonsGetAtlasSize(FONScontext* s, int* width, int* height);
+// Returns a counter which changes whenever baked glyph quads become invalid (the atlas has been reset or resized).
+int fonsGetAtlasID(FONScontext* s);
 // Expands the atlas size.
 int fonsExpandAtlas(FONScontext* s, int width, int height);
 // Resets the whole stash.
@@ -2295,6 +2297,11 @@ void fonsSetErrorCallback(FONScontext* stash, void (*callback)(void* uptr, int e
 	stash->errorUptr = uptr;
 }
 
+int fonsGetAtlasID(FONScontext* stash)
+{
+	return stash->atlasID;
+}
+
 void fonsGetAtlasSize(FONScontext* stash, int* width, int* height)
 {
 	if (stash == NULL) return;
@@ -2356,6 +2363,9 @@ int fonsExpandAtlas(FONScontext* stash, int width, int height)
 	stash->params.height = height;
 	stash->itw = 1.0f/stash->params.width;
 	stash->ith = 1.0f/stash->params.height;
+
+	// The texture coordinates of the baked glyphs changed.
+	stash->atlasID++;
 
 	return 1;
 }

@@ -164,6 +164,47 @@ struct PendingShape
 	float m_Args[8];
 };
 
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+// Laid out glyph quads of text() strings (see textCacheFind()).
+struct TextCacheEntry
+{
+	uint64_t m_Hash;
+	uint32_t m_StrOffset;  // Offset of the string in TextCache::m_StrData
+	uint32_t m_StrLen;
+	uint32_t m_FirstQuad;  // Offset of the quads in TextCache::m_Quads
+	uint32_t m_NumQuads;
+	float m_Width;
+	uint16_t m_FontID;
+	int16_t m_FontSize;    // Font size * 10 (like fontstash's glyph size)
+};
+
+struct TextCache
+{
+	uint32_t* m_Table;     // Open addressing hash table: entry index + 1, 0 for empty slots
+	TextCacheEntry* m_Entries;
+	uint32_t m_NumEntries;
+	FONSquad* m_Quads;
+	uint32_t m_NumQuads;
+	char* m_StrData;
+	uint32_t m_StrDataSize;
+	int m_AtlasID;         // fonsGetAtlasID() when the entries were baked
+};
+
+static constexpr uint32_t nextPowerOf2(uint32_t v)
+{
+	v--;
+	v |= v >> 1;
+	v |= v >> 2;
+	v |= v >> 4;
+	v |= v >> 8;
+	v |= v >> 16;
+	return v + 1;
+}
+
+static const uint32_t kTextCacheTableSize = nextPowerOf2(VG_CONFIG_TEXT_CACHE_MAX_STRINGS * 2); // Load factor <= 0.5
+static const uint32_t kTextCacheMaxStrData = VG_CONFIG_TEXT_CACHE_MAX_GLYPHS * 4;
+#endif
+
 // Floats per vertex of Type::Shape draw commands (3 x vec4, see fs_shape.sc)
 static const uint32_t kShapeVertexSize = 12;
 
@@ -518,6 +559,9 @@ struct Context
 	uv_t m_FontImageWhitePixelUV[2];
 
 	FONSstring m_TextString;
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+	TextCache m_TextCache;
+#endif
 	FontData* m_FontData;
 	uint32_t m_NextFontID;
 
@@ -598,6 +642,10 @@ static ImageHandle allocImage(Context* ctx);
 static void resetImage(Image* img);
 
 static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQuads, Color color, float tx, float ty);
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+static void textCacheInit(Context* ctx);
+static void textCacheDestroy(Context* ctx);
+#endif
 static bool allocTextAtlas(Context* ctx);
 static void flushTextAtlas(Context* ctx);
 
@@ -998,6 +1046,9 @@ Context* createContext(bx::AllocatorI* allocator, const ContextConfig* userCfg)
 	updateWhitePixelUV(ctx);
 
 	fonsInitString(&ctx->m_TextString);
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+	textCacheInit(ctx);
+#endif
 
 	return ctx;
 }
@@ -1008,6 +1059,9 @@ void destroyContext(Context* ctx)
 	const ContextConfig* cfg = &ctx->m_Config;
 
 	fonsDestroyString(&ctx->m_TextString);
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+	textCacheDestroy(ctx);
+#endif
 
 	// Destroy all command lists the user hasn't destroyed.
 	while (ctx->m_CmdListHandleAlloc->getNumHandles() != 0) {
@@ -4683,6 +4737,113 @@ static void ctxIndexedTriList(Context* ctx, const float* pos, const uv_t* uv, ui
 	cmd->m_NumIndices += numIndices;
 }
 
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+static void textCacheInit(Context* ctx)
+{
+	bx::AllocatorI* allocator = ctx->m_Allocator;
+	TextCache* cache = &ctx->m_TextCache;
+	cache->m_Table = (uint32_t*)bx::alloc(allocator, sizeof(uint32_t) * kTextCacheTableSize);
+	cache->m_Entries = (TextCacheEntry*)bx::alloc(allocator, sizeof(TextCacheEntry) * VG_CONFIG_TEXT_CACHE_MAX_STRINGS);
+	cache->m_Quads = (FONSquad*)bx::alloc(allocator, sizeof(FONSquad) * VG_CONFIG_TEXT_CACHE_MAX_GLYPHS);
+	cache->m_StrData = (char*)bx::alloc(allocator, kTextCacheMaxStrData);
+	bx::memSet(cache->m_Table, 0, sizeof(uint32_t) * kTextCacheTableSize);
+	cache->m_NumEntries = 0;
+	cache->m_NumQuads = 0;
+	cache->m_StrDataSize = 0;
+	cache->m_AtlasID = -1;
+}
+
+static void textCacheDestroy(Context* ctx)
+{
+	bx::AllocatorI* allocator = ctx->m_Allocator;
+	TextCache* cache = &ctx->m_TextCache;
+	bx::free(allocator, cache->m_Table);
+	bx::free(allocator, cache->m_Entries);
+	bx::free(allocator, cache->m_Quads);
+	bx::free(allocator, cache->m_StrData);
+	bx::memSet(cache, 0, sizeof(TextCache));
+}
+
+static void textCacheReset(TextCache* cache, int atlasID)
+{
+	if (cache->m_NumEntries != 0) {
+		bx::memSet(cache->m_Table, 0, sizeof(uint32_t) * kTextCacheTableSize);
+	}
+	cache->m_NumEntries = 0;
+	cache->m_NumQuads = 0;
+	cache->m_StrDataSize = 0;
+	cache->m_AtlasID = atlasID;
+}
+
+static uint64_t textCacheHash(uint16_t fontID, int16_t fontSize, const char* str, uint32_t len)
+{
+	uint64_t h = 14695981039346656037ull ^ (((uint64_t)fontID << 16) | (uint16_t)fontSize);
+	h *= 1099511628211ull;
+	for (uint32_t i = 0; i < len; ++i) {
+		h ^= (uint8_t)str[i];
+		h *= 1099511628211ull;
+	}
+	return h;
+}
+
+// Returns the slot of the string in the hash table (empty if it's not in the cache).
+static uint32_t* textCacheFindSlot(TextCache* cache, uint64_t hash, uint16_t fontID, int16_t fontSize, const char* str, uint32_t len)
+{
+	uint32_t slot = (uint32_t)(hash >> 32) & (kTextCacheTableSize - 1);
+	for (;;) {
+		const uint32_t id = cache->m_Table[slot];
+		if (id == 0) {
+			return &cache->m_Table[slot];
+		}
+
+		const TextCacheEntry* entry = &cache->m_Entries[id - 1];
+		if (entry->m_Hash == hash
+		&&  entry->m_StrLen == len
+		&&  entry->m_FontID == fontID
+		&&  entry->m_FontSize == fontSize
+		&&  !bx::memCmp(&cache->m_StrData[entry->m_StrOffset], str, len)) {
+			return &cache->m_Table[slot];
+		}
+
+		slot = (slot + 1) & (kTextCacheTableSize - 1);
+	}
+}
+
+// Adds the baked string (unless it doesn't fit in the cache even after clearing it).
+static void textCacheInsert(TextCache* cache, uint64_t hash, uint16_t fontID, int16_t fontSize, const char* str, uint32_t len, const FONSquad* quads, uint32_t numQuads, float width, int atlasID)
+{
+	if (numQuads > VG_CONFIG_TEXT_CACHE_MAX_GLYPHS || len > kTextCacheMaxStrData) {
+		return;
+	}
+
+	if (cache->m_AtlasID != atlasID
+	||  cache->m_NumEntries == VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+	||  cache->m_NumQuads + numQuads > VG_CONFIG_TEXT_CACHE_MAX_GLYPHS
+	||  cache->m_StrDataSize + len > kTextCacheMaxStrData) {
+		textCacheReset(cache, atlasID);
+	}
+
+	uint32_t* slot = textCacheFindSlot(cache, hash, fontID, fontSize, str, len);
+	VG_CHECK(*slot == 0, "String already in the text cache");
+
+	TextCacheEntry* entry = &cache->m_Entries[cache->m_NumEntries++];
+	entry->m_Hash = hash;
+	entry->m_StrOffset = cache->m_StrDataSize;
+	entry->m_StrLen = len;
+	entry->m_FirstQuad = cache->m_NumQuads;
+	entry->m_NumQuads = numQuads;
+	entry->m_Width = width;
+	entry->m_FontID = fontID;
+	entry->m_FontSize = fontSize;
+	*slot = cache->m_NumEntries;
+
+	bx::memCopy(&cache->m_StrData[cache->m_StrDataSize], str, len);
+	cache->m_StrDataSize += len;
+	bx::memCopy(&cache->m_Quads[cache->m_NumQuads], quads, sizeof(FONSquad) * numQuads);
+	cache->m_NumQuads += numQuads;
+}
+#endif
+
 static void ctxText(Context* ctx, const TextConfig& cfg, float x, float y, const char* str, const char* end)
 {
 	VG_CHECK(isValid(cfg.m_FontHandle), "Invalid font handle");
@@ -4704,27 +4865,58 @@ static void ctxText(Context* ctx, const TextConfig& cfg, float x, float y, const
 	fonsSetSize(fons, scaledFontSize);
 	fonsSetFont(fons, cfg.m_FontHandle.idx);
 
-	fonsResetString(fons, vgs, str, end);
+	const FONSquad* quads = nullptr;
+	uint32_t numQuads = 0;
 
-	int numBakedChars = fonsBakeString(fons, vgs);
-	if (numBakedChars == -1) {
-		// Atlas full? Retry
-		if (!allocTextAtlas(ctx)) {
-			VG_WARN(false, "Failed to allocate enough text atlas space for string");
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+	// The quads depend on the font, the font size as fontstash quantizes it (see fonsBakeString()) and the string.
+	TextCache* cache = &ctx->m_TextCache;
+	const uint16_t fontID = cfg.m_FontHandle.idx;
+	const int16_t fontSize = (int16_t)(scaledFontSize * 10.0f);
+	const uint32_t len = (uint32_t)(end - str);
+	const int atlasID = fonsGetAtlasID(fons);
+	const uint64_t hash = textCacheHash(fontID, fontSize, str, len);
+	if (cache->m_AtlasID == atlasID) {
+		const uint32_t id = *textCacheFindSlot(cache, hash, fontID, fontSize, str, len);
+		if (id != 0) {
+			const TextCacheEntry* entry = &cache->m_Entries[id - 1];
+			quads = &cache->m_Quads[entry->m_FirstQuad];
+			numQuads = entry->m_NumQuads;
+			vgs->m_Width = entry->m_Width; // Used by fonsAlignString()
+		}
+	}
+#endif
+
+	if (!quads) {
+		fonsResetString(fons, vgs, str, end);
+
+		int numBakedChars = fonsBakeString(fons, vgs);
+		if (numBakedChars == -1) {
+			// Atlas full? Retry
+			if (!allocTextAtlas(ctx)) {
+				VG_WARN(false, "Failed to allocate enough text atlas space for string");
+				return;
+			}
+
+			numBakedChars = fonsBakeString(fons, vgs);
+		}
+
+		if (numBakedChars <= 0) {
 			return;
 		}
 
-		numBakedChars = fonsBakeString(fons, vgs);
-	}
+		quads = vgs->m_Quads;
+		numQuads = (uint32_t)numBakedChars;
 
-	if (numBakedChars <= 0) {
-		return;
+#if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
+		textCacheInsert(cache, hash, fontID, fontSize, str, len, quads, numQuads, vgs->m_Width, fonsGetAtlasID(fons));
+#endif
 	}
 
 	float dx = 0.0f, dy = 0.0f;
 	fonsAlignString(fons, vgs, cfg.m_Alignment, &dx, &dy);
 
-	renderTextQuads(ctx, vgs->m_Quads, (uint32_t)numBakedChars, cfg.m_Color, x + dx / scale, y + dy / scale);
+	renderTextQuads(ctx, quads, numQuads, cfg.m_Color, x + dx / scale, y + dy / scale);
 }
 
 static void ctxTextBox(Context* ctx, const TextConfig& cfg, float x, float y, float breakWidth, const char* str, const char* end, uint32_t textboxFlags)

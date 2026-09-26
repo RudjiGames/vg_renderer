@@ -23,6 +23,7 @@ Strokes and fills are generated using the Stroker struct (`src/vg/stroker.cpp, .
 9. FontStash: optional (compile-time flag) caching of glyph indices and kerning info for ASCII chars in order to avoid repeated calls to stbtt functions.
 10. Per-fill and per-stroke control over whether anti-aliasing geometry should be generated.
 11. Anti-aliased solid color fills and strokes of rectangles, rounded rectangles and circles are drawn as single quads with analytic (signed distance) coverage in the fragment shader instead of generated geometry (`VG_CONFIG_ENABLE_ANALYTIC_SHAPES`).
+12. Laid out text strings (glyph quads per font, size and string) are cached across frames (`VG_CONFIG_TEXT_CACHE_MAX_STRINGS`).
 
 ### What's not supported compared to NanoVG
 
