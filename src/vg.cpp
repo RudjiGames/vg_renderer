@@ -172,9 +172,15 @@ struct VertexBuffer
 
 struct IndexBuffer
 {
-	uint16_t* m_Indices;
+	uint16_t* m_Indices;       // The indices of the current frame (m_HeapIndices or the transient index buffer's data)
 	uint32_t m_Count;
-	uint32_t m_Capacity;
+	uint32_t m_Capacity;       // Capacity of m_Indices (0 until the first indices of the frame are allocated)
+	uint16_t* m_HeapIndices;   // Persistent storage, reused across frames. Grow-only.
+	uint32_t m_HeapCapacity;
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+	bgfx::TransientIndexBuffer m_TransientBuffer;
+	bool m_Transient;          // m_Indices points directly into m_TransientBuffer (see growIndexBuffer())
+#endif
 };
 
 struct Image
@@ -409,6 +415,7 @@ struct Context
 #endif
 	uint32_t m_NumIndexBuffers;
 	uint16_t m_ActiveIndexBufferID;
+	uint32_t m_NumFrameIndices;      // Number of indices generated between the last begin()/end() pair
 
 	float** m_Vec2DataPool;
 	uint32_t m_Vec2DataPoolCapacity;
@@ -984,10 +991,12 @@ void destroyContext(Context* ctx)
 		}
 #endif
 		IndexBuffer* ib = &ctx->m_IndexBuffers[i];
-        if (ib->m_Indices) {
-            bx::alignedFree(allocator, ib->m_Indices, 16);
-            ib->m_Indices = nullptr;
-        }
+		if (ib->m_HeapIndices) {
+			bx::alignedFree(allocator, ib->m_HeapIndices, 16);
+			ib->m_HeapIndices = nullptr;
+		}
+		ib->m_Indices = nullptr;
+		ib->m_HeapCapacity = 0;
 		ib->m_Capacity = 0;
 		ib->m_Count = 0;
 	}
@@ -1131,7 +1140,17 @@ void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasH
 	allocVertexBuffer(ctx);
 
 	ctx->m_ActiveIndexBufferID = allocIndexBuffer(ctx);
-	VG_CHECK(ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID].m_Count == 0, "Not empty index buffer");
+	{
+		IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
+		VG_CHECK(ib->m_Count == 0, "Not empty index buffer");
+
+		// The storage is selected when the first indices are allocated (see growIndexBuffer()).
+		ib->m_Indices = nullptr;
+		ib->m_Capacity = 0;
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		ib->m_Transient = false;
+#endif
+	}
 
 	ctx->m_NumDrawCommands = 0;
 	ctx->m_ForceNewDrawCommand = true;
@@ -1165,6 +1184,10 @@ void end(Context* ctx)
 		for (uint32_t iVB = ctx->m_FirstVertexBufferID; iVB < numVertexBuffers; ++iVB) {
 			releaseVertexBufferStorage(ctx, &ctx->m_VertexBuffers[iVB]);
 		}
+
+		// ...and the index buffer (clip commands might have allocated indices)
+		ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID].m_Count = 0;
+		ctx->m_NumFrameIndices = 0;
 
 		return;
 	}
@@ -1237,10 +1260,16 @@ void end(Context* ctx)
 
 	// Update bgfx index buffer...
 	IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
+	ctx->m_NumFrameIndices = ib->m_Count;
 #if VG_CONFIG_USE_TRANSIENT_BUFFERS
 	bgfx::TransientIndexBuffer indexBuffer;
-	bgfx::allocTransientIndexBuffer(&indexBuffer, ib->m_Count);
-	bx::memCopy(indexBuffer.data, ib->m_Indices, sizeof(int16_t) * ib->m_Count);
+	if (ib->m_Transient) {
+		// The indices have been written directly into the transient buffer.
+		indexBuffer = ib->m_TransientBuffer;
+	} else {
+		bgfx::allocTransientIndexBuffer(&indexBuffer, ib->m_Count);
+		bx::memCopy(indexBuffer.data, ib->m_Indices, sizeof(int16_t) * ib->m_Count);
+	}
 	releaseIndexBuffer(ctx, ib->m_Indices);
 #else
 	GPUIndexBuffer* gpuib = &ctx->m_GPUIndexBuffers[ctx->m_ActiveIndexBufferID];
@@ -5456,6 +5485,11 @@ static uint16_t allocIndexBuffer(Context* ctx)
 		ib->m_Capacity = 0;
 		ib->m_Count = 0;
 		ib->m_Indices = nullptr;
+		ib->m_HeapCapacity = 0;
+		ib->m_HeapIndices = nullptr;
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		ib->m_Transient = false;
+#endif
 
 #if !VG_CONFIG_USE_TRANSIENT_BUFFERS
 		GPUIndexBuffer* gpuib = &ctx->m_GPUIndexBuffers[ibID];
@@ -5955,14 +5989,47 @@ static uint32_t allocVertices(Context* ctx, uint32_t numVertices, uint32_t* vbID
 	return firstVertexID;
 }
 
+// With transient buffers, the indices are written directly into a bgfx transient index buffer, so end() doesn't
+// have to copy them. Its capacity is based on the number of indices of the previous frame. If the frame needs more
+// indices (or there isn't enough transient memory), the indices are moved to the heap buffer and copied into a
+// transient index buffer in end().
+static void growIndexBuffer(Context* ctx, IndexBuffer* ib, uint32_t minCapacity)
+{
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+	if (ib->m_Capacity == 0) {
+		const uint32_t capacity = bx::max(minCapacity, ctx->m_NumFrameIndices + ctx->m_NumFrameIndices / 8 + 1024);
+		if (bgfx::getAvailTransientIndexBuffer(capacity) == capacity) {
+			bgfx::allocTransientIndexBuffer(&ib->m_TransientBuffer, capacity);
+			ib->m_Indices = (uint16_t*)ib->m_TransientBuffer.data;
+			ib->m_Capacity = capacity;
+			ib->m_Transient = true;
+			return;
+		}
+	}
+#endif
+
+	if (minCapacity > ib->m_HeapCapacity) {
+		const uint32_t nextCapacity = ib->m_HeapCapacity != 0 ? (ib->m_HeapCapacity * 3) / 2 : 32;
+		ib->m_HeapCapacity = bx::max(nextCapacity, minCapacity);
+		ib->m_HeapIndices = (uint16_t*)bx::alignedRealloc(ctx->m_Allocator, ib->m_HeapIndices, sizeof(uint16_t) * ib->m_HeapCapacity, 16);
+	}
+
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+	if (ib->m_Transient) {
+		bx::memCopy(ib->m_HeapIndices, ib->m_Indices, sizeof(uint16_t) * ib->m_Count);
+		ib->m_Transient = false;
+	}
+#endif
+
+	ib->m_Indices = ib->m_HeapIndices;
+	ib->m_Capacity = ib->m_HeapCapacity;
+}
+
 static uint32_t allocIndices(Context* ctx, uint32_t numIndices)
 {
 	IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
 	if (ib->m_Count + numIndices > ib->m_Capacity) {
-		const uint32_t nextCapacity = ib->m_Capacity != 0 ? (ib->m_Capacity * 3) / 2 : 32;
-
-		ib->m_Capacity = bx::max(nextCapacity, ib->m_Count + numIndices);
-		ib->m_Indices = (uint16_t*)bx::alignedRealloc(ctx->m_Allocator, ib->m_Indices, sizeof(uint16_t) * ib->m_Capacity, 16);
+		growIndexBuffer(ctx, ib, ib->m_Count + numIndices);
 	}
 
 	const uint32_t firstIndexID = ib->m_Count;
