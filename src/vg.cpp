@@ -1165,6 +1165,18 @@ void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasH
 	ctx->m_NextImagePatternID = 0;
 }
 
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+// Returns false if the vertices of the command couldn't be uploaded to the transient vertex buffers (not enough memory).
+static bool isCommandUploaded(const GPUVertexBuffer* gpuvb, const DrawCommand* cmd)
+{
+	const uint32_t end = cmd->m_FirstVertexID + cmd->m_NumVertices;
+	return gpuvb->m_PosBufferHandle.size != 0
+		&& gpuvb->m_ColorBufferHandle.size != 0
+		&& end * gpuvb->m_PosBufferHandle.stride <= gpuvb->m_PosBufferHandle.size
+		&& end * gpuvb->m_ColorBufferHandle.stride <= gpuvb->m_ColorBufferHandle.size;
+}
+#endif
+
 void end(Context* ctx)
 {
 	VG_CHECK(ctx->m_StateStackTop == 0, "pushState()/popState() mismatch");
@@ -1209,6 +1221,21 @@ void end(Context* ctx)
 			vb->m_UV = nullptr;
 			vb->m_Color = nullptr;
 			continue;
+		}
+
+		// NOTE: bgfx truncates transient allocations to the available memory (see isCommandUploaded()).
+		{
+			const uint32_t posStride = ctx->m_PosVertexDecl.getStride();
+			const uint32_t totalBytes = vb->m_Count * (posStride + ctx->m_UVVertexDecl.getStride() + ctx->m_ColorVertexDecl.getStride()) + 64;
+			const uint32_t numPosVertices = (totalBytes + posStride - 1) / posStride;
+			if (bgfx::getAvailTransientVertexBuffer(numPosVertices, ctx->m_PosVertexDecl) != numPosVertices) {
+				VG_WARN(false, "Not enough transient vertex buffer memory for %u vertices", vb->m_Count);
+				releaseVertexBufferStorage(ctx, vb);
+				gpuvb->m_PosBufferHandle.size = 0;
+				gpuvb->m_UVBufferHandle.size = 0;
+				gpuvb->m_ColorBufferHandle.size = 0;
+				continue;
+			}
 		}
 
 		bgfx::allocTransientVertexBuffer(&gpuvb->m_PosBufferHandle, vb->m_Count, ctx->m_PosVertexDecl);
@@ -1266,9 +1293,13 @@ void end(Context* ctx)
 	if (ib->m_Transient) {
 		// The indices have been written directly into the transient buffer.
 		indexBuffer = ib->m_TransientBuffer;
-	} else {
+	} else if (bgfx::getAvailTransientIndexBuffer(ib->m_Count) == ib->m_Count) {
 		bgfx::allocTransientIndexBuffer(&indexBuffer, ib->m_Count);
 		bx::memCopy(indexBuffer.data, ib->m_Indices, sizeof(int16_t) * ib->m_Count);
+	} else {
+		VG_WARN(false, "Not enough transient index buffer memory for %u indices", ib->m_Count);
+		releaseIndexBuffer(ctx, ib->m_Indices);
+		return;
 	}
 	releaseIndexBuffer(ctx, ib->m_Indices);
 #else
@@ -1302,6 +1333,11 @@ void end(Context* ctx)
 
 	auto submitClipCommand = [&](const DrawCommand* clipCmd, uint8_t stencilValue) {
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[clipCmd->m_VertexBufferID];
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		if (!isCommandUploaded(gpuvb, clipCmd)) {
+			return;
+		}
+#endif
 #if VG_CONFIG_USE_TRANSIENT_BUFFERS
 		bgfx::setVertexBuffer(0, &gpuvb->m_PosBufferHandle, clipCmd->m_FirstVertexID, clipCmd->m_NumVertices);
 		bgfx::setIndexBuffer(&indexBuffer, clipCmd->m_FirstIndexID, clipCmd->m_NumIndices);
@@ -1376,6 +1412,10 @@ void end(Context* ctx)
 
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[cmd->m_VertexBufferID];
 #if VG_CONFIG_USE_TRANSIENT_BUFFERS
+		if (!isCommandUploaded(gpuvb, cmd)) {
+			continue;
+		}
+
 		bgfx::setVertexBuffer(0, &gpuvb->m_PosBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
 		bgfx::setVertexBuffer(1, &gpuvb->m_ColorBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
 		bgfx::setIndexBuffer(&indexBuffer, cmd->m_FirstIndexID, cmd->m_NumIndices);
