@@ -319,7 +319,7 @@ struct RoundJoinArc
 
 // Max number of vertices of a concave polygon to triangulate by ear clipping instead of libtess2
 // (see triangulateSimplePolygon()).
-static const uint32_t kMaxSimplePolygonVertices = 64;
+static const uint32_t kMaxSimplePolygonVertices = 256;
 
 struct Stroker
 {
@@ -1503,6 +1503,150 @@ static bool segmentsIntersect(const Vec2& a, const Vec2& b, const Vec2& c, const
 // are stored in CCW order in m_SimplePolyVertices (so the boundary contour is 0..n-1, like the tesselator's boundary
 // contours, with the interior on the left) and the n - 2 CCW triangles in m_SimplePolyTriangles.
 // Returns the number of vertices, or 0 if the fast path can't be used (the contours have to be tesselated).
+// Returns a 32-bit key with the same order as the float (NaNs excluded).
+static inline uint32_t floatSortKey(float f)
+{
+	const uint32_t u = bx::floatToBits(f);
+	return (u & 0x80000000u) != 0 ? ~u : (u | 0x80000000u);
+}
+
+// Sorts the n (unique) keys. Uses a natural merge sort for larger arrays (the keys of the edges of a polygon form
+// long monotone runs). Returns the sorted keys (either keys or temp).
+static uint64_t* sortPolygonKeys(uint64_t* keys, uint64_t* temp, uint32_t n)
+{
+	if (n <= 32) {
+		for (uint32_t i = 1; i < n; ++i) {
+			const uint64_t key = keys[i];
+			uint32_t k = i;
+			for (; k > 0 && keys[k - 1] > key; --k) {
+				keys[k] = keys[k - 1];
+			}
+			keys[k] = key;
+		}
+
+		return keys;
+	}
+
+	// Find the runs and make them all ascending
+	uint16_t runStart[kMaxSimplePolygonVertices + 1];
+	uint32_t numRuns = 0;
+	for (uint32_t i = 0; i < n; ) {
+		uint32_t j = i + 1;
+		if (j < n && keys[j] < keys[i]) {
+			while (j < n && keys[j] < keys[j - 1]) {
+				++j;
+			}
+
+			for (uint32_t l = i, r = j - 1; l < r; ++l, --r) {
+				const uint64_t tmp = keys[l];
+				keys[l] = keys[r];
+				keys[r] = tmp;
+			}
+		} else {
+			while (j < n && keys[j] > keys[j - 1]) {
+				++j;
+			}
+		}
+
+		runStart[numRuns++] = (uint16_t)i;
+		i = j;
+	}
+	runStart[numRuns] = (uint16_t)n;
+
+	uint64_t* src = keys;
+	uint64_t* dst = temp;
+	while (numRuns > 1) {
+		uint32_t numMerged = 0;
+		for (uint32_t r = 0; r < numRuns; r += 2) {
+			const uint32_t begin = runStart[r];
+			const uint32_t mid = runStart[bx::min(r + 1, numRuns)];
+			const uint32_t end = runStart[bx::min(r + 2, numRuns)];
+			uint32_t a = begin;
+			uint32_t b = mid;
+			uint32_t k = begin;
+			while (a < mid && b < end) {
+				dst[k++] = src[a] < src[b] ? src[a++] : src[b++];
+			}
+			while (a < mid) {
+				dst[k++] = src[a++];
+			}
+			while (b < end) {
+				dst[k++] = src[b++];
+			}
+
+			runStart[numMerged++] = (uint16_t)begin;
+		}
+		runStart[numMerged] = (uint16_t)n;
+		numRuns = numMerged;
+
+		uint64_t* tmp = src;
+		src = dst;
+		dst = tmp;
+	}
+
+	return src;
+}
+
+// Uniform grid over the bounding box of a polygon (see triangulateSimplePolygon()).
+struct PolygonGrid
+{
+	static const uint32_t kMaxSize = 16;
+	static const uint32_t kMaxCells = kMaxSize * kMaxSize;
+
+	Vec2 m_Min;
+	Vec2 m_InvCellSize;
+	uint32_t m_Size; // Number of cells along each axis
+
+	void init(const Vec2& bbMin, const Vec2& bbMax, uint32_t numElements)
+	{
+		// ~2 elements per cell
+		uint32_t size = 1;
+		while (size < kMaxSize && size * size * 2 < numElements) {
+			++size;
+		}
+
+		m_Size = size;
+		m_Min = bbMin;
+		m_InvCellSize.x = bbMax.x > bbMin.x ? (float)size / (bbMax.x - bbMin.x) : 0.0f;
+		m_InvCellSize.y = bbMax.y > bbMin.y ? (float)size / (bbMax.y - bbMin.y) : 0.0f;
+	}
+
+	// NOTE: Monotonic, so the cell range of a bounding box includes the cells of all the points inside it.
+	uint32_t getCell(float v, float vmin, float invCellSize) const
+	{
+		const float c = (v - vmin) * invCellSize;
+		return c <= 0.0f ? 0 : bx::min((uint32_t)c, m_Size - 1);
+	}
+
+	uint32_t getCellID(const Vec2& p) const
+	{
+		return getCell(p.y, m_Min.y, m_InvCellSize.y) * m_Size + getCell(p.x, m_Min.x, m_InvCellSize.x);
+	}
+
+	// Cell range (minX, minY, maxX, maxY) overlapped by bbox (minX, minY, maxX, maxY)
+	void getCellRange(const float* bbox, uint8_t* range) const
+	{
+		range[0] = (uint8_t)getCell(bbox[0], m_Min.x, m_InvCellSize.x);
+		range[1] = (uint8_t)getCell(bbox[1], m_Min.y, m_InvCellSize.y);
+		range[2] = (uint8_t)getCell(bbox[2], m_Min.x, m_InvCellSize.x);
+		range[3] = (uint8_t)getCell(bbox[3], m_Min.y, m_InvCellSize.y);
+	}
+};
+
+// Returns true if the reflex vertex ir is inside or on the ear (ip, ic, in) with the bounding box bbox.
+static inline bool blocksEar(const Vec2* vtx, uint32_t ir, uint32_t ip, uint32_t ic, uint32_t in, const float* bbox)
+{
+	const Vec2& r = vtx[ir];
+	if (ir == ip || ir == ic || ir == in || r.x < bbox[0] || r.y < bbox[1] || r.x > bbox[2] || r.y > bbox[3]) {
+		return false;
+	}
+
+	const Vec2& p = vtx[ip];
+	const Vec2& c = vtx[ic];
+	const Vec2& q = vtx[in];
+	return orient2d(p, c, r) >= 0.0 && orient2d(c, q, r) >= 0.0 && orient2d(q, p, r) >= 0.0;
+}
+
 static uint32_t triangulateSimplePolygon(Stroker* stroker)
 {
 	if (stroker->m_NumContours != 1) {
@@ -1526,12 +1670,21 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 	}
 
 	Vec2* vtx = stroker->m_SimplePolyVertices;
-	for (uint32_t i = 0; i < n; ++i) {
-		vtx[i] = area2 > 0.0 ? src[i] : src[n - 1 - i];
+	if (area2 > 0.0) {
+		bx::memCopy(vtx, src, n * sizeof(Vec2));
+	} else {
+		for (uint32_t i = 0; i < n; ++i) {
+			vtx[i] = src[n - 1 - i];
+		}
 	}
 
 	// Simplicity: adjacent edges must not fold back onto each other, other edges must not intersect or touch
 	// (this also rejects duplicate vertices).
+	bool isReflex[kMaxSimplePolygonVertices]; // Reflex or flat vertices (see ear clipping below)
+	float sumDx = 0.0f;
+	float sumDy = 0.0f;
+	Vec2 bbMin = vtx[0];
+	Vec2 bbMax = vtx[0];
 	for (uint32_t i = 0; i < n; ++i) {
 		const Vec2& p0 = vtx[i == 0 ? n - 1 : i - 1];
 		const Vec2& p1 = vtx[i];
@@ -1539,78 +1692,172 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 		if (p0.x == p1.x && p0.y == p1.y) {
 			return 0;
 		}
-		if (orient2d(p0, p1, p2) == 0.0 && ((double)p1.x - p0.x) * ((double)p2.x - p1.x) + ((double)p1.y - p0.y) * ((double)p2.y - p1.y) <= 0.0) {
+		const double o = orient2d(p0, p1, p2);
+		if (o == 0.0 && ((double)p1.x - p0.x) * ((double)p2.x - p1.x) + ((double)p1.y - p0.y) * ((double)p2.y - p1.y) <= 0.0) {
 			return 0;
 		}
+
+		isReflex[i] = !(o > 0.0);
+		sumDx += bx::abs(p2.x - p1.x);
+		sumDy += bx::abs(p2.y - p1.y);
+		bbMin = { bx::min(bbMin.x, p1.x), bx::min(bbMin.y, p1.y) };
+		bbMax = { bx::max(bbMax.x, p1.x), bx::max(bbMax.y, p1.y) };
 	}
-	for (uint32_t i = 0; i + 2 < n; ++i) {
-		const Vec2& a = vtx[i];
-		const Vec2& b = vtx[i + 1];
-		for (uint32_t j = i + 2; j < n; ++j) {
-			if (i == 0 && j == n - 1) {
-				continue; // Adjacent (closing edge)
+
+	// Other edges are tested with a sweep along the X or Y axis (the one along which the edges overlap less):
+	// the edges are sorted by their min coordinate and each edge is tested only against the following edges whose
+	// range overlaps with its own.
+	const bool sweepY = sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x);
+	float edgeMin[kMaxSimplePolygonVertices];
+	float edgeMax[kMaxSimplePolygonVertices];
+	uint64_t sortKeys[kMaxSimplePolygonVertices];
+	uint64_t sortTemp[kMaxSimplePolygonVertices];
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		const float c1 = sweepY ? p1.y : p1.x;
+		const float c2 = sweepY ? p2.y : p2.x;
+		edgeMin[i] = bx::min(c1, c2);
+		edgeMax[i] = bx::max(c1, c2);
+		sortKeys[i] = ((uint64_t)floatSortKey(edgeMin[i]) << 32) | i;
+	}
+
+	const uint64_t* sortedEdges = sortPolygonKeys(sortKeys, sortTemp, n);
+	for (uint32_t i = 0; i < n; ++i) {
+		const uint32_t ea = (uint32_t)sortedEdges[i];
+		const float maxC = edgeMax[ea];
+		const Vec2& a = vtx[ea];
+		const Vec2& b = vtx[ea + 1 == n ? 0 : ea + 1];
+		for (uint32_t j = i + 1; j < n; ++j) {
+			const uint32_t eb = (uint32_t)sortedEdges[j];
+			if (edgeMin[eb] > maxC) {
+				break;
 			}
-			if (segmentsIntersect(a, b, vtx[j], vtx[j + 1 == n ? 0 : j + 1])) {
+
+			const uint32_t d = ea > eb ? ea - eb : eb - ea;
+			if (d == 1 || d == n - 1) {
+				continue; // Adjacent
+			}
+
+			if (segmentsIntersect(a, b, vtx[eb], vtx[eb + 1 == n ? 0 : eb + 1])) {
 				return 0;
 			}
 		}
 	}
 
+	PolygonGrid grid;
+	grid.init(bbMin, bbMax, n);
+	const uint32_t numCells = grid.m_Size * grid.m_Size;
+
 	// Ear clipping. An ear (p, c, q) must be convex (or c on the segment p-q) and no other vertex may be inside
-	// or on the triangle.
-	uint16_t remaining[kMaxSimplePolygonVertices];
+	// or on the triangle. In a simple polygon it's enough to test the reflex vertices (if there's a vertex inside
+	// the triangle, there's also a reflex one). Flat vertices are tested as well.
+	// The reflex vertices are binned into the grid (a linked list per cell: reflexHead[cell] -> reflexNext[vertex]
+	// -> ... -> UINT16_MAX) so each ear is tested only against the reflex vertices in the cells its bounding box
+	// overlaps. Vertices which become reflex later (only possible due to numerical issues) are added then.
+	uint16_t prev[kMaxSimplePolygonVertices];
+	uint16_t next[kMaxSimplePolygonVertices];
+	uint16_t reflexHead[PolygonGrid::kMaxCells];
+	uint16_t reflexNext[kMaxSimplePolygonVertices];
+	bool isListed[kMaxSimplePolygonVertices];
+	bx::memSet(reflexHead, 0xff, sizeof(uint16_t) * numCells);
 	for (uint32_t i = 0; i < n; ++i) {
-		remaining[i] = (uint16_t)i;
+		prev[i] = (uint16_t)(i == 0 ? n - 1 : i - 1);
+		next[i] = (uint16_t)(i + 1 == n ? 0 : i + 1);
+		isListed[i] = isReflex[i];
+		if (isReflex[i]) {
+			const uint32_t cell = grid.getCellID(vtx[i]);
+			reflexNext[i] = reflexHead[cell];
+			reflexHead[cell] = (uint16_t)i;
+		}
 	}
+
+	// Bail out (and let libtess2 handle the polygon) if ear clipping takes too long.
+	int32_t budget = (int32_t)(n * 64 + 256);
 
 	uint16_t* tri = stroker->m_SimplePolyTriangles;
 	uint32_t numRemaining = n;
-	uint32_t k = 0;
+	uint32_t c = 0;
 	uint32_t numTested = 0;
 	while (numRemaining > 3) {
-		if (numTested == numRemaining) {
-			return 0; // No ear found (numerical problems)
+		if (numTested == numRemaining || budget < 0) {
+			return 0; // No ear found (numerical problems) or too slow
 		}
+		--budget;
 
-		const uint32_t kp = k == 0 ? numRemaining - 1 : k - 1;
-		const uint32_t kn = k + 1 == numRemaining ? 0 : k + 1;
-		const Vec2& p = vtx[remaining[kp]];
-		const Vec2& c = vtx[remaining[k]];
-		const Vec2& q = vtx[remaining[kn]];
-		const double o = orient2d(p, c, q);
-		bool isEar = o > 0.0 || (o == 0.0 && ((double)c.x - p.x) * ((double)q.x - c.x) + ((double)c.y - p.y) * ((double)q.y - c.y) > 0.0);
-		for (uint32_t m = 0; m < numRemaining && isEar; ++m) {
-			if (m == kp || m == k || m == kn) {
-				continue;
+		const uint32_t ip = prev[c];
+		const uint32_t in = next[c];
+		const Vec2& pp = vtx[ip];
+		const Vec2& pc = vtx[c];
+		const Vec2& pq = vtx[in];
+		const double o = orient2d(pp, pc, pq);
+		bool isEar = o > 0.0 || (o == 0.0 && ((double)pc.x - pp.x) * ((double)pq.x - pc.x) + ((double)pc.y - pp.y) * ((double)pq.y - pc.y) > 0.0);
+		if (isEar) {
+			const float bbox[4] = {
+				bx::min(pp.x, bx::min(pc.x, pq.x)),
+				bx::min(pp.y, bx::min(pc.y, pq.y)),
+				bx::max(pp.x, bx::max(pc.x, pq.x)),
+				bx::max(pp.y, bx::max(pc.y, pq.y))
+			};
+			uint8_t cellRange[4];
+			grid.getCellRange(bbox, cellRange);
+			for (uint32_t cy = cellRange[1]; cy <= cellRange[3] && isEar; ++cy) {
+				for (uint32_t cx = cellRange[0]; cx <= cellRange[2] && isEar; ++cx) {
+					--budget;
+					uint16_t* link = &reflexHead[cy * grid.m_Size + cx];
+					while (*link != UINT16_MAX && isEar) {
+						--budget;
+						const uint32_t ir = *link;
+						if (!isReflex[ir]) {
+							// Clipped or not reflex anymore: remove it from the grid
+							*link = reflexNext[ir];
+							isListed[ir] = false;
+							continue;
+						}
+
+						isEar = !blocksEar(vtx, ir, ip, c, in, bbox);
+						link = &reflexNext[ir];
+					}
+				}
 			}
-
-			const Vec2& r = vtx[remaining[m]];
-			isEar = !(orient2d(p, c, r) >= 0.0 && orient2d(c, q, r) >= 0.0 && orient2d(q, p, r) >= 0.0);
 		}
 
 		if (!isEar) {
-			k = kn;
+			c = in;
 			++numTested;
 			continue;
 		}
 
-		tri[0] = remaining[kp];
-		tri[1] = remaining[k];
-		tri[2] = remaining[kn];
+		tri[0] = (uint16_t)ip;
+		tri[1] = (uint16_t)c;
+		tri[2] = (uint16_t)in;
 		tri += 3;
 
-		for (uint32_t m = k; m + 1 < numRemaining; ++m) {
-			remaining[m] = remaining[m + 1];
-		}
+		next[ip] = (uint16_t)in;
+		prev[in] = (uint16_t)ip;
+		isReflex[c] = false;
 		--numRemaining;
-		k = k < numRemaining ? k : 0;
-		k = k == 0 ? numRemaining - 1 : k - 1; // Continue with the previous vertex (it might have become an ear)
+
+		// The neighbors' angles changed.
+		const uint32_t neighbors[2] = { ip, in };
+		for (uint32_t k = 0; k < 2; ++k) {
+			const uint32_t iv = neighbors[k];
+			isReflex[iv] = !(orient2d(vtx[prev[iv]], vtx[iv], vtx[next[iv]]) > 0.0);
+			if (isReflex[iv] && !isListed[iv]) {
+				const uint32_t cell = grid.getCellID(vtx[iv]);
+				reflexNext[iv] = reflexHead[cell];
+				reflexHead[cell] = (uint16_t)iv;
+				isListed[iv] = true;
+			}
+		}
+
+		c = in;
 		numTested = 0;
 	}
 
-	tri[0] = remaining[0];
-	tri[1] = remaining[1];
-	tri[2] = remaining[2];
+	tri[0] = prev[c];
+	tri[1] = (uint16_t)c;
+	tri[2] = next[c];
 
 	// Boundary: vertices 0..n-1, a single contour (first = 0, count = n)
 	uint16_t* boundary = stroker->m_SimplePolyBoundary;
