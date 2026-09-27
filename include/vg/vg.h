@@ -46,6 +46,16 @@
 #	define VG_CONFIG_ENABLE_ANALYTIC_SHAPES 1
 #endif
 
+// Draw immediate mode concave fills with stencil-then-cover instead of tesselating them on the CPU: the contours are
+// drawn as triangle fans into the stencil buffer (which accumulates the winding numbers), the AA fringe strips around
+// the contours are drawn where the stencil says a segment is on the boundary of the filled area and a cover quad
+// fills the interior. Requires a stencil buffer cleared to 0 at the start of the frame (the stencil is left at 0).
+// Fills inside clip regions, in command lists and paths whose geometry is in the path cache are tesselated as before.
+// Can be disabled per context (see ContextConfig::m_DisableStencilFills).
+#ifndef VG_CONFIG_ENABLE_STENCIL_FILLS
+#	define VG_CONFIG_ENABLE_STENCIL_FILLS 1
+#endif
+
 // Cached command list geometry is reused as long as the scale of the transform stays within this relative
 // tolerance of the scale it was generated with (e.g. 0.1 = +/-10%). Otherwise it's regenerated. Reusing it at a
 // slightly different scale slightly changes the width of the AA fringe and the flattening tolerance of curves.
@@ -384,6 +394,8 @@ struct ContextConfig
 	uint32_t m_FontAtlasImageFlags; // default: ImageFlags::Filter_Bilinear
 	uint32_t m_MaxCommandListDepth; // default: 16
 	bool m_ResetViewTransformOnEnd; // default: true
+	bool m_DisableStencilFills;     // default: false. Tesselate all concave fills (see VG_CONFIG_ENABLE_STENCIL_FILLS), e.g. when the frame buffer has no stencil.
+	bool m_MirroredView;            // default: false. Set if the view/projection transform mirrors the canvas (e.g. y up), so triangle facing is flipped. Used by stencil fills.
 };
 
 struct Stats

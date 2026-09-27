@@ -25,6 +25,7 @@ Strokes and fills are generated using the Stroker struct (`src/vg/stroker.cpp, .
 11. Anti-aliased solid color fills and strokes of rectangles, rounded rectangles and circles are drawn as single quads with analytic (signed distance) coverage in the fragment shader instead of generated geometry (`VG_CONFIG_ENABLE_ANALYTIC_SHAPES`).
 12. Laid out text strings (glyph quads per font, size and string) are cached across frames (`VG_CONFIG_TEXT_CACHE_MAX_STRINGS`).
 13. The geometry of immediate mode fills and strokes is cached across frames, keyed by the path, its parameters and the transform (except for the translation), so static content costs a copy per path after the first frames (`VG_CONFIG_PATH_CACHE_BUDGET`).
+14. Immediate mode concave fills which aren't in the path cache (i.e. dynamic content) are drawn with stencil-then-cover instead of being tesselated on the CPU: the contours are drawn as triangle fans into the stencil buffer, the AA fringe strips around the contours are drawn where the stencil says a segment is on the boundary of the filled area and a cover quad fills the interior (`VG_CONFIG_ENABLE_STENCIL_FILLS`, `ContextConfig::m_DisableStencilFills`). Requires a stencil buffer cleared to 0 at the start of the frame. The fringe around self-intersection points is approximate.
 
 ### What's not supported compared to NanoVG
 

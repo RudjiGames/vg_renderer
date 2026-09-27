@@ -32,6 +32,7 @@ inline Vec2 vec2PerpCCW(const Vec2& a)               { return{ -a.y, a.x }; }
 inline Vec2 vec2PerpCW(const Vec2& a)                { return{ a.y, -a.x }; }
 inline float vec2Cross(const Vec2& a, const Vec2& b) { return a.x * b.y - b.x * a.y; }
 inline float vec2Dot(const Vec2& a, const Vec2& b)   { return a.x * b.x + a.y * b.y; }
+inline float vec2LengthSqr(const Vec2& a)            { return a.x * a.x + a.y * a.y; }
 
 // Direction from a to b
 inline Vec2 vec2Dir(const Vec2& a, const Vec2& b)
@@ -3133,6 +3134,170 @@ static bool concaveFillEndAATwoSweeps(Stroker* stroker, Mesh* mesh, uint32_t col
 	}
 
 	setMeshFromStrokerBuffers(stroker, mesh);
+	return true;
+}
+
+bool strokerConcaveFillEndStencil(Stroker* stroker, Mesh* mesh, uint32_t color, bool aa, StencilFillGeometry* geom, const StrokerSink* sink)
+{
+	// Vertex layout (aa): 5 vertices per contour vertex p, with v = the extrusion vector scaled by half the fringe
+	// width: p (alpha/2), p + v (alpha), p - v (alpha), p + v (0), p - v (0). Non-AA: p (alpha). Followed by the 4
+	// cover vertices (alpha).
+	// The left side of a segment (p_i, p_j) is the side of p + v. Which side is the interior is decided per pixel
+	// by the renderer from the stencil values written by the fans (see StencilFillGeometry).
+	const uint32_t numContours = stroker->m_NumContours;
+	const uint32_t numContourVertices = stroker->m_NumContourVertices;
+	if (numContours == 0 || numContourVertices < 3) {
+		return false;
+	}
+
+	const uint32_t verticesPerPoint = aa ? 5 : 1;
+	const uint32_t numVertices = numContourVertices * verticesPerPoint + 4;
+	if (numVertices > 65536) {
+		return false;
+	}
+
+	uint32_t numFanIndices = 0;
+	for (uint32_t iContour = 0; iContour < numContours; ++iContour) {
+		const uint32_t n = stroker->m_ContourSizes[iContour];
+		VG_CHECK(n >= 3, "Contours with less than 3 vertices should have been skipped");
+		numFanIndices += (n - 2) * 3;
+	}
+
+	const uint32_t numFringeIndices = aa ? numContourVertices * 6 : 0; // Per strip (1 quad per segment)
+	const uint32_t numIndices = numFanIndices + numFringeIndices * 4 + 6;
+
+	GeometryOutput out;
+	beginGeometry(stroker, sink, numVertices, numIndices, true, &out);
+
+	Vec2* dstPos = out.m_Pos;
+	uint32_t* dstColor = out.m_Color;
+	uint16_t* dstFan = out.m_Index;
+	uint16_t* dstOuter = dstFan + numFanIndices;
+	uint16_t* dstInnerLeft = dstOuter + numFringeIndices * 2;
+	uint16_t* dstInnerRight = dstInnerLeft + numFringeIndices;
+	uint16_t* dstCover = dstInnerRight + numFringeIndices;
+
+	const uint32_t alpha = colorGetAlpha(color);
+	const Color colHalf = colorSetAlpha(color, (uint8_t)((alpha + 1) >> 1));
+	const Color col0 = colorSetAlpha(color, 0);
+	const float aaWidth = stroker->m_FringeWidth * 0.5f;
+
+	Vec2 bboxMin = stroker->m_ContourVertices[0];
+	Vec2 bboxMax = bboxMin;
+
+	const Vec2* contourVertices = stroker->m_ContourVertices;
+	uint32_t firstPoint = 0;
+	for (uint32_t iContour = 0; iContour < numContours; ++iContour) {
+		const uint32_t n = stroker->m_ContourSizes[iContour];
+		const Vec2* vtx = &contourVertices[firstPoint];
+
+		// Fan
+		const uint16_t fanBase = (uint16_t)(firstPoint * verticesPerPoint);
+		for (uint32_t i = 1; i + 1 < n; ++i) {
+			dstFan[0] = fanBase;
+			dstFan[1] = (uint16_t)(fanBase + i * verticesPerPoint);
+			dstFan[2] = (uint16_t)(fanBase + (i + 1) * verticesPerPoint);
+			dstFan += 3;
+		}
+
+		if (!aa) {
+			for (uint32_t i = 0; i < n; ++i) {
+				const Vec2 p = vtx[i];
+				dstPos[i] = p;
+				dstColor[i] = color;
+				bboxMin.x = bx::min(bboxMin.x, p.x);
+				bboxMin.y = bx::min(bboxMin.y, p.y);
+				bboxMax.x = bx::max(bboxMax.x, p.x);
+				bboxMax.y = bx::max(bboxMax.y, p.y);
+			}
+			dstPos += n;
+			dstColor += n;
+		} else {
+			Vec2 d01 = vec2Dir(vtx[n - 1], vtx[0]);
+			float len01 = vec2LengthSqr(vec2Sub(vtx[0], vtx[n - 1]));
+			for (uint32_t i = 0; i < n; ++i) {
+				const Vec2 p = vtx[i];
+				const Vec2 pNext = vtx[i + 1 == n ? 0 : i + 1];
+				const Vec2 d12 = vec2Dir(p, pNext);
+				const float len12 = vec2LengthSqr(vec2Sub(pNext, p));
+				// A hairpin (the contour reverses its direction) has no extrusion vector on the left side of both
+				// segments (the miter is infinite). Both segments lie on the same line, so the strips of the longer
+				// one cover the shorter one as well: use the normal of the longer segment (the strips of the shorter
+				// one collapse).
+				const bool hairpin = bx::abs(vec2Cross(d12, d01)) <= kMinExtrusionCross && vec2Dot(d01, d12) < 0.0f;
+				const Vec2 v = hairpin
+					? vec2Scale(vec2PerpCCW(len12 > len01 ? d12 : d01), aaWidth)
+					: vec2Scale(calcExtrusionVector(d01, d12), aaWidth);
+				const Vec2 pl = vec2Add(p, v);
+				const Vec2 pr = vec2Sub(p, v);
+				dstPos[0] = p;
+				dstPos[1] = pl;
+				dstPos[2] = pr;
+				dstPos[3] = pl;
+				dstPos[4] = pr;
+				dstColor[0] = colHalf;
+				dstColor[1] = color;
+				dstColor[2] = color;
+				dstColor[3] = col0;
+				dstColor[4] = col0;
+				dstPos += 5;
+				dstColor += 5;
+				d01 = d12;
+				len01 = len12;
+
+				bboxMin.x = bx::min(bboxMin.x, p.x);
+				bboxMin.y = bx::min(bboxMin.y, p.y);
+				bboxMax.x = bx::max(bboxMax.x, p.x);
+				bboxMax.y = bx::max(bboxMax.y, p.y);
+
+				// Strips of the segment (i, i + 1): quads (p_i, side_i, side_j, p_j)
+				const uint16_t bi = (uint16_t)(fanBase + i * 5);
+				const uint16_t bj = (uint16_t)(i + 1 == n ? fanBase : bi + 5);
+				dstOuter[0] = bi;     dstOuter[1] = (uint16_t)(bi + 3); dstOuter[2] = (uint16_t)(bj + 3);
+				dstOuter[3] = bi;     dstOuter[4] = (uint16_t)(bj + 3); dstOuter[5] = bj;
+				dstOuter[6] = bi;     dstOuter[7] = (uint16_t)(bj + 4); dstOuter[8] = (uint16_t)(bi + 4);
+				dstOuter[9] = bi;     dstOuter[10] = bj;                dstOuter[11] = (uint16_t)(bj + 4);
+				dstOuter += 12;
+				dstInnerLeft[0] = bi; dstInnerLeft[1] = (uint16_t)(bi + 1); dstInnerLeft[2] = (uint16_t)(bj + 1);
+				dstInnerLeft[3] = bi; dstInnerLeft[4] = (uint16_t)(bj + 1); dstInnerLeft[5] = bj;
+				dstInnerLeft += 6;
+				dstInnerRight[0] = bi; dstInnerRight[1] = (uint16_t)(bj + 2); dstInnerRight[2] = (uint16_t)(bi + 2);
+				dstInnerRight[3] = bi; dstInnerRight[4] = bj;                 dstInnerRight[5] = (uint16_t)(bj + 2);
+				dstInnerRight += 6;
+			}
+		}
+
+		firstPoint += n;
+	}
+
+	// Cover quad
+	{
+		const uint16_t base = (uint16_t)(numContourVertices * verticesPerPoint);
+		dstPos[0] = { bboxMin.x, bboxMin.y };
+		dstPos[1] = { bboxMax.x, bboxMin.y };
+		dstPos[2] = { bboxMax.x, bboxMax.y };
+		dstPos[3] = { bboxMin.x, bboxMax.y };
+		dstColor[0] = color;
+		dstColor[1] = color;
+		dstColor[2] = color;
+		dstColor[3] = color;
+		dstPos += 4;
+		dstColor += 4;
+		dstCover[0] = base;
+		dstCover[1] = (uint16_t)(base + 1);
+		dstCover[2] = (uint16_t)(base + 2);
+		dstCover[3] = base;
+		dstCover[4] = (uint16_t)(base + 2);
+		dstCover[5] = (uint16_t)(base + 3);
+		dstCover += 6;
+	}
+
+	geom->m_NumFanIndices = numFanIndices;
+	geom->m_NumOuterFringeIndices = numFringeIndices * 2;
+	geom->m_NumInnerLeftIndices = numFringeIndices;
+	geom->m_NumInnerRightIndices = numFringeIndices;
+
+	endGeometry(stroker, &out, dstPos, dstCover, true, mesh);
 	return true;
 }
 

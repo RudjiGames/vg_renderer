@@ -143,10 +143,36 @@ struct DrawCommand
 	uint16_t m_ScissorRect[4];
 	uint16_t m_HandleID; // Type::Textured => ImageHandle, Type::ColorGradient => GradientHandle, Type::ImagePattern => ImagePatternHandle
 	uint32_t m_FirstShapeVertexID; // Type::Shape => first vertex in Context::m_ShapeVertices
+	// Stencil-then-cover fills (see createStencilFillCommand()): 0 = regular command, 1 = FillRule::NonZero,
+	// 2 = FillRule::EvenOdd. The indices are drawn in several passes (see end() and StencilFillGeometry).
+	uint8_t m_StencilFill;
+	uint32_t m_NumStencilIndices[4]; // Fans, outer fringe, inner left fringe, inner right fringe. The last 6 indices are the cover quad.
 };
 
-// A rectangle, rounded rectangle or circle added to an empty path. It's converted to path vertices only if the path
-// can't be drawn as an analytic shape (see drawPendingShape()).
+// Path commands are recorded (see recordPathCmd()) and flattened into the Path only when the vertices are needed
+// (see flattenPath()): a cached path (see pathCacheLookup()) or an analytic shape never needs them.
+struct PathCmd
+{
+	enum Enum : uint32_t
+	{
+		MoveTo,             // x, y
+		LineTo,             // x, y
+		CubicTo,            // c1x, c1y, c2x, c2y, x, y
+		QuadraticTo,        // cx, cy, x, y
+		Arc,                // cx, cy, r, a0, a1, dir
+		ArcTo,              // x1, y1, x2, y2, r
+		Rect,               // x, y, w, h
+		RoundedRect,        // x, y, w, h, r
+		RoundedRectVarying, // x, y, w, h, rtl, rtr, rbr, rbl
+		Circle,             // cx, cy, r
+		Ellipse,            // cx, cy, rx, ry
+		Polyline,           // numPoints, coords...
+		Close,
+	};
+};
+
+// A path consisting of a single rectangle, rounded rectangle or circle, which can be drawn as an analytic shape
+// (see getPendingShape() and drawPendingShape()).
 struct PendingShape
 {
 	struct Type
@@ -213,9 +239,9 @@ struct PathCacheKey
 	float m_Mtx[4];       // Linear part of the transform
 	float m_Width;        // Stroke width (0 for fills)
 	float m_FringeWidth;
+	float m_Tolerance;    // Tesselation tolerance (flattening)
 	uint32_t m_Flags;     // Fill/stroke flags
-	uint32_t m_NumVertices;
-	uint32_t m_NumSubPaths;
+	uint32_t m_NumCmdWords;
 	uint32_t m_Kind;      // 0 = fill, 1 = stroke
 };
 
@@ -223,7 +249,7 @@ struct PathCacheEntry
 {
 	uint64_t m_Hash;
 	PathCacheKey m_Key;
-	uint8_t* m_Data;         // Path vertices, sub paths, mesh positions, alpha mask and indices (see pathCacheInsert())
+	uint8_t* m_Data;         // Path commands, mesh positions, alpha mask and indices (see pathCacheCaptureEnd())
 	uint32_t m_DataSize;
 	uint32_t m_NumMeshVertices;
 	uint32_t m_NumMeshIndices;
@@ -572,7 +598,10 @@ struct Context
 
 	float* m_TransformedVertices;
 	uint32_t m_TransformedVertexCapacity;
-	PendingShape m_PendingShape;       // A shape added to the (still empty) path, not converted to path vertices yet
+	uint32_t* m_PathCmds;              // Recorded commands of the current path (see recordPathCmd()). Grow-only.
+	uint32_t m_NumPathCmdWords;
+	uint32_t m_PathCmdCapacity;
+	bool m_PathFlattened;              // m_Path holds the vertices of m_PathCmds (see flattenPath())
 	float* m_ShapeVertices;            // Per vertex shape parameters of Type::Shape draw commands (kShapeVertexSize floats each):
 	uint32_t m_NumShapeVertices;       // m_ShapeTransientBuffer's data or m_ShapeHeapVertices (see growShapeVertices())
 	uint32_t m_ShapeVertexCapacity;    // Capacity of m_ShapeVertices (0 until the first shape of the frame)
@@ -678,10 +707,12 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 static void createDrawCommand_ImagePattern(Context* ctx, ImagePatternHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 static void createDrawCommand_ColorGradient(Context* ctx, GradientHandle handle, const float* vtx, uint32_t numVertices, const uint32_t* colors, uint32_t numColors, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
 static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numVertices, const uint16_t* indices, uint32_t numIndices, const float* mtx = nullptr);
-static void flushPendingShape(Context* ctx);
-static bool deferShape(Context* ctx, PendingShape::Type::Enum type, const float* args, uint32_t numArgs);
-static bool pendingShapeHasSharpCorners(const Context* ctx);
-static bool drawPendingShape(Context* ctx, Color color, uint32_t mode, float halfStrokeWidth, bool sharpCorners);
+static uint32_t* allocPathCmd(Context* ctx, PathCmd::Enum cmd, uint32_t numArgs);
+static void recordPathCmd(Context* ctx, PathCmd::Enum cmd, const float* args, uint32_t numArgs);
+static void flattenPath(Context* ctx);
+static bool getPendingShape(const Context* ctx, PendingShape* shape);
+static bool pendingShapeHasSharpCorners(const PendingShape* shape);
+static bool drawPendingShape(Context* ctx, const PendingShape* shape, Color color, uint32_t mode, float halfStrokeWidth, bool sharpCorners);
 
 // Makes the stroker write its geometry directly into the vertex/index buffers of a draw command, which is
 // equivalent to (but avoids the copies of) generating the mesh into the stroker's buffers and calling
@@ -695,8 +726,12 @@ struct DrawCommandSink
 	uint16_t m_Handle;
 	Color m_Color;     // Vertex color used when the stroker doesn't generate colors (non-AA meshes)
 	bool m_FillColor;
+	bool m_Allocated;  // Set when the stroker has written its geometry into a draw command
 };
 static const StrokerSink* initDrawCommandSink(DrawCommandSink* sink, Context* ctx, DrawCommand::Type::Enum type, uint16_t handle, Color color, bool fillColor);
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+static bool createStencilFillCommand(Context* ctx, DrawCommand::Type::Enum type, uint16_t handle, Color color, bool aa, FillRule::Enum fillRule, const float* pathVertices);
+#endif
 
 static ImageHandle allocImage(Context* ctx);
 static void resetImage(Image* img);
@@ -963,7 +998,9 @@ Context* createContext(bx::AllocatorI* allocator, const ContextConfig* userCfg)
 		65536,                       // m_MaxVBVertices
 		ImageFlags::Filter_Bilinear, // m_FontAtlasImageFlags
 		16,                          // m_MaxCommandListDepth
-		true                         // m_ResetViewTransformOnEnd
+		true,                        // m_ResetViewTransformOnEnd
+		false,                       // m_DisableStencilFills
+		false,                       // m_MirroredView
 	};
 
 	const ContextConfig* cfg = userCfg ? userCfg : &defaultConfig;
@@ -1295,6 +1332,9 @@ void destroyContext(Context* ctx)
 
 	destroyPath(ctx->m_Path);
 	ctx->m_Path = nullptr;
+	bx::free(allocator, ctx->m_PathCmds);
+	ctx->m_PathCmds = nullptr;
+	ctx->m_PathCmdCapacity = 0;
 
 	destroyStroker(ctx->m_Stroker);
 	ctx->m_Stroker = nullptr;
@@ -1369,7 +1409,8 @@ void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasH
 	ctx->m_ShapeVertices = nullptr;
 	ctx->m_ShapeVertexCapacity = 0;
 	ctx->m_ShapeTransient = false;
-	ctx->m_PendingShape.m_Type = PendingShape::Type::None;
+	ctx->m_NumPathCmdWords = 0;
+	ctx->m_PathFlattened = true;
 
 	ctx->m_NumClipCommands = 0;
 	ctx->m_ForceNewClipCommand = true;
@@ -1563,8 +1604,16 @@ void end(Context* ctx)
 	uint16_t prevScissorRect[4] = { 0, 0, canvasWidth, canvasHeight};
 	uint16_t prevScissorID = UINT16_MAX;
 	uint32_t prevClipCmdID = UINT32_MAX;
+	uint32_t prevNumClipCommands = 0;
 	uint32_t stencilState = BGFX_STENCIL_NONE;
 	uint8_t nextStencilValue = 1; // 0 after wrapping around (see below)
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+	// Stencil fills require a stencil buffer which is 0 outside the active clip region (see below).
+	const bool stencilFills = !ctx->m_Config.m_DisableStencilFills;
+	const bool mirroredView = ctx->m_Config.m_MirroredView;
+#else
+	const bool stencilFills = false;
+#endif
 
 	auto submitClipCommand = [&](const DrawCommand* clipCmd, uint8_t stencilValue) {
 		GPUVertexBuffer* gpuvb = &ctx->m_GPUVertexBuffers[clipCmd->m_VertexBufferID];
@@ -1613,7 +1662,16 @@ void end(Context* ctx)
 
 		const ClipState* cmdClipState = &cmd->m_ClipState;
 		if (cmdClipState->m_FirstCmdID != prevClipCmdID) {
+			if (stencilFills && prevNumClipCommands != 0) {
+				// Reset the stencil values written by the previous clip region so the stencil buffer is 0 again
+				// (stencil fills accumulate winding numbers on top of whatever is in the stencil buffer).
+				for (uint32_t iClip = 0; iClip < prevNumClipCommands; ++iClip) {
+					submitClipCommand(&ctx->m_ClipCommands[prevClipCmdID + iClip], 0);
+				}
+			}
+
 			prevClipCmdID = cmdClipState->m_FirstCmdID;
+			prevNumClipCommands = cmdClipState->m_NumCmds;
 			const uint32_t numClipCommands = cmdClipState->m_NumCmds;
 			if (numClipCommands) {
 				if (nextStencilValue == 0) {
@@ -1670,57 +1728,152 @@ void end(Context* ctx)
 			}
 		}
 
-		if (cmd->m_Type == DrawCommand::Type::Textured) {
-			VG_CHECK(cmd->m_HandleID != UINT16_MAX, "Invalid image handle");
-			Image* tex = &ctx->m_Images[cmd->m_HandleID];
+		if (cmd->m_Type == DrawCommand::Type::Textured || cmd->m_Type == DrawCommand::Type::ColorGradient || cmd->m_Type == DrawCommand::Type::ImagePattern) {
+			// Binds the paint (texture and uniforms) of the command; returns its program.
+			auto bindPaint = [&]() -> bgfx::ProgramHandle {
+				if (cmd->m_Type == DrawCommand::Type::Textured) {
+					VG_CHECK(cmd->m_HandleID != UINT16_MAX, "Invalid image handle");
+					Image* tex = &ctx->m_Images[cmd->m_HandleID];
+					bgfx::setTexture(0, ctx->m_TexUniform, tex->m_bgfxHandle, tex->m_Flags);
+				} else if (cmd->m_Type == DrawCommand::Type::ColorGradient) {
+					VG_CHECK(cmd->m_HandleID != UINT16_MAX, "Invalid gradient handle");
+					Gradient* grad = &ctx->m_Gradients[cmd->m_HandleID];
+					bgfx::setUniform(ctx->m_PaintMatUniform, grad->m_Matrix, 1);
+					bgfx::setUniform(ctx->m_ExtentRadiusFeatherUniform, grad->m_Params, 1);
+					bgfx::setUniform(ctx->m_InnerColorUniform, grad->m_InnerColor, 1);
+					bgfx::setUniform(ctx->m_OuterColorUniform, grad->m_OuterColor, 1);
+				} else {
+					VG_CHECK(cmd->m_HandleID != UINT16_MAX, "Invalid image pattern handle");
+					ImagePattern* imgPattern = &ctx->m_ImagePatterns[cmd->m_HandleID];
+					VG_CHECK(isValid(imgPattern->m_ImageHandle), "Invalid image handle in pattern");
+					Image* tex = &ctx->m_Images[imgPattern->m_ImageHandle.idx];
+					bgfx::setTexture(0, ctx->m_TexUniform, tex->m_bgfxHandle, tex->m_Flags);
+					bgfx::setUniform(ctx->m_PaintMatUniform, imgPattern->m_Matrix, 1);
+				}
+				return ctx->m_ProgramHandle[cmd->m_Type];
+			};
 
+			// Binds the vertex streams of the command, a range of its indices and its scissor rect (bgfx discards them
+			// after each submit).
+			auto bindGeometry = [&](uint32_t firstIndex, uint32_t numIndices) {
+				bgfx::setScissor(prevScissorID);
 #if VG_CONFIG_USE_TRANSIENT_BUFFERS
-			bgfx::setVertexBuffer(2, &gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				bgfx::setVertexBuffer(0, &gpuvb->m_PosBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				bgfx::setVertexBuffer(1, &gpuvb->m_ColorBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				if (cmd->m_Type == DrawCommand::Type::Textured) {
+					bgfx::setVertexBuffer(2, &gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				}
+				bgfx::setIndexBuffer(&indexBuffer, firstIndex, numIndices);
 #else
-			bgfx::setVertexBuffer(2, gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				bgfx::setVertexBuffer(0, gpuvb->m_PosBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				bgfx::setVertexBuffer(1, gpuvb->m_ColorBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				if (cmd->m_Type == DrawCommand::Type::Textured) {
+					bgfx::setVertexBuffer(2, gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+				}
+				bgfx::setIndexBuffer(gpuib->m_bgfxHandle, firstIndex, numIndices);
 #endif
-			bgfx::setTexture(0, ctx->m_TexUniform, tex->m_bgfxHandle, tex->m_Flags);
+			};
 
-			bgfx::setState(0
+			const uint64_t paintState = 0
 				| BGFX_STATE_WRITE_A
 				| BGFX_STATE_WRITE_RGB
-				| BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA));
-			bgfx::setStencil(stencilState);
+				| BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA);
 
-			bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::Textured]);
-		} else if (cmd->m_Type == DrawCommand::Type::ColorGradient) {
-			VG_CHECK(cmd->m_HandleID != UINT16_MAX, "Invalid gradient handle");
-			Gradient* grad = &ctx->m_Gradients[cmd->m_HandleID];
+			if (cmd->m_StencilFill == 0) {
+				if (cmd->m_Type == DrawCommand::Type::Textured) {
+#if VG_CONFIG_USE_TRANSIENT_BUFFERS
+					bgfx::setVertexBuffer(2, &gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+#else
+					bgfx::setVertexBuffer(2, gpuvb->m_UVBufferHandle, cmd->m_FirstVertexID, cmd->m_NumVertices);
+#endif
+				}
+				const bgfx::ProgramHandle program = bindPaint();
+				bgfx::setState(paintState);
+				bgfx::setStencil(stencilState);
+				bgfx::submit(viewID, program);
+			} else {
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+				// Stencil-then-cover fill (see createStencilFillCommand() and strokerConcaveFillEndStencil()).
+				// 1. The triangle fans of the contours accumulate the winding number of each pixel in the stencil
+				//    buffer (front facing triangles: +1, back facing: -1; even-odd: invert), starting from 0.
+				// 2. The fringe strips on both sides of each contour segment are drawn where the stencil is 0
+				//    (outside the filled area), fading from alpha/2 on the segment to 0.
+				// 3. The fringe strips on the left side of each segment are drawn where the winding number is 1
+				//    (and, being right across the segment, 0 on its right side, i.e. the segment is a boundary of the
+				//    filled area with the interior on its left) and the strips on the right side where it's -1.
+				//    These fade from alpha/2 on the segment to alpha and reset the stencil to 0 so the cover skips
+				//    them. Even-odd: both sides where the stencil is non zero (every segment is a boundary).
+				// 4. The cover quad fills the pixels whose stencil is still non zero and resets the stencil to 0.
+				// The stencil buffer is 0 everywhere at this point (see submitClipCommand() and the clip region reset
+				// above), so the fill leaves it at 0 as well.
+				VG_CHECK(stencilState == BGFX_STENCIL_NONE, "Stencil fills cannot be clipped");
 
-			bgfx::setUniform(ctx->m_PaintMatUniform, grad->m_Matrix, 1);
-			bgfx::setUniform(ctx->m_ExtentRadiusFeatherUniform, grad->m_Params, 1);
-			bgfx::setUniform(ctx->m_InnerColorUniform, grad->m_InnerColor, 1);
-			bgfx::setUniform(ctx->m_OuterColorUniform, grad->m_OuterColor, 1);
+				const bool nonZero = cmd->m_StencilFill == 1;
+				const uint32_t* numPassIndices = cmd->m_NumStencilIndices;
+				uint32_t firstIndex = cmd->m_FirstIndexID;
 
-			bgfx::setState(0
-				| BGFX_STATE_WRITE_A
-				| BGFX_STATE_WRITE_RGB
-				| BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA));
-			bgfx::setStencil(stencilState);
+				// Winding numbers
+				{
+					const uint32_t fanState = BGFX_STENCIL_TEST_ALWAYS | BGFX_STENCIL_FUNC_RMASK(0xff) | BGFX_STENCIL_OP_FAIL_S_KEEP | BGFX_STENCIL_OP_FAIL_Z_KEEP;
+					const uint32_t frontOp = !nonZero ? BGFX_STENCIL_OP_PASS_Z_INVERT : (mirroredView ? BGFX_STENCIL_OP_PASS_Z_DECR : BGFX_STENCIL_OP_PASS_Z_INCR);
+					const uint32_t backOp = !nonZero ? BGFX_STENCIL_OP_PASS_Z_INVERT : (mirroredView ? BGFX_STENCIL_OP_PASS_Z_INCR : BGFX_STENCIL_OP_PASS_Z_DECR);
+					bindGeometry(firstIndex, numPassIndices[0]);
+					firstIndex += numPassIndices[0];
+					bgfx::setState(0);
+					bgfx::setStencil(fanState | frontOp, fanState | backOp);
+					bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::Clip]);
+				}
 
-			bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::ColorGradient]);
-		} else if(cmd->m_Type == DrawCommand::Type::ImagePattern) {
-			VG_CHECK(cmd->m_HandleID != UINT16_MAX, "Invalid image pattern handle");
-			ImagePattern* imgPattern = &ctx->m_ImagePatterns[cmd->m_HandleID];
+				if (numPassIndices[1] != 0) {
+					// Outer fringe
+					bindGeometry(firstIndex, numPassIndices[1]);
+					firstIndex += numPassIndices[1];
+					bgfx::ProgramHandle program = bindPaint();
+					bgfx::setState(paintState);
+					bgfx::setStencil(BGFX_STENCIL_TEST_EQUAL | BGFX_STENCIL_FUNC_REF(0) | BGFX_STENCIL_FUNC_RMASK(0xff) | BGFX_STENCIL_OP_FAIL_S_KEEP | BGFX_STENCIL_OP_FAIL_Z_KEEP | BGFX_STENCIL_OP_PASS_Z_KEEP);
+					bgfx::submit(viewID, program);
 
-			VG_CHECK(isValid(imgPattern->m_ImageHandle), "Invalid image handle in pattern");
-			Image* tex = &ctx->m_Images[imgPattern->m_ImageHandle.idx];
+					// Inner fringe
+					const uint32_t innerState = BGFX_STENCIL_TEST_EQUAL | BGFX_STENCIL_FUNC_RMASK(0xff) | BGFX_STENCIL_OP_FAIL_S_KEEP | BGFX_STENCIL_OP_FAIL_Z_KEEP | BGFX_STENCIL_OP_PASS_Z_ZERO;
+					if (nonZero) {
+						bindGeometry(firstIndex, numPassIndices[2]);
+						firstIndex += numPassIndices[2];
+						program = bindPaint();
+						bgfx::setState(paintState);
+						bgfx::setStencil(innerState | BGFX_STENCIL_FUNC_REF(1));
+						bgfx::submit(viewID, program);
 
-			bgfx::setTexture(0, ctx->m_TexUniform, tex->m_bgfxHandle, tex->m_Flags);
-			bgfx::setUniform(ctx->m_PaintMatUniform, imgPattern->m_Matrix, 1);
+						bindGeometry(firstIndex, numPassIndices[3]);
+						firstIndex += numPassIndices[3];
+						program = bindPaint();
+						bgfx::setState(paintState);
+						bgfx::setStencil(innerState | BGFX_STENCIL_FUNC_REF(0xff));
+						bgfx::submit(viewID, program);
+					} else {
+						bindGeometry(firstIndex, numPassIndices[2] + numPassIndices[3]);
+						firstIndex += numPassIndices[2] + numPassIndices[3];
+						program = bindPaint();
+						bgfx::setState(paintState);
+						bgfx::setStencil(innerState | BGFX_STENCIL_FUNC_REF(0xff));
+						bgfx::submit(viewID, program);
+					}
+				}
 
-			bgfx::setState(0
-				| BGFX_STATE_WRITE_A
-				| BGFX_STATE_WRITE_RGB
-				| BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA));
-			bgfx::setStencil(stencilState);
-
-			bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::ImagePattern]);
+				// Cover
+				{
+					VG_CHECK(firstIndex + 6 == cmd->m_FirstIndexID + cmd->m_NumIndices, "Invalid stencil fill geometry");
+					bindGeometry(firstIndex, 6);
+					const bgfx::ProgramHandle program = bindPaint();
+					bgfx::setState(paintState);
+					bgfx::setStencil(BGFX_STENCIL_TEST_NOTEQUAL | BGFX_STENCIL_FUNC_REF(0) | BGFX_STENCIL_FUNC_RMASK(0xff) | BGFX_STENCIL_OP_FAIL_S_KEEP | BGFX_STENCIL_OP_FAIL_Z_KEEP | BGFX_STENCIL_OP_PASS_Z_ZERO);
+					bgfx::submit(viewID, program);
+				}
+#else
+				VG_CHECK(false, "Stencil fills are disabled");
+				BX_UNUSED(bindGeometry);
+				bgfx::discard();
+#endif
+			}
 		} else if (cmd->m_Type == DrawCommand::Type::Shape) {
 			if (!hasShapeVertexBuffer) {
 				bgfx::discard();
@@ -1737,6 +1890,13 @@ void end(Context* ctx)
 			bgfx::submit(viewID, ctx->m_ProgramHandle[DrawCommand::Type::Shape]);
 		} else {
 			VG_CHECK(false, "Unknown draw command type");
+		}
+	}
+
+	if (stencilFills && prevNumClipCommands != 0) {
+		// Leave the stencil buffer at 0 (see the clip region reset above).
+		for (uint32_t iClip = 0; iClip < prevNumClipCommands; ++iClip) {
+			submitClipCommand(&ctx->m_ClipCommands[prevClipCmdID + iClip], 0);
 		}
 	}
 }
@@ -3435,7 +3595,8 @@ static void ctxBeginPath(Context* ctx)
 
 	pathReset(path, avgScale, testTol);
 	strokerReset(stroker, avgScale, testTol, fringeWidth);
-	ctx->m_PendingShape.m_Type = PendingShape::Type::None;
+	ctx->m_NumPathCmdWords = 0;
+	ctx->m_PathFlattened = true;
 	ctx->m_PathTransformed = false;
 	ctx->m_PathBoundsValid = false;
 }
@@ -3443,107 +3604,107 @@ static void ctxBeginPath(Context* ctx)
 static void ctxMoveTo(Context* ctx, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathMoveTo(ctx->m_Path, x, y);
+	uint32_t* w = allocPathCmd(ctx, PathCmd::MoveTo, 2);
+	w[0] = bx::floatToBits(x);
+	w[1] = bx::floatToBits(y);
 }
 
 static void ctxLineTo(Context* ctx, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathLineTo(ctx->m_Path, x, y);
+	uint32_t* w = allocPathCmd(ctx, PathCmd::LineTo, 2);
+	w[0] = bx::floatToBits(x);
+	w[1] = bx::floatToBits(y);
 }
 
 static void ctxCubicTo(Context* ctx, float c1x, float c1y, float c2x, float c2y, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathCubicTo(ctx->m_Path, c1x, c1y, c2x, c2y, x, y);
+	uint32_t* w = allocPathCmd(ctx, PathCmd::CubicTo, 6);
+	w[0] = bx::floatToBits(c1x);
+	w[1] = bx::floatToBits(c1y);
+	w[2] = bx::floatToBits(c2x);
+	w[3] = bx::floatToBits(c2y);
+	w[4] = bx::floatToBits(x);
+	w[5] = bx::floatToBits(y);
 }
 
 static void ctxQuadraticTo(Context* ctx, float cx, float cy, float x, float y)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathQuadraticTo(ctx->m_Path, cx, cy, x, y);
+	uint32_t* w = allocPathCmd(ctx, PathCmd::QuadraticTo, 4);
+	w[0] = bx::floatToBits(cx);
+	w[1] = bx::floatToBits(cy);
+	w[2] = bx::floatToBits(x);
+	w[3] = bx::floatToBits(y);
 }
 
 static void ctxArc(Context* ctx, float cx, float cy, float r, float a0, float a1, Winding::Enum dir)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathArc(ctx->m_Path, cx, cy, r, a0, a1, dir);
+	uint32_t* w = allocPathCmd(ctx, PathCmd::Arc, 6);
+	w[0] = bx::floatToBits(cx);
+	w[1] = bx::floatToBits(cy);
+	w[2] = bx::floatToBits(r);
+	w[3] = bx::floatToBits(a0);
+	w[4] = bx::floatToBits(a1);
+	w[5] = (uint32_t)dir;
 }
 
 static void ctxArcTo(Context* ctx, float x1, float y1, float x2, float y2, float r)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathArcTo(ctx->m_Path, x1, y1, x2, y2, r);
+	const float args[] = { x1, y1, x2, y2, r };
+	recordPathCmd(ctx, PathCmd::ArcTo, args, 5);
 }
 
 static void ctxRect(Context* ctx, float x, float y, float w, float h)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
 	const float args[] = { x, y, w, h };
-	if (!deferShape(ctx, PendingShape::Type::Rect, args, 4)) {
-		flushPendingShape(ctx);
-		pathRect(ctx->m_Path, x, y, w, h);
-	}
+	recordPathCmd(ctx, PathCmd::Rect, args, 4);
 }
 
 static void ctxRoundedRect(Context* ctx, float x, float y, float w, float h, float r)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
 	const float args[] = { x, y, w, h, r };
-	if (!deferShape(ctx, PendingShape::Type::RoundedRect, args, 5)) {
-		flushPendingShape(ctx);
-		pathRoundedRect(ctx->m_Path, x, y, w, h, r);
-	}
+	recordPathCmd(ctx, PathCmd::RoundedRect, args, 5);
 }
 
 static void ctxRoundedRectVarying(Context* ctx, float x, float y, float w, float h, float rtl, float rtr, float rbr, float rbl)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
 	const float args[] = { x, y, w, h, rtl, rtr, rbr, rbl };
-	if (!deferShape(ctx, PendingShape::Type::RoundedRectVarying, args, 8)) {
-		flushPendingShape(ctx);
-		pathRoundedRectVarying(ctx->m_Path, x, y, w, h, rtl, rtr, rbr, rbl);
-	}
+	recordPathCmd(ctx, PathCmd::RoundedRectVarying, args, 8);
 }
 
 static void ctxCircle(Context* ctx, float cx, float cy, float radius)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
 	const float args[] = { cx, cy, radius };
-	if (!deferShape(ctx, PendingShape::Type::Circle, args, 3)) {
-		flushPendingShape(ctx);
-		pathCircle(ctx->m_Path, cx, cy, radius);
-	}
+	recordPathCmd(ctx, PathCmd::Circle, args, 3);
 }
 
 static void ctxEllipse(Context* ctx, float cx, float cy, float rx, float ry)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	const float args[] = { cx, cy, rx };
-	if (rx != ry || !deferShape(ctx, PendingShape::Type::Circle, args, 3)) {
-		flushPendingShape(ctx);
-		pathEllipse(ctx->m_Path, cx, cy, rx, ry);
-	}
+	const float args[] = { cx, cy, rx, ry };
+	recordPathCmd(ctx, PathCmd::Ellipse, args, 4);
 }
 
 static void ctxPolyline(Context* ctx, const float* coords, uint32_t numPoints)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathPolyline(ctx->m_Path, coords, numPoints);
+	uint32_t* w = allocPathCmd(ctx, PathCmd::Polyline, 1 + numPoints * 2);
+	w[0] = numPoints;
+	memcpy(w + 1, coords, sizeof(float) * 2 * numPoints);
 }
 
 static void ctxClosePath(Context* ctx)
 {
 	VG_CHECK(!ctx->m_PathTransformed, "Call beginPath() before starting a new path");
-	flushPendingShape(ctx);
-	pathClose(ctx->m_Path);
+	allocPathCmd(ctx, PathCmd::Close, 0);
 }
 
 static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
@@ -3571,13 +3732,12 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 #endif
 
 	// Analytic shapes aren't recorded in caches or used as clip shapes.
-	if (ctx->m_PendingShape.m_Type != PendingShape::Type::None && aa && !hasCache && !recordClipCommands) {
-		if (drawPendingShape(ctx, col, 0, 0.0f, true)) {
+	PendingShape pendingShape;
+	if (aa && !hasCache && !recordClipCommands && getPendingShape(ctx, &pendingShape)) {
+		if (drawPendingShape(ctx, &pendingShape, col, 0, 0.0f, true)) {
 			return;
 		}
 	}
-
-	flushPendingShape(ctx);
 
 #if VG_CONFIG_PATH_CACHE_BUDGET
 	PathCacheCapture pathCapture;
@@ -3596,6 +3756,13 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 
 	const float* pathVertices = transformPath(ctx);
 	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	const bool stencilFillCaptured = pathCapture.m_Active;
+#else
+	const bool stencilFillCaptured = false;
+#endif
+#endif
 	const FillRule::Enum fillRule = VG_FILL_FLAGS_RULE(flags);
 
 	const Path* path = ctx->m_Path;
@@ -3658,6 +3825,13 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 			}
 		}
 	} else if (pathType == PathType::Concave) {
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+		// Paths which are being captured into the path cache are tesselated so their cached geometry is a single mesh.
+		if (!hasCache && !recordClipCommands && !stencilFillCaptured && createStencilFillCommand(ctx, DrawCommand::Type::Textured, ctx->m_FontImages[0].idx, col, aa, fillRule, pathVertices)) {
+			return;
+		}
+#endif
+
 		strokerConcaveFillBegin(stroker);
 		for (uint32_t i = 0; i < numSubPaths; ++i) {
 			const SubPath* subPath = &subPaths[i];
@@ -3722,8 +3896,6 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 	const bool hasCache = false;
 #endif
 
-	flushPendingShape(ctx);
-
 #if VG_CONFIG_PATH_CACHE_BUDGET
 	PathCacheCapture pathCapture;
 	pathCapture.m_Active = false;
@@ -3742,6 +3914,13 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 	const float* pathVertices = transformPath(ctx);
 
 	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	const bool stencilFillCaptured = pathCapture.m_Active;
+#else
+	const bool stencilFillCaptured = false;
+#endif
+#endif
 	const FillRule::Enum fillRule = VG_FILL_FLAGS_RULE(flags);
 #if VG_CONFIG_FORCE_AA_OFF
 	const bool aa = false;
@@ -3809,6 +3988,13 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 			createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	} else if (pathType == PathType::Concave) {
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+		// Paths which are being captured into the path cache are tesselated so their cached geometry is a single mesh.
+		if (!hasCache && !stencilFillCaptured && createStencilFillCommand(ctx, DrawCommand::Type::ColorGradient, gradientHandle.idx, black, aa, fillRule, pathVertices)) {
+			return;
+		}
+#endif
+
 		strokerConcaveFillBegin(stroker);
 		for (uint32_t i = 0; i < numSubPaths; ++i) {
 			const SubPath* subPath = &subPaths[i];
@@ -3874,16 +4060,6 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 		return;
 	}
 
-	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
-	const FillRule::Enum fillRule = VG_FILL_FLAGS_RULE(flags);
-#if VG_CONFIG_FORCE_AA_OFF
-	const bool aa = false;
-#else
-	const bool aa = VG_FILL_FLAGS_AA(flags);
-#endif
-
-	flushPendingShape(ctx);
-
 #if VG_CONFIG_PATH_CACHE_BUDGET
 	PathCacheCapture pathCapture;
 	pathCapture.m_Active = false;
@@ -3897,6 +4073,21 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 			return;
 		}
 	}
+#endif
+
+	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	const bool stencilFillCaptured = pathCapture.m_Active;
+#else
+	const bool stencilFillCaptured = false;
+#endif
+#endif
+	const FillRule::Enum fillRule = VG_FILL_FLAGS_RULE(flags);
+#if VG_CONFIG_FORCE_AA_OFF
+	const bool aa = false;
+#else
+	const bool aa = VG_FILL_FLAGS_AA(flags);
 #endif
 
 	const float* pathVertices = transformPath(ctx);
@@ -3949,6 +4140,13 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 			createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 		}
 	} else if (pathType == PathType::Concave) {
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+		// Paths which are being captured into the path cache are tesselated so their cached geometry is a single mesh.
+		if (!hasCache && !stencilFillCaptured && createStencilFillCommand(ctx, DrawCommand::Type::ImagePattern, imgPatternHandle.idx, col, aa, fillRule, pathVertices)) {
+			return;
+		}
+#endif
+
 		strokerConcaveFillBegin(stroker);
 		for (uint32_t i = 0; i < numSubPaths; ++i) {
 			const SubPath* subPath = &subPaths[i];
@@ -4035,15 +4233,14 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 
 	// Analytic shapes aren't recorded in caches or used as clip shapes. Corners with a radius of 0 are joins: miter
 	// joins are sharp and round joins are round (thin strokes use bevel joins instead of round joins).
-	if (ctx->m_PendingShape.m_Type != PendingShape::Type::None && aa && !hasCache && !recordClipCommands) {
-		if (lineJoin == LineJoin::Miter || (lineJoin == LineJoin::Round && !isThin) || !pendingShapeHasSharpCorners(ctx)) {
-			if (drawPendingShape(ctx, col, isThin ? 2 : 1, strokeWidth * 0.5f, lineJoin == LineJoin::Miter)) {
+	PendingShape pendingShape;
+	if (aa && !hasCache && !recordClipCommands && getPendingShape(ctx, &pendingShape)) {
+		if (lineJoin == LineJoin::Miter || (lineJoin == LineJoin::Round && !isThin) || !pendingShapeHasSharpCorners(&pendingShape)) {
+			if (drawPendingShape(ctx, &pendingShape, col, isThin ? 2 : 1, strokeWidth * 0.5f, lineJoin == LineJoin::Miter)) {
 				return;
 			}
 		}
 	}
-
-	flushPendingShape(ctx);
 
 #if VG_CONFIG_PATH_CACHE_BUDGET
 	PathCacheCapture pathCapture;
@@ -4167,8 +4364,6 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 #else
 	const bool aa = VG_STROKE_FLAGS_AA(flags);
 #endif
-
-	flushPendingShape(ctx);
 
 #if VG_CONFIG_PATH_CACHE_BUDGET
 	PathCacheCapture pathCapture;
@@ -4317,8 +4512,6 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 #endif
 
 	const float strokeWidth = isThin ? fringeWidth : scaledStrokeWidth;
-
-	flushPendingShape(ctx);
 
 #if VG_CONFIG_PATH_CACHE_BUDGET
 	PathCacheCapture pathCapture;
@@ -5052,31 +5245,28 @@ static void pathCacheBeginFrame(Context* ctx)
 	}
 }
 
-// Looks up the geometry of the current path (fill: kind = 0, stroke: kind = 1). Returns the entry if it's cached.
-// Otherwise the capture is set up for pathCacheCaptureEnd(), which is called after generating the geometry.
+// Looks up the geometry of the current path (fill: kind = 0, stroke: kind = 1) by its recorded commands. Returns the
+// entry if it's cached (the path isn't flattened then). Otherwise the capture is set up for pathCacheCaptureEnd(),
+// which is called after generating the geometry.
 static PathCacheEntry* pathCacheLookup(Context* ctx, uint32_t kind, uint32_t flags, float width, PathCacheCapture* capture)
 {
 	PathCache* cache = &ctx->m_PathCache;
 	const State* state = getState(ctx);
-	const Path* path = ctx->m_Path;
-	const uint32_t numVertices = pathGetNumVertices(path);
-	const uint32_t numSubPaths = pathGetNumSubPaths(path);
-	const float* vertices = pathGetVertices(path);
-	const SubPath* subPaths = pathGetSubPaths(path);
+	const uint32_t* cmds = ctx->m_PathCmds;
+	const uint32_t numCmdWords = ctx->m_NumPathCmdWords;
 
 	PathCacheKey* key = &capture->m_Key;
 	bx::memSet(key, 0, sizeof(PathCacheKey));
 	bx::memCopy(key->m_Mtx, state->m_TransformMtx, sizeof(float) * 4);
 	key->m_Width = width;
 	key->m_FringeWidth = ctx->m_FringeWidth;
+	key->m_Tolerance = ctx->m_TesselationTolerance;
 	key->m_Flags = flags;
-	key->m_NumVertices = numVertices;
-	key->m_NumSubPaths = numSubPaths;
+	key->m_NumCmdWords = numCmdWords;
 	key->m_Kind = kind;
 
 	uint64_t hash = pathCacheHash(14695981039346656037ull, key, sizeof(PathCacheKey));
-	hash = pathCacheHash(hash, vertices, sizeof(float) * 2 * numVertices);
-	hash = pathCacheHash(hash, subPaths, sizeof(SubPath) * numSubPaths);
+	hash = pathCacheHash(hash, cmds, sizeof(uint32_t) * numCmdWords);
 	capture->m_Hash = hash;
 
 	uint32_t slot = (uint32_t)(hash >> 32) & (kPathCacheTableSize - 1);
@@ -5089,8 +5279,7 @@ static PathCacheEntry* pathCacheLookup(Context* ctx, uint32_t kind, uint32_t fla
 		PathCacheEntry* entry = &cache->m_Entries[id - 1];
 		if (entry->m_Hash == hash
 		&&  !bx::memCmp(&entry->m_Key, key, sizeof(PathCacheKey))
-		&&  !bx::memCmp(entry->m_Data, vertices, sizeof(float) * 2 * numVertices)
-		&&  !bx::memCmp(entry->m_Data + sizeof(float) * 2 * numVertices, subPaths, sizeof(SubPath) * numSubPaths)) {
+		&&  !bx::memCmp(entry->m_Data, cmds, sizeof(uint32_t) * numCmdWords)) {
 			entry->m_LastUsedFrame = cache->m_Frame;
 			cache->m_NumHits++;
 			capture->m_Active = false;
@@ -5160,7 +5349,7 @@ static const uint32_t* pathCacheColors(Context* ctx, const PathCacheEntry* entry
 		cache->m_Colors = (uint32_t*)bx::realloc(ctx->m_Allocator, cache->m_Colors, sizeof(uint32_t) * cache->m_ColorCapacity);
 	}
 
-	const uint8_t* mask = entry->m_Data + sizeof(float) * 2 * entry->m_Key.m_NumVertices + sizeof(SubPath) * entry->m_Key.m_NumSubPaths + sizeof(float) * 2 * n;
+	const uint8_t* mask = entry->m_Data + sizeof(uint32_t) * entry->m_Key.m_NumCmdWords + sizeof(float) * 2 * n;
 	const uint32_t transparent = color & 0x00FFFFFF;
 	uint32_t* colors = cache->m_Colors;
 	for (uint32_t i = 0; i < n; ++i) {
@@ -5171,12 +5360,12 @@ static const uint32_t* pathCacheColors(Context* ctx, const PathCacheEntry* entry
 
 static const float* pathCachePositions(const PathCacheEntry* entry)
 {
-	return (const float*)(entry->m_Data + sizeof(float) * 2 * entry->m_Key.m_NumVertices + sizeof(SubPath) * entry->m_Key.m_NumSubPaths);
+	return (const float*)(entry->m_Data + sizeof(uint32_t) * entry->m_Key.m_NumCmdWords);
 }
 
 static const uint16_t* pathCacheIndices(const PathCacheEntry* entry)
 {
-	const uint32_t offset = sizeof(float) * 2 * entry->m_Key.m_NumVertices + sizeof(SubPath) * entry->m_Key.m_NumSubPaths + sizeof(float) * 2 * entry->m_NumMeshVertices + entry->m_NumMeshVertices;
+	const uint32_t offset = sizeof(uint32_t) * entry->m_Key.m_NumCmdWords + sizeof(float) * 2 * entry->m_NumMeshVertices + entry->m_NumMeshVertices;
 	return (const uint16_t*)(entry->m_Data + ((offset + 1) & ~1u));
 }
 
@@ -5217,10 +5406,9 @@ static void pathCacheCaptureEnd(Context* ctx, const PathCacheCapture* capture)
 	const uint32_t numMeshVertices = cmd->m_NumVertices - firstVertex;
 	const uint32_t numMeshIndices = cmd->m_NumIndices - firstIndex;
 	const PathCacheKey* key = &capture->m_Key;
-	const uint32_t verticesSize = sizeof(float) * 2 * key->m_NumVertices;
-	const uint32_t subPathsSize = sizeof(SubPath) * key->m_NumSubPaths;
+	const uint32_t cmdsSize = sizeof(uint32_t) * key->m_NumCmdWords;
 	const uint32_t posSize = sizeof(float) * 2 * numMeshVertices;
-	const uint32_t maskOffset = verticesSize + subPathsSize + posSize;
+	const uint32_t maskOffset = cmdsSize + posSize;
 	const uint32_t indicesOffset = (maskOffset + numMeshVertices + 1) & ~1u;
 	const uint32_t dataSize = indicesOffset + sizeof(uint16_t) * numMeshIndices;
 	if (dataSize > VG_CONFIG_PATH_CACHE_BUDGET / 4) {
@@ -5237,14 +5425,12 @@ static void pathCacheCaptureEnd(Context* ctx, const PathCacheCapture* capture)
 	}
 
 	uint8_t* data = (uint8_t*)bx::alignedAlloc(ctx->m_Allocator, dataSize, 16);
-	const Path* path = ctx->m_Path;
-	bx::memCopy(data, pathGetVertices(path), verticesSize);
-	bx::memCopy(data + verticesSize, pathGetSubPaths(path), subPathsSize);
+	bx::memCopy(data, ctx->m_PathCmds, cmdsSize);
 
 	const VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
 	const uint32_t vbOffset = cmd->m_FirstVertexID + firstVertex;
 	const float* pos = &vb->m_Pos[vbOffset << 1];
-	bx::memCopy(data + verticesSize + subPathsSize, pos, posSize);
+	bx::memCopy(data + cmdsSize, pos, posSize);
 
 	float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	if (numMeshVertices != 0) {
@@ -6257,6 +6443,8 @@ static bool isIdentity(const float* transform)
 
 static const float* transformPath(Context* ctx)
 {
+	flattenPath(ctx);
+
 	const State* state = getState(ctx);
 	const float* stateTransform = state->m_TransformMtx;
 	Path* path = ctx->m_Path;
@@ -6699,47 +6887,137 @@ static void createDrawCommand_VertexColor(Context* ctx, const float* vtx, uint32
 // uniform scale), it's drawn as a single quad whose coverage is computed by fs_shape.sc (Type::Shape draw command).
 // Otherwise (or when any other path command is added) it's converted to path vertices.
 
-// Converts the pending shape (if any) to path vertices.
-static void flushPendingShape(Context* ctx)
+static void growPathCmds(Context* ctx, uint32_t numWords)
 {
-	PendingShape* shape = &ctx->m_PendingShape;
-	const PendingShape::Type::Enum type = shape->m_Type;
-	if (type == PendingShape::Type::None) {
-		return;
+	ctx->m_PathCmdCapacity = bx::max<uint32_t>(ctx->m_NumPathCmdWords + numWords, bx::max<uint32_t>(256, ctx->m_PathCmdCapacity * 2));
+	ctx->m_PathCmds = (uint32_t*)bx::realloc(ctx->m_Allocator, ctx->m_PathCmds, sizeof(uint32_t) * ctx->m_PathCmdCapacity);
+}
+
+// Appends a command to the current path (see PathCmd) and returns the pointer to its numArgs argument words.
+static BX_FORCE_INLINE uint32_t* allocPathCmd(Context* ctx, PathCmd::Enum cmd, uint32_t numArgs)
+{
+	const uint32_t numWords = 1 + numArgs;
+	if (ctx->m_NumPathCmdWords + numWords > ctx->m_PathCmdCapacity) {
+		growPathCmds(ctx, numWords);
 	}
 
-	shape->m_Type = PendingShape::Type::None;
+	uint32_t* dst = &ctx->m_PathCmds[ctx->m_NumPathCmdWords];
+	dst[0] = (uint32_t)cmd;
+	ctx->m_NumPathCmdWords += numWords;
+	ctx->m_PathFlattened = false;
+	return dst + 1;
+}
 
-	const float* a = shape->m_Args;
+static void recordPathCmd(Context* ctx, PathCmd::Enum cmd, const float* args, uint32_t numArgs)
+{
+	uint32_t* dst = allocPathCmd(ctx, cmd, numArgs);
+	memcpy(dst, args, sizeof(float) * numArgs);
+}
+
+// Flattens the recorded commands into m_Path (unless they already are).
+static void flattenPath(Context* ctx)
+{
+	if (ctx->m_PathFlattened) {
+		return;
+	}
+	ctx->m_PathFlattened = true;
+
 	Path* path = ctx->m_Path;
-	switch (type) {
-	case PendingShape::Type::Rect:
-		pathRect(path, a[0], a[1], a[2], a[3]);
-		break;
-	case PendingShape::Type::RoundedRect:
-		pathRoundedRect(path, a[0], a[1], a[2], a[3], a[4]);
-		break;
-	case PendingShape::Type::RoundedRectVarying:
-		pathRoundedRectVarying(path, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-		break;
-	case PendingShape::Type::Circle:
-		pathCircle(path, a[0], a[1], a[2]);
-		break;
-	default:
-		break;
+	const uint32_t* cmds = ctx->m_PathCmds;
+	const uint32_t numWords = ctx->m_NumPathCmdWords;
+	for (uint32_t i = 0; i < numWords; ) {
+		const PathCmd::Enum cmd = (PathCmd::Enum)cmds[i++];
+		const float* a = (const float*)&cmds[i];
+		switch (cmd) {
+		case PathCmd::MoveTo:
+			pathMoveTo(path, a[0], a[1]);
+			i += 2;
+			break;
+		case PathCmd::LineTo:
+			pathLineTo(path, a[0], a[1]);
+			i += 2;
+			break;
+		case PathCmd::CubicTo:
+			pathCubicTo(path, a[0], a[1], a[2], a[3], a[4], a[5]);
+			i += 6;
+			break;
+		case PathCmd::QuadraticTo:
+			pathQuadraticTo(path, a[0], a[1], a[2], a[3]);
+			i += 4;
+			break;
+		case PathCmd::Arc:
+			pathArc(path, a[0], a[1], a[2], a[3], a[4], (Winding::Enum)cmds[i + 5]);
+			i += 6;
+			break;
+		case PathCmd::ArcTo:
+			pathArcTo(path, a[0], a[1], a[2], a[3], a[4]);
+			i += 5;
+			break;
+		case PathCmd::Rect:
+			pathRect(path, a[0], a[1], a[2], a[3]);
+			i += 4;
+			break;
+		case PathCmd::RoundedRect:
+			pathRoundedRect(path, a[0], a[1], a[2], a[3], a[4]);
+			i += 5;
+			break;
+		case PathCmd::RoundedRectVarying:
+			pathRoundedRectVarying(path, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+			i += 8;
+			break;
+		case PathCmd::Circle:
+			pathCircle(path, a[0], a[1], a[2]);
+			i += 3;
+			break;
+		case PathCmd::Ellipse:
+			pathEllipse(path, a[0], a[1], a[2], a[3]);
+			i += 4;
+			break;
+		case PathCmd::Polyline: {
+			const uint32_t numPoints = cmds[i];
+			pathPolyline(path, a + 1, numPoints);
+			i += 1 + numPoints * 2;
+		} break;
+		case PathCmd::Close:
+			pathClose(path);
+			break;
+		}
 	}
 }
 
-// Returns true if the shape has been kept as the pending shape of the path (instead of being added to the path).
-static bool deferShape(Context* ctx, PendingShape::Type::Enum type, const float* args, uint32_t numArgs)
+// Returns true if the path consists of a single rectangle, rounded rectangle or circle which can be drawn as an
+// analytic shape (non-degenerate; also rejects NaNs).
+static bool getPendingShape(const Context* ctx, PendingShape* shape)
 {
 #if VG_CONFIG_ENABLE_ANALYTIC_SHAPES
-	if (!ctx->m_ShapesSupported || ctx->m_PendingShape.m_Type != PendingShape::Type::None || pathGetNumVertices(ctx->m_Path) != 0) {
+	if (!ctx->m_ShapesSupported || ctx->m_NumPathCmdWords == 0) {
 		return false;
 	}
 
-	// Only non-degenerate shapes (also rejects NaNs)
-	if (type == PendingShape::Type::Circle) {
+	const uint32_t* cmds = ctx->m_PathCmds;
+	const float* args = (const float*)&cmds[1];
+	uint32_t numArgs;
+	switch ((PathCmd::Enum)cmds[0]) {
+	case PathCmd::Rect:               shape->m_Type = PendingShape::Type::Rect;               numArgs = 4; break;
+	case PathCmd::RoundedRect:        shape->m_Type = PendingShape::Type::RoundedRect;        numArgs = 5; break;
+	case PathCmd::RoundedRectVarying: shape->m_Type = PendingShape::Type::RoundedRectVarying; numArgs = 8; break;
+	case PathCmd::Circle:             shape->m_Type = PendingShape::Type::Circle;             numArgs = 3; break;
+	case PathCmd::Ellipse:
+		if (args[2] != args[3]) {
+			return false;
+		}
+		shape->m_Type = PendingShape::Type::Circle;
+		numArgs = 4;
+		break;
+	default:
+		return false;
+	}
+
+	if (ctx->m_NumPathCmdWords != 1 + numArgs) {
+		return false;
+	}
+
+	if (shape->m_Type == PendingShape::Type::Circle) {
 		if (!(args[2] > 0.0f)) {
 			return false;
 		}
@@ -6754,12 +7032,10 @@ static bool deferShape(Context* ctx, PendingShape::Type::Enum type, const float*
 		}
 	}
 
-	PendingShape* shape = &ctx->m_PendingShape;
-	shape->m_Type = type;
-	bx::memCopy(shape->m_Args, args, sizeof(float) * numArgs);
+	bx::memCopy(shape->m_Args, args, sizeof(float) * bx::min<uint32_t>(numArgs, 8));
 	return true;
 #else
-	BX_UNUSED(ctx, type, args, numArgs);
+	BX_UNUSED(ctx, shape);
 	return false;
 #endif
 }
@@ -6811,10 +7087,10 @@ static void getAnalyticShape(const PendingShape* shape, AnalyticShape* out)
 	}
 }
 
-static bool pendingShapeHasSharpCorners(const Context* ctx)
+static bool pendingShapeHasSharpCorners(const PendingShape* pendingShape)
 {
 	AnalyticShape shape;
-	getAnalyticShape(&ctx->m_PendingShape, &shape);
+	getAnalyticShape(pendingShape, &shape);
 	return shape.m_Radii[0] == 0.0f || shape.m_Radii[1] == 0.0f || shape.m_Radii[2] == 0.0f || shape.m_Radii[3] == 0.0f;
 }
 
@@ -6895,7 +7171,7 @@ static bool createDrawCommand_Shape(Context* ctx, Color color, float** pos, floa
 // fs_shape.sc). halfStrokeWidth and the fringe width are in canvas units. sharpCorners: whether corners with a
 // radius of 0 are sharp (fills and miter joins) or round (round joins).
 // Returns false if the shape can't be drawn this way with the current transform.
-static bool drawPendingShape(Context* ctx, Color color, uint32_t mode, float halfStrokeWidth, bool sharpCorners)
+static bool drawPendingShape(Context* ctx, const PendingShape* pendingShape, Color color, uint32_t mode, float halfStrokeWidth, bool sharpCorners)
 {
 	const State* state = getState(ctx);
 	const float* mtx = state->m_TransformMtx;
@@ -6912,7 +7188,7 @@ static bool drawPendingShape(Context* ctx, Color color, uint32_t mode, float hal
 	const float scale = bx::sqrt(len0);
 
 	AnalyticShape shape;
-	getAnalyticShape(&ctx->m_PendingShape, &shape);
+	getAnalyticShape(pendingShape, &shape);
 
 	// The quad covers all the pixels with a non-zero coverage (see fs_shape.sc).
 	const float fringeWidth = ctx->m_FringeWidth;
@@ -7146,13 +7422,14 @@ static void createDrawCommand_Clip(Context* ctx, const float* vtx, uint32_t numV
 
 static bool drawCommandSinkAlloc(void* userData, uint32_t numVertices, uint32_t numIndices, StrokerOutput* output)
 {
-	const DrawCommandSink* sink = (const DrawCommandSink*)userData;
+	DrawCommandSink* sink = (DrawCommandSink*)userData;
 	Context* ctx = sink->m_Context;
 
 	// NOTE: Returning false makes the stroker use its internal buffers; the caller then skips the mesh.
 	if (!canAllocVertices(ctx, numVertices)) {
 		return false;
 	}
+	sink->m_Allocated = true;
 
 	DrawCommand* cmd = sink->m_Type == DrawCommand::Type::Clip
 		? allocClipCommand(ctx, numVertices, numIndices)
@@ -7197,8 +7474,67 @@ static const StrokerSink* initDrawCommandSink(DrawCommandSink* sink, Context* ct
 	sink->m_Handle = handle;
 	sink->m_Color = color;
 	sink->m_FillColor = fillColor;
+	sink->m_Allocated = false;
 	return &sink->m_Sink;
 }
+
+
+#if VG_CONFIG_ENABLE_STENCIL_FILLS
+// Draws the current (transformed) path as a stencil-then-cover fill (see VG_CONFIG_ENABLE_STENCIL_FILLS) if possible.
+// Returns false if the path has to be tesselated instead.
+static bool createStencilFillCommand(Context* ctx, DrawCommand::Type::Enum type, uint16_t handle, Color color, bool aa, FillRule::Enum fillRule, const float* pathVertices)
+{
+	// The stencil buffer holds the clip region while clipping.
+	if (ctx->m_Config.m_DisableStencilFills || ctx->m_ClipState.m_NumCmds != 0 || ctx->m_RecordClipCommands) {
+		return false;
+	}
+
+	const Path* path = ctx->m_Path;
+	const uint32_t numSubPaths = pathGetNumSubPaths(path);
+	const SubPath* subPaths = pathGetSubPaths(path);
+	uint32_t numContourVertices = 0;
+	for (uint32_t i = 0; i < numSubPaths; ++i) {
+		if (subPaths[i].m_NumVertices >= 3) {
+			numContourVertices += subPaths[i].m_NumVertices;
+		}
+	}
+
+	// The whole fill must fit in one draw command (uint16 indices).
+	const uint32_t numVertices = numContourVertices * (aa ? 5 : 1) + 4;
+	if (numContourVertices < 3 || numVertices > ctx->m_Config.m_MaxVBVertices) {
+		return false;
+	}
+
+	Stroker* stroker = ctx->m_Stroker;
+	strokerConcaveFillBegin(stroker);
+	for (uint32_t i = 0; i < numSubPaths; ++i) {
+		const SubPath* subPath = &subPaths[i];
+		if (subPath->m_NumVertices >= 3) {
+			strokerConcaveFillAddContour(stroker, &pathVertices[subPath->m_FirstVertexID << 1], subPath->m_NumVertices);
+		}
+	}
+
+	// Generate the geometry directly into a new draw command (its passes must not be merged with other commands).
+	ctx->m_ForceNewDrawCommand = true;
+	DrawCommandSink sink;
+	Mesh mesh;
+	StencilFillGeometry geom;
+	if (!strokerConcaveFillEndStencil(stroker, &mesh, color, aa, &geom, initDrawCommandSink(&sink, ctx, type, handle, color, false)) || !sink.m_Allocated) {
+		ctx->m_ForceNewDrawCommand = false;
+		return false;
+	}
+
+	DrawCommand* cmd = &ctx->m_DrawCommands[ctx->m_NumDrawCommands - 1];
+	VG_CHECK(cmd->m_NumIndices == mesh.m_NumIndices && cmd->m_NumVertices == mesh.m_NumVertices, "Stencil fill geometry doesn't match the draw command");
+	cmd->m_StencilFill = fillRule == FillRule::NonZero ? 1 : 2;
+	cmd->m_NumStencilIndices[0] = geom.m_NumFanIndices;
+	cmd->m_NumStencilIndices[1] = geom.m_NumOuterFringeIndices;
+	cmd->m_NumStencilIndices[2] = geom.m_NumInnerLeftIndices;
+	cmd->m_NumStencilIndices[3] = geom.m_NumInnerRightIndices;
+	ctx->m_ForceNewDrawCommand = true;
+	return true;
+}
+#endif
 
 // NOTE: Side effect: Resets m_ForceNewDrawCommand and m_ForceNewClipCommand if the current
 // vertex buffer cannot hold the specified amount of vertices.
@@ -7324,7 +7660,7 @@ static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_
 		      && prevCmd->m_ScissorRect[2] == (uint16_t)scissor[2] 
 		      && prevCmd->m_ScissorRect[3] == (uint16_t)scissor[3], "Invalid scissor rect");
 
-		if (prevCmd->m_Type == type && (prevCmd->m_HandleID == handle || isSamePaint(ctx, type, prevCmd->m_HandleID, handle))) {
+		if (prevCmd->m_StencilFill == 0 && prevCmd->m_Type == type && (prevCmd->m_HandleID == handle || isSamePaint(ctx, type, prevCmd->m_HandleID, handle))) {
 			return prevCmd;
 		}
 	}
@@ -7345,6 +7681,7 @@ static DrawCommand* allocDrawCommand(Context* ctx, uint32_t numVertices, uint32_
 	cmd->m_NumIndices = 0;
 	cmd->m_Type = type;
 	cmd->m_HandleID = handle;
+	cmd->m_StencilFill = 0;
 	cmd->m_ScissorRect[0] = (uint16_t)scissor[0];
 	cmd->m_ScissorRect[1] = (uint16_t)scissor[1];
 	cmd->m_ScissorRect[2] = (uint16_t)scissor[2];
@@ -7394,6 +7731,7 @@ static DrawCommand* allocClipCommand(Context* ctx, uint32_t numVertices, uint32_
 	cmd->m_NumIndices = 0;
 	cmd->m_Type = DrawCommand::Type::Clip;
 	cmd->m_HandleID = UINT16_MAX;
+	cmd->m_StencilFill = 0;
 	cmd->m_ScissorRect[0] = (uint16_t)scissor[0];
 	cmd->m_ScissorRect[1] = (uint16_t)scissor[1];
 	cmd->m_ScissorRect[2] = (uint16_t)scissor[2];
