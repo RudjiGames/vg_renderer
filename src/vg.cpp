@@ -19,6 +19,7 @@
 #include <bx/string.h>
 #include <bgfx/bgfx.h>
 #include <bgfx/embedded_shader.h>
+#include <string.h> // memcpy
 
 #if VG_CONFIG_ENABLE_SIMD && BX_CPU_X86 && FONS_QUAD_SIMD
 #	include <emmintrin.h>
@@ -203,6 +204,62 @@ static constexpr uint32_t nextPowerOf2(uint32_t v)
 
 static const uint32_t kTextCacheTableSize = nextPowerOf2(VG_CONFIG_TEXT_CACHE_MAX_STRINGS * 2); // Load factor <= 0.5
 static const uint32_t kTextCacheMaxStrData = VG_CONFIG_TEXT_CACHE_MAX_GLYPHS * 4;
+#endif
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+// Immediate mode path geometry cache (see pathCacheFind()).
+struct PathCacheKey
+{
+	float m_Mtx[4];       // Linear part of the transform
+	float m_Width;        // Stroke width (0 for fills)
+	float m_FringeWidth;
+	uint32_t m_Flags;     // Fill/stroke flags
+	uint32_t m_NumVertices;
+	uint32_t m_NumSubPaths;
+	uint32_t m_Kind;      // 0 = fill, 1 = stroke
+};
+
+struct PathCacheEntry
+{
+	uint64_t m_Hash;
+	PathCacheKey m_Key;
+	uint8_t* m_Data;         // Path vertices, sub paths, mesh positions, alpha mask and indices (see pathCacheInsert())
+	uint32_t m_DataSize;
+	uint32_t m_NumMeshVertices;
+	uint32_t m_NumMeshIndices;
+	uint32_t m_LastUsedFrame;
+	float m_Translation[2];  // Translation of the transform the mesh was generated with
+	float m_Bounds[4];       // Bounds of the mesh (canvas space, at m_Translation)
+};
+
+struct PathCache
+{
+	uint32_t* m_Table;       // Open addressing hash table: entry index + 1, 0 for empty slots
+	PathCacheEntry* m_Entries;
+	uint32_t m_NumEntries;
+	uint32_t m_TotalSize;    // Bytes of all the entries' data
+	uint32_t m_Frame;
+	bool m_Full;             // No more insertions this frame (evicting didn't free enough memory)
+	uint32_t* m_Colors;      // Scratch buffer for the vertex colors of cached meshes. Grow-only.
+	uint32_t m_ColorCapacity;
+	uint32_t m_NumHits;
+	uint32_t m_NumMisses;
+	// Admission filter: a path is cached only when it's seen again within a few frames of a miss, so paths which
+	// change every frame (animations) don't pay for storing their geometry. Hash and frame of recent misses.
+	uint64_t m_SeenHash[VG_CONFIG_PATH_CACHE_MAX_ENTRIES];
+	uint32_t m_SeenFrame[VG_CONFIG_PATH_CACHE_MAX_ENTRIES];
+};
+
+// Recorded before generating the geometry of a path, to find it in the vertex/index buffers afterwards.
+struct PathCacheCapture
+{
+	uint64_t m_Hash;
+	PathCacheKey m_Key;
+	uint32_t m_NumDrawCommands;
+	uint32_t m_LastCmdNumVertices;
+	uint32_t m_LastCmdNumIndices;
+	bool m_Active;
+};
 #endif
 
 // Floats per vertex of Type::Shape draw commands (3 x vec4, see fs_shape.sc)
@@ -562,6 +619,9 @@ struct Context
 #if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
 	TextCache m_TextCache;
 #endif
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCache m_PathCache;
+#endif
 	FontData* m_FontData;
 	uint32_t m_NextFontID;
 
@@ -645,6 +705,18 @@ static void renderTextQuads(Context* ctx, const FONSquad* quads, uint32_t numQua
 #if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
 static void textCacheInit(Context* ctx);
 static void textCacheDestroy(Context* ctx);
+#endif
+#if VG_CONFIG_PATH_CACHE_BUDGET
+static bool isRectOutsideScissor(const State* state, float minx, float miny, float maxx, float maxy);
+static void pathCacheInit(Context* ctx);
+static void pathCacheDestroy(Context* ctx);
+static void pathCacheBeginFrame(Context* ctx);
+static PathCacheEntry* pathCacheLookup(Context* ctx, uint32_t kind, uint32_t flags, float width, PathCacheCapture* capture);
+static bool pathCacheCull(Context* ctx, const PathCacheEntry* entry, float* mtx);
+static const uint32_t* pathCacheColors(Context* ctx, const PathCacheEntry* entry, Color color);
+static const float* pathCachePositions(const PathCacheEntry* entry);
+static const uint16_t* pathCacheIndices(const PathCacheEntry* entry);
+static void pathCacheCaptureEnd(Context* ctx, const PathCacheCapture* capture);
 #endif
 static bool allocTextAtlas(Context* ctx);
 static void flushTextAtlas(Context* ctx);
@@ -1049,6 +1121,9 @@ Context* createContext(bx::AllocatorI* allocator, const ContextConfig* userCfg)
 #if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
 	textCacheInit(ctx);
 #endif
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheInit(ctx);
+#endif
 
 	return ctx;
 }
@@ -1061,6 +1136,9 @@ void destroyContext(Context* ctx)
 	fonsDestroyString(&ctx->m_TextString);
 #if VG_CONFIG_TEXT_CACHE_MAX_STRINGS
 	textCacheDestroy(ctx);
+#endif
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheDestroy(ctx);
 #endif
 
 	// Destroy all command lists the user hasn't destroyed.
@@ -1284,6 +1362,9 @@ void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasH
 
 	ctx->m_NumDrawCommands = 0;
 	ctx->m_ForceNewDrawCommand = true;
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheBeginFrame(ctx);
+#endif
 	ctx->m_NumShapeVertices = 0;
 	ctx->m_ShapeVertices = nullptr;
 	ctx->m_ShapeVertexCapacity = 0;
@@ -3497,6 +3578,22 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 	}
 
 	flushPendingShape(ctx);
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCacheCapture pathCapture;
+	pathCapture.m_Active = false;
+	if (!hasCache && !ctx->m_RecordClipCommands) {
+		const PathCacheEntry* cached = pathCacheLookup(ctx, 0, flags, 0.0f, &pathCapture);
+		if (cached) {
+			float mtx[6];
+			if (!pathCacheCull(ctx, cached, mtx) && cached->m_NumMeshVertices != 0) {
+				createDrawCommand_VertexColor(ctx, pathCachePositions(cached), cached->m_NumMeshVertices, pathCacheColors(ctx, cached, col), cached->m_NumMeshVertices, pathCacheIndices(cached), cached->m_NumMeshIndices, mtx[4] != 0.0f || mtx[5] != 0.0f ? mtx : nullptr);
+			}
+			return;
+		}
+	}
+#endif
+
 	const float* pathVertices = transformPath(ctx);
 	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
 	const FillRule::Enum fillRule = VG_FILL_FLAGS_RULE(flags);
@@ -3602,6 +3699,10 @@ static void ctxFillPathColor(Context* ctx, Color color, uint32_t flags)
 		}
 	}
 
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheCaptureEnd(ctx, &pathCapture);
+#endif
+
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	if (hasCache) {
 		endCachedCommand(ctx);
@@ -3622,6 +3723,22 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 #endif
 
 	flushPendingShape(ctx);
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCacheCapture pathCapture;
+	pathCapture.m_Active = false;
+	if (!hasCache && !ctx->m_RecordClipCommands) {
+		const PathCacheEntry* cached = pathCacheLookup(ctx, 0, flags, 0.0f, &pathCapture);
+		if (cached) {
+			float mtx[6];
+			if (!pathCacheCull(ctx, cached, mtx) && cached->m_NumMeshVertices != 0) {
+				createDrawCommand_ColorGradient(ctx, gradientHandle, pathCachePositions(cached), cached->m_NumMeshVertices, pathCacheColors(ctx, cached, colorSetAlpha(Colors::Black, (uint8_t)(0xff * getState(ctx)->m_GlobalAlpha))), cached->m_NumMeshVertices, pathCacheIndices(cached), cached->m_NumMeshIndices, mtx[4] != 0.0f || mtx[5] != 0.0f ? mtx : nullptr);
+			}
+			return;
+		}
+	}
+#endif
+
 	const float* pathVertices = transformPath(ctx);
 
 	const PathType::Enum pathType = VG_FILL_FLAGS_PATH_TYPE(flags);
@@ -3725,6 +3842,10 @@ static void ctxFillPathGradient(Context* ctx, GradientHandle gradientHandle, uin
 		}
 	}
 
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheCaptureEnd(ctx, &pathCapture);
+#endif
+
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	if (hasCache) {
 		endCachedCommand(ctx);
@@ -3762,6 +3883,22 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 #endif
 
 	flushPendingShape(ctx);
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCacheCapture pathCapture;
+	pathCapture.m_Active = false;
+	if (!hasCache && !ctx->m_RecordClipCommands) {
+		const PathCacheEntry* cached = pathCacheLookup(ctx, 0, flags, 0.0f, &pathCapture);
+		if (cached) {
+			float mtx[6];
+			if (!pathCacheCull(ctx, cached, mtx) && cached->m_NumMeshVertices != 0) {
+				createDrawCommand_ImagePattern(ctx, imgPatternHandle, pathCachePositions(cached), cached->m_NumMeshVertices, pathCacheColors(ctx, cached, col), cached->m_NumMeshVertices, pathCacheIndices(cached), cached->m_NumMeshIndices, mtx[4] != 0.0f || mtx[5] != 0.0f ? mtx : nullptr);
+			}
+			return;
+		}
+	}
+#endif
+
 	const float* pathVertices = transformPath(ctx);
 
 	// Skip generating geometry which will be completely scissored out. Cached command lists must
@@ -3849,6 +3986,10 @@ static void ctxFillPathImagePattern(Context* ctx, ImagePatternHandle imgPatternH
 		}
 	}
 
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheCaptureEnd(ctx, &pathCapture);
+#endif
+
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	if (hasCache) {
 		endCachedCommand(ctx);
@@ -3903,6 +4044,22 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 	}
 
 	flushPendingShape(ctx);
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCacheCapture pathCapture;
+	pathCapture.m_Active = false;
+	if (!hasCache && !ctx->m_RecordClipCommands) {
+		const PathCacheEntry* cached = pathCacheLookup(ctx, 1, flags, width, &pathCapture);
+		if (cached) {
+			float mtx[6];
+			if (!pathCacheCull(ctx, cached, mtx) && cached->m_NumMeshVertices != 0) {
+				createDrawCommand_VertexColor(ctx, pathCachePositions(cached), cached->m_NumMeshVertices, pathCacheColors(ctx, cached, col), cached->m_NumMeshVertices, pathCacheIndices(cached), cached->m_NumMeshIndices, mtx[4] != 0.0f || mtx[5] != 0.0f ? mtx : nullptr);
+			}
+			return;
+		}
+	}
+#endif
+
 	const float* pathVertices = transformPath(ctx);
 
 	const Path* path = ctx->m_Path;
@@ -3980,6 +4137,10 @@ static void ctxStrokePathColor(Context* ctx, Color color, float width, uint32_t 
 		}
 	}
 
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheCaptureEnd(ctx, &pathCapture);
+#endif
+
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	if (hasCache) {
 		endCachedCommand(ctx);
@@ -4008,6 +4169,22 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 #endif
 
 	flushPendingShape(ctx);
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCacheCapture pathCapture;
+	pathCapture.m_Active = false;
+	if (!hasCache && !ctx->m_RecordClipCommands) {
+		const PathCacheEntry* cached = pathCacheLookup(ctx, 1, flags, width, &pathCapture);
+		if (cached) {
+			float mtx[6];
+			if (!pathCacheCull(ctx, cached, mtx) && cached->m_NumMeshVertices != 0) {
+				createDrawCommand_ColorGradient(ctx, gradientHandle, pathCachePositions(cached), cached->m_NumMeshVertices, pathCacheColors(ctx, cached, colorSetAlpha(Colors::Black, (uint8_t)(0xff * getState(ctx)->m_GlobalAlpha))), cached->m_NumMeshVertices, pathCacheIndices(cached), cached->m_NumMeshIndices, mtx[4] != 0.0f || mtx[5] != 0.0f ? mtx : nullptr);
+			}
+			return;
+		}
+	}
+#endif
+
 	const float* pathVertices = transformPath(ctx);
 
 	const State* state = getState(ctx);
@@ -4092,6 +4269,10 @@ static void ctxStrokePathGradient(Context* ctx, GradientHandle gradientHandle, f
 		createDrawCommand_ColorGradient(ctx, gradientHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 	}
 
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheCaptureEnd(ctx, &pathCapture);
+#endif
+
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	if (hasCache) {
 		endCachedCommand(ctx);
@@ -4138,6 +4319,22 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 	const float strokeWidth = isThin ? fringeWidth : scaledStrokeWidth;
 
 	flushPendingShape(ctx);
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCacheCapture pathCapture;
+	pathCapture.m_Active = false;
+	if (!hasCache && !ctx->m_RecordClipCommands) {
+		const PathCacheEntry* cached = pathCacheLookup(ctx, 1, flags, width, &pathCapture);
+		if (cached) {
+			float mtx[6];
+			if (!pathCacheCull(ctx, cached, mtx) && cached->m_NumMeshVertices != 0) {
+				createDrawCommand_ImagePattern(ctx, imgPatternHandle, pathCachePositions(cached), cached->m_NumMeshVertices, pathCacheColors(ctx, cached, col), cached->m_NumMeshVertices, pathCacheIndices(cached), cached->m_NumMeshIndices, mtx[4] != 0.0f || mtx[5] != 0.0f ? mtx : nullptr);
+			}
+			return;
+		}
+	}
+#endif
+
 	const float* pathVertices = transformPath(ctx);
 
 	// Skip generating geometry which will be completely scissored out. Cached command lists must
@@ -4192,6 +4389,10 @@ static void ctxStrokePathImagePattern(Context* ctx, ImagePatternHandle imgPatter
 
 		createDrawCommand_ImagePattern(ctx, imgPatternHandle, mesh.m_PosBuffer, mesh.m_NumVertices, scaleColorsAlpha(ctx, colors, numColors, drawAlpha), numColors, mesh.m_IndexBuffer, mesh.m_NumIndices);
 	}
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	pathCacheCaptureEnd(ctx, &pathCapture);
+#endif
 
 #if VG_CONFIG_ENABLE_SHAPE_CACHING
 	if (hasCache) {
@@ -4735,6 +4936,378 @@ static void ctxIndexedTriList(Context* ctx, const float* pos, const uv_t* uv, ui
 
 	cmd->m_NumVertices += numVertices;
 	cmd->m_NumIndices += numIndices;
+}
+
+#if VG_CONFIG_PATH_CACHE_BUDGET
+static const uint32_t kPathCacheTableSize = nextPowerOf2(VG_CONFIG_PATH_CACHE_MAX_ENTRIES * 2); // Load factor <= 0.5
+static_assert((VG_CONFIG_PATH_CACHE_MAX_ENTRIES & (VG_CONFIG_PATH_CACHE_MAX_ENTRIES - 1)) == 0, "VG_CONFIG_PATH_CACHE_MAX_ENTRIES must be a power of 2");
+
+static void pathCacheInit(Context* ctx)
+{
+	bx::AllocatorI* allocator = ctx->m_Allocator;
+	PathCache* cache = &ctx->m_PathCache;
+	bx::memSet(cache, 0, sizeof(PathCache));
+	cache->m_Table = (uint32_t*)bx::alloc(allocator, sizeof(uint32_t) * kPathCacheTableSize);
+	bx::memSet(cache->m_Table, 0, sizeof(uint32_t) * kPathCacheTableSize);
+	cache->m_Entries = (PathCacheEntry*)bx::alloc(allocator, sizeof(PathCacheEntry) * VG_CONFIG_PATH_CACHE_MAX_ENTRIES);
+}
+
+static void pathCacheDestroy(Context* ctx)
+{
+	bx::AllocatorI* allocator = ctx->m_Allocator;
+	PathCache* cache = &ctx->m_PathCache;
+	for (uint32_t i = 0; i < cache->m_NumEntries; ++i) {
+		bx::alignedFree(allocator, cache->m_Entries[i].m_Data, 16);
+	}
+	bx::free(allocator, cache->m_Table);
+	bx::free(allocator, cache->m_Entries);
+	bx::free(allocator, cache->m_Colors);
+	bx::memSet(cache, 0, sizeof(PathCache));
+}
+
+static uint64_t pathCacheHash(uint64_t h, const void* data, uint32_t size)
+{
+	const uint8_t* p = (const uint8_t*)data;
+	uint32_t i = 0;
+	for (; i + 8 <= size; i += 8) {
+		uint64_t v;
+		memcpy(&v, p + i, 8); // NOTE: memcpy() (not bx::memCopy()) so the compiler inlines it
+		h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+		h ^= h >> 29;
+	}
+	for (; i < size; ++i) {
+		h = (h ^ p[i]) * 0x100000001B3ull;
+	}
+	return h;
+}
+
+// Slot of the entry (which must be in the table).
+static uint32_t pathCacheFindSlot(const PathCache* cache, uint32_t entryID)
+{
+	uint32_t slot = (uint32_t)(cache->m_Entries[entryID].m_Hash >> 32) & (kPathCacheTableSize - 1);
+	while (cache->m_Table[slot] != entryID + 1) {
+		VG_CHECK(cache->m_Table[slot] != 0, "Path cache entry not in the table");
+		slot = (slot + 1) & (kPathCacheTableSize - 1);
+	}
+	return slot;
+}
+
+static void pathCacheRemove(Context* ctx, uint32_t entryID)
+{
+	PathCache* cache = &ctx->m_PathCache;
+
+	// Remove the slot (backward shift deletion)
+	uint32_t slot = pathCacheFindSlot(cache, entryID);
+	uint32_t next = (slot + 1) & (kPathCacheTableSize - 1);
+	while (cache->m_Table[next] != 0) {
+		const uint32_t home = (uint32_t)(cache->m_Entries[cache->m_Table[next] - 1].m_Hash >> 32) & (kPathCacheTableSize - 1);
+		// Move the entry at next to slot if its home slot isn't in (slot, next]
+		const bool between = slot < next ? (home > slot && home <= next) : (home > slot || home <= next);
+		if (!between) {
+			cache->m_Table[slot] = cache->m_Table[next];
+			slot = next;
+		}
+		next = (next + 1) & (kPathCacheTableSize - 1);
+	}
+	cache->m_Table[slot] = 0;
+
+	// Remove the entry (swap with the last one)
+	PathCacheEntry* entry = &cache->m_Entries[entryID];
+	cache->m_TotalSize -= entry->m_DataSize;
+	bx::alignedFree(ctx->m_Allocator, entry->m_Data, 16);
+
+	const uint32_t last = cache->m_NumEntries - 1;
+	if (entryID != last) {
+		const uint32_t lastSlot = pathCacheFindSlot(cache, last);
+		*entry = cache->m_Entries[last];
+		cache->m_Table[lastSlot] = entryID + 1;
+	}
+	cache->m_NumEntries = last;
+}
+
+// Evicts the entries which haven't been used since frame minFrame. Returns the number of bytes freed.
+static uint32_t pathCacheEvict(Context* ctx, uint32_t minFrame)
+{
+	PathCache* cache = &ctx->m_PathCache;
+	const uint32_t sizeBefore = cache->m_TotalSize;
+	for (uint32_t i = 0; i < cache->m_NumEntries; ) {
+		if (cache->m_Entries[i].m_LastUsedFrame < minFrame) {
+			pathCacheRemove(ctx, i); // The last entry moved to i
+		} else {
+			++i;
+		}
+	}
+	return sizeBefore - cache->m_TotalSize;
+}
+
+static void pathCacheBeginFrame(Context* ctx)
+{
+	PathCache* cache = &ctx->m_PathCache;
+	cache->m_Frame++;
+	cache->m_Full = false;
+
+	// Drop the entries which haven't been used for a couple of frames once the cache is half full.
+	if (cache->m_TotalSize > VG_CONFIG_PATH_CACHE_BUDGET / 2 && cache->m_Frame > 2) {
+		pathCacheEvict(ctx, cache->m_Frame - 2);
+	}
+}
+
+// Looks up the geometry of the current path (fill: kind = 0, stroke: kind = 1). Returns the entry if it's cached.
+// Otherwise the capture is set up for pathCacheCaptureEnd(), which is called after generating the geometry.
+static PathCacheEntry* pathCacheLookup(Context* ctx, uint32_t kind, uint32_t flags, float width, PathCacheCapture* capture)
+{
+	PathCache* cache = &ctx->m_PathCache;
+	const State* state = getState(ctx);
+	const Path* path = ctx->m_Path;
+	const uint32_t numVertices = pathGetNumVertices(path);
+	const uint32_t numSubPaths = pathGetNumSubPaths(path);
+	const float* vertices = pathGetVertices(path);
+	const SubPath* subPaths = pathGetSubPaths(path);
+
+	PathCacheKey* key = &capture->m_Key;
+	bx::memSet(key, 0, sizeof(PathCacheKey));
+	bx::memCopy(key->m_Mtx, state->m_TransformMtx, sizeof(float) * 4);
+	key->m_Width = width;
+	key->m_FringeWidth = ctx->m_FringeWidth;
+	key->m_Flags = flags;
+	key->m_NumVertices = numVertices;
+	key->m_NumSubPaths = numSubPaths;
+	key->m_Kind = kind;
+
+	uint64_t hash = pathCacheHash(14695981039346656037ull, key, sizeof(PathCacheKey));
+	hash = pathCacheHash(hash, vertices, sizeof(float) * 2 * numVertices);
+	hash = pathCacheHash(hash, subPaths, sizeof(SubPath) * numSubPaths);
+	capture->m_Hash = hash;
+
+	uint32_t slot = (uint32_t)(hash >> 32) & (kPathCacheTableSize - 1);
+	for (;;) {
+		const uint32_t id = cache->m_Table[slot];
+		if (id == 0) {
+			break;
+		}
+
+		PathCacheEntry* entry = &cache->m_Entries[id - 1];
+		if (entry->m_Hash == hash
+		&&  !bx::memCmp(&entry->m_Key, key, sizeof(PathCacheKey))
+		&&  !bx::memCmp(entry->m_Data, vertices, sizeof(float) * 2 * numVertices)
+		&&  !bx::memCmp(entry->m_Data + sizeof(float) * 2 * numVertices, subPaths, sizeof(SubPath) * numSubPaths)) {
+			entry->m_LastUsedFrame = cache->m_Frame;
+			cache->m_NumHits++;
+			capture->m_Active = false;
+			return entry;
+		}
+
+		slot = (slot + 1) & (kPathCacheTableSize - 1);
+	}
+
+	cache->m_NumMisses++;
+
+	// Admission: store the geometry only if the path has been seen recently (see PathCache::m_SeenHash). 2 candidate
+	// slots per hash; a miss is recorded in the older one so that colliding paths don't keep evicting each other.
+	const uint32_t seenSlot0 = (uint32_t)hash & (VG_CONFIG_PATH_CACHE_MAX_ENTRIES - 1);
+	const uint32_t seenSlot1 = (uint32_t)(hash >> 20) & (VG_CONFIG_PATH_CACHE_MAX_ENTRIES - 1);
+	const bool seen = (cache->m_SeenHash[seenSlot0] == hash && cache->m_Frame - cache->m_SeenFrame[seenSlot0] <= 8)
+		|| (cache->m_SeenHash[seenSlot1] == hash && cache->m_Frame - cache->m_SeenFrame[seenSlot1] <= 8);
+	if (!seen) {
+		const uint32_t seenSlot = cache->m_SeenFrame[seenSlot0] <= cache->m_SeenFrame[seenSlot1] ? seenSlot0 : seenSlot1;
+		cache->m_SeenHash[seenSlot] = hash;
+		cache->m_SeenFrame[seenSlot] = cache->m_Frame;
+	}
+
+	capture->m_Active = seen && !cache->m_Full;
+	capture->m_NumDrawCommands = ctx->m_NumDrawCommands;
+	if (ctx->m_NumDrawCommands != 0) {
+		const DrawCommand* cmd = &ctx->m_DrawCommands[ctx->m_NumDrawCommands - 1];
+		capture->m_LastCmdNumVertices = cmd->m_NumVertices;
+		capture->m_LastCmdNumIndices = cmd->m_NumIndices;
+	} else {
+		capture->m_LastCmdNumVertices = 0;
+		capture->m_LastCmdNumIndices = 0;
+	}
+	return nullptr;
+}
+
+// Returns true if the cached mesh is completely outside the scissor rect. Otherwise mtx is the transform to apply
+// to the cached positions (the change of translation since the mesh was generated; nullptr if unchanged).
+static bool pathCacheCull(Context* ctx, const PathCacheEntry* entry, float* mtx)
+{
+	const State* state = getState(ctx);
+	const float dx = state->m_TransformMtx[4] - entry->m_Translation[0];
+	const float dy = state->m_TransformMtx[5] - entry->m_Translation[1];
+	const float* scissor = state->m_ScissorRect;
+	if (scissor[2] < 1.0f || scissor[3] < 1.0f
+	||  isRectOutsideScissor(state, entry->m_Bounds[0] + dx, entry->m_Bounds[1] + dy, entry->m_Bounds[2] + dx, entry->m_Bounds[3] + dy)) {
+		return true;
+	}
+
+	mtx[0] = 1.0f;
+	mtx[1] = 0.0f;
+	mtx[2] = 0.0f;
+	mtx[3] = 1.0f;
+	mtx[4] = dx;
+	mtx[5] = dy;
+	return false;
+}
+
+// The vertex colors of the cached mesh for the specified color: the mesh's alpha mask selects between the color and
+// the color with a zero alpha (AA fringes).
+static const uint32_t* pathCacheColors(Context* ctx, const PathCacheEntry* entry, Color color)
+{
+	PathCache* cache = &ctx->m_PathCache;
+	const uint32_t n = entry->m_NumMeshVertices;
+	if (n > cache->m_ColorCapacity) {
+		cache->m_ColorCapacity = bx::max<uint32_t>(n, cache->m_ColorCapacity * 2);
+		cache->m_Colors = (uint32_t*)bx::realloc(ctx->m_Allocator, cache->m_Colors, sizeof(uint32_t) * cache->m_ColorCapacity);
+	}
+
+	const uint8_t* mask = entry->m_Data + sizeof(float) * 2 * entry->m_Key.m_NumVertices + sizeof(SubPath) * entry->m_Key.m_NumSubPaths + sizeof(float) * 2 * n;
+	const uint32_t transparent = color & 0x00FFFFFF;
+	uint32_t* colors = cache->m_Colors;
+	for (uint32_t i = 0; i < n; ++i) {
+		colors[i] = mask[i] ? color : transparent;
+	}
+	return colors;
+}
+
+static const float* pathCachePositions(const PathCacheEntry* entry)
+{
+	return (const float*)(entry->m_Data + sizeof(float) * 2 * entry->m_Key.m_NumVertices + sizeof(SubPath) * entry->m_Key.m_NumSubPaths);
+}
+
+static const uint16_t* pathCacheIndices(const PathCacheEntry* entry)
+{
+	const uint32_t offset = sizeof(float) * 2 * entry->m_Key.m_NumVertices + sizeof(SubPath) * entry->m_Key.m_NumSubPaths + sizeof(float) * 2 * entry->m_NumMeshVertices + entry->m_NumMeshVertices;
+	return (const uint16_t*)(entry->m_Data + ((offset + 1) & ~1u));
+}
+
+// Stores the geometry generated since pathCacheLookup() (in the vertex/index buffers of the last draw command).
+static void pathCacheCaptureEnd(Context* ctx, const PathCacheCapture* capture)
+{
+	if (!capture->m_Active) {
+		return;
+	}
+
+	PathCache* cache = &ctx->m_PathCache;
+
+	// The geometry must be in a single draw command: either appended to the last one or in a new one.
+	const uint32_t numDrawCommands = ctx->m_NumDrawCommands;
+	const DrawCommand* cmd;
+	uint32_t firstVertex, firstIndex;
+	if (numDrawCommands == capture->m_NumDrawCommands) {
+		if (numDrawCommands == 0) {
+			return;
+		}
+		cmd = &ctx->m_DrawCommands[numDrawCommands - 1];
+		firstVertex = capture->m_LastCmdNumVertices;
+		firstIndex = capture->m_LastCmdNumIndices;
+	} else if (numDrawCommands == capture->m_NumDrawCommands + 1) {
+		if (capture->m_NumDrawCommands != 0) {
+			const DrawCommand* prev = &ctx->m_DrawCommands[numDrawCommands - 2];
+			if (prev->m_NumVertices != capture->m_LastCmdNumVertices || prev->m_NumIndices != capture->m_LastCmdNumIndices) {
+				return; // Split between 2 draw commands
+			}
+		}
+		cmd = &ctx->m_DrawCommands[numDrawCommands - 1];
+		firstVertex = 0;
+		firstIndex = 0;
+	} else {
+		return;
+	}
+
+	const uint32_t numMeshVertices = cmd->m_NumVertices - firstVertex;
+	const uint32_t numMeshIndices = cmd->m_NumIndices - firstIndex;
+	const PathCacheKey* key = &capture->m_Key;
+	const uint32_t verticesSize = sizeof(float) * 2 * key->m_NumVertices;
+	const uint32_t subPathsSize = sizeof(SubPath) * key->m_NumSubPaths;
+	const uint32_t posSize = sizeof(float) * 2 * numMeshVertices;
+	const uint32_t maskOffset = verticesSize + subPathsSize + posSize;
+	const uint32_t indicesOffset = (maskOffset + numMeshVertices + 1) & ~1u;
+	const uint32_t dataSize = indicesOffset + sizeof(uint16_t) * numMeshIndices;
+	if (dataSize > VG_CONFIG_PATH_CACHE_BUDGET / 4) {
+		return; // Too large for the cache
+	}
+
+	// Make room
+	if (cache->m_NumEntries == VG_CONFIG_PATH_CACHE_MAX_ENTRIES || cache->m_TotalSize + dataSize > VG_CONFIG_PATH_CACHE_BUDGET) {
+		pathCacheEvict(ctx, cache->m_Frame); // Everything not used in this frame
+		if (cache->m_NumEntries == VG_CONFIG_PATH_CACHE_MAX_ENTRIES || cache->m_TotalSize + dataSize > VG_CONFIG_PATH_CACHE_BUDGET) {
+			cache->m_Full = true;
+			return;
+		}
+	}
+
+	uint8_t* data = (uint8_t*)bx::alignedAlloc(ctx->m_Allocator, dataSize, 16);
+	const Path* path = ctx->m_Path;
+	bx::memCopy(data, pathGetVertices(path), verticesSize);
+	bx::memCopy(data + verticesSize, pathGetSubPaths(path), subPathsSize);
+
+	const VertexBuffer* vb = &ctx->m_VertexBuffers[cmd->m_VertexBufferID];
+	const uint32_t vbOffset = cmd->m_FirstVertexID + firstVertex;
+	const float* pos = &vb->m_Pos[vbOffset << 1];
+	bx::memCopy(data + verticesSize + subPathsSize, pos, posSize);
+
+	float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	if (numMeshVertices != 0) {
+		bounds[0] = bounds[2] = pos[0];
+		bounds[1] = bounds[3] = pos[1];
+		for (uint32_t i = 1; i < numMeshVertices; ++i) {
+			bounds[0] = bx::min(bounds[0], pos[i * 2 + 0]);
+			bounds[1] = bx::min(bounds[1], pos[i * 2 + 1]);
+			bounds[2] = bx::max(bounds[2], pos[i * 2 + 0]);
+			bounds[3] = bx::max(bounds[3], pos[i * 2 + 1]);
+		}
+	}
+
+	const uint32_t* colors = &vb->m_Color[vbOffset];
+	uint8_t* mask = data + maskOffset;
+	for (uint32_t i = 0; i < numMeshVertices; ++i) {
+		mask[i] = (colors[i] >> 24) != 0 ? 1 : 0;
+	}
+
+	const IndexBuffer* ib = &ctx->m_IndexBuffers[ctx->m_ActiveIndexBufferID];
+	const uint16_t* indices = &ib->m_Indices[cmd->m_FirstIndexID + firstIndex];
+	uint16_t* dstIndices = (uint16_t*)(data + indicesOffset);
+	for (uint32_t i = 0; i < numMeshIndices; ++i) {
+		dstIndices[i] = (uint16_t)(indices[i] - firstVertex);
+	}
+
+	// Insert
+	uint32_t slot = (uint32_t)(capture->m_Hash >> 32) & (kPathCacheTableSize - 1);
+	while (cache->m_Table[slot] != 0) {
+		slot = (slot + 1) & (kPathCacheTableSize - 1);
+	}
+
+	const State* state = getState(ctx);
+	PathCacheEntry* entry = &cache->m_Entries[cache->m_NumEntries++];
+	entry->m_Hash = capture->m_Hash;
+	entry->m_Key = *key;
+	entry->m_Data = data;
+	entry->m_DataSize = dataSize;
+	entry->m_NumMeshVertices = numMeshVertices;
+	entry->m_NumMeshIndices = numMeshIndices;
+	entry->m_LastUsedFrame = cache->m_Frame;
+	entry->m_Translation[0] = state->m_TransformMtx[4];
+	entry->m_Translation[1] = state->m_TransformMtx[5];
+	bx::memCopy(entry->m_Bounds, bounds, sizeof(bounds));
+	cache->m_Table[slot] = cache->m_NumEntries;
+	cache->m_TotalSize += dataSize;
+}
+#endif // VG_CONFIG_PATH_CACHE_BUDGET
+
+void getPathCacheStats(Context* ctx, PathCacheStats* stats)
+{
+#if VG_CONFIG_PATH_CACHE_BUDGET
+	PathCache* cache = &ctx->m_PathCache;
+	stats->m_NumEntries = cache->m_NumEntries;
+	stats->m_NumBytes = cache->m_TotalSize;
+	stats->m_NumHits = cache->m_NumHits;
+	stats->m_NumMisses = cache->m_NumMisses;
+	cache->m_NumHits = 0;
+	cache->m_NumMisses = 0;
+#else
+	BX_UNUSED(ctx);
+	bx::memSet(stats, 0, sizeof(PathCacheStats));
+#endif
 }
 
 #if VG_CONFIG_TEXT_CACHE_MAX_STRINGS

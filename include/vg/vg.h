@@ -12,6 +12,20 @@
 #	define VG_CONFIG_ENABLE_SHAPE_CACHING 1
 #endif
 
+// The geometry of immediate mode fills and strokes is cached across frames, keyed by the path's vertices, the
+// fill/stroke parameters and the transform (except for its translation, so moved paths are cache hits too).
+// Drawing a cached path costs a copy of its mesh. The cache is bounded by VG_CONFIG_PATH_CACHE_BUDGET bytes and
+// VG_CONFIG_PATH_CACHE_MAX_ENTRIES paths; entries which haven't been used recently are evicted when it's full.
+// Command lists, clip shapes and analytic shapes don't use it. 0 = disabled.
+#ifndef VG_CONFIG_PATH_CACHE_BUDGET
+#	define VG_CONFIG_PATH_CACHE_BUDGET (16 * 1024 * 1024)
+#endif
+
+// Must be a power of 2.
+#ifndef VG_CONFIG_PATH_CACHE_MAX_ENTRIES
+#	define VG_CONFIG_PATH_CACHE_MAX_ENTRIES 4096
+#endif
+
 // Laid out glyph quads of text() strings are cached across frames (keyed by font, size and string), so drawing
 // the same strings again skips decoding, kerning and glyph lookups. The cache holds at most
 // VG_CONFIG_TEXT_CACHE_MAX_STRINGS strings with a total of VG_CONFIG_TEXT_CACHE_MAX_GLYPHS glyphs; it's cleared
@@ -440,6 +454,16 @@ void destroyContext(Context* ctx);
 
 void begin(Context* ctx, uint16_t viewID, uint16_t canvasWidth, uint16_t canvasHeight, float devicePixelRatio);
 void end(Context* ctx);
+
+struct PathCacheStats
+{
+	uint32_t m_NumEntries;
+	uint32_t m_NumBytes;
+	uint32_t m_NumHits;   // Since the last call
+	uint32_t m_NumMisses; // Since the last call
+};
+// Statistics of the immediate mode path geometry cache (see VG_CONFIG_PATH_CACHE_BUDGET).
+void getPathCacheStats(Context* ctx, PathCacheStats* stats);
 void frame(Context* ctx);
 const Stats* getStats(Context* ctx);
 
