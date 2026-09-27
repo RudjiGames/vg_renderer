@@ -4,6 +4,7 @@
 #include <bx/allocator.h>
 #include <bx/math.h>
 #include <string.h> // memcpy
+#include <float.h>  // DBL_MAX
 
 BX_PRAGMA_DIAGNOSTIC_IGNORED_MSVC(4127) // conditional expression is constant
 BX_PRAGMA_DIAGNOSTIC_IGNORED_MSVC(4456) // declaration of X hides previous local decleration
@@ -320,6 +321,11 @@ struct RoundJoinArc
 // Max number of vertices of a concave polygon to triangulate by ear clipping instead of libtess2
 // (see triangulateSimplePolygon()).
 static const uint32_t kMaxSimplePolygonVertices = 256;
+static const uint32_t kMaxSimplePolygonContours = 32;
+// With more holes per outer contour, bridging them and ear clipping the resulting ring is slower than libtess2.
+static const uint32_t kMaxSimplePolygonHolesPerContour = 6;
+// Max number of vertices of a ring (an outer contour with its holes joined by bridges, which duplicate 2 vertices)
+static const uint32_t kMaxSimplePolygonRingVertices = kMaxSimplePolygonVertices + 2 * kMaxSimplePolygonContours;
 
 struct Stroker
 {
@@ -340,8 +346,10 @@ struct Stroker
 	uint32_t* m_ClampScratch;     // Scratch memory used by clampInset(). Grow-only.
 	uint32_t m_ClampScratchCapacity;
 	Vec2 m_SimplePolyVertices[kMaxSimplePolygonVertices];                  // See triangulateSimplePolygon()
-	uint16_t m_SimplePolyTriangles[(kMaxSimplePolygonVertices - 2) * 3];
-	uint16_t m_SimplePolyBoundary[kMaxSimplePolygonVertices + 2];           // Boundary vertex IDs + contour (first, count)
+	uint16_t m_SimplePolyTriangles[(kMaxSimplePolygonRingVertices - 2) * 3];
+	uint16_t m_SimplePolyBoundary[kMaxSimplePolygonVertices + 2 * kMaxSimplePolygonContours]; // Boundary vertex IDs + contours (first, count)
+	uint32_t m_SimplePolyNumContours;
+	uint32_t m_SimplePolyNumIndices;
 	Vec2* m_ContourVertices;      // Copy of the contours added with strokerConcaveFillAddContour()
 	uint32_t m_NumContourVertices;
 	uint32_t m_ContourVertexCapacity;
@@ -1497,12 +1505,6 @@ static bool segmentsIntersect(const Vec2& a, const Vec2& b, const Vec2& c, const
 	return o1 == 0.0 || o2 == 0.0 || o3 == 0.0 || o4 == 0.0;
 }
 
-// Fast path for concave fills: if the only contour is a simple polygon (no self intersections, no touching edges,
-// no duplicate vertices) with at most kMaxSimplePolygonVertices vertices, it's triangulated by ear clipping, which is
-// much faster than libtess2 for small polygons. Both fill rules fill the interior of a simple polygon. The vertices
-// are stored in CCW order in m_SimplePolyVertices (so the boundary contour is 0..n-1, like the tesselator's boundary
-// contours, with the interior on the left) and the n - 2 CCW triangles in m_SimplePolyTriangles.
-// Returns the number of vertices, or 0 if the fast path can't be used (the contours have to be tesselated).
 // Returns a 32-bit key with the same order as the float (NaNs excluded).
 static inline uint32_t floatSortKey(float f)
 {
@@ -1624,10 +1626,11 @@ static int32_t calcTurningNumber(const Vec2* vtx, uint32_t n)
 	return turningNumber;
 }
 
-// Returns true if any 2 non-adjacent edges of the polygon intersect or touch. Uses a sweep along the X or Y axis:
+// Returns true if any 2 non-adjacent edges of the polygon intersect or touch. The edges are (i, i + 1) or, for
+// multiple contours, (i, nextVertex[i]). Uses a sweep along the X or Y axis:
 // the edges are sorted by their min coordinate and each edge is tested only against the following edges whose range
 // overlaps with its own.
-static bool hasIntersectingEdges(const Vec2* vtx, uint32_t n, bool sweepY)
+static bool hasIntersectingEdges(const Vec2* vtx, uint32_t n, bool sweepY, const uint16_t* nextVertex = nullptr)
 {
 	float edgeMin[kMaxSimplePolygonVertices];
 	float edgeMax[kMaxSimplePolygonVertices];
@@ -1635,7 +1638,7 @@ static bool hasIntersectingEdges(const Vec2* vtx, uint32_t n, bool sweepY)
 	uint64_t sortTemp[kMaxSimplePolygonVertices];
 	for (uint32_t i = 0; i < n; ++i) {
 		const Vec2& p1 = vtx[i];
-		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		const Vec2& p2 = vtx[nextVertex ? nextVertex[i] : (i + 1 == n ? 0 : i + 1)];
 		const float c1 = sweepY ? p1.y : p1.x;
 		const float c2 = sweepY ? p2.y : p2.x;
 		edgeMin[i] = bx::min(c1, c2);
@@ -1648,19 +1651,19 @@ static bool hasIntersectingEdges(const Vec2* vtx, uint32_t n, bool sweepY)
 		const uint32_t ea = (uint32_t)sortedEdges[i];
 		const float maxC = edgeMax[ea];
 		const Vec2& a = vtx[ea];
-		const Vec2& b = vtx[ea + 1 == n ? 0 : ea + 1];
+		const Vec2& b = vtx[nextVertex ? nextVertex[ea] : (ea + 1 == n ? 0 : ea + 1)];
 		for (uint32_t j = i + 1; j < n; ++j) {
 			const uint32_t eb = (uint32_t)sortedEdges[j];
 			if (edgeMin[eb] > maxC) {
 				break;
 			}
 
-			const uint32_t d = ea > eb ? ea - eb : eb - ea;
-			if (d == 1 || d == n - 1) {
+			const uint32_t ebNext = nextVertex ? nextVertex[eb] : (eb + 1 == n ? 0 : eb + 1);
+			if (ebNext == ea || (nextVertex ? nextVertex[ea] : (ea + 1 == n ? 0 : ea + 1)) == eb) {
 				continue; // Adjacent
 			}
 
-			if (segmentsIntersect(a, b, vtx[eb], vtx[eb + 1 == n ? 0 : eb + 1])) {
+			if (segmentsIntersect(a, b, vtx[eb], vtx[ebNext])) {
 				return true;
 			}
 		}
@@ -1726,105 +1729,53 @@ static inline bool blocksEar(const Vec2* vtx, uint32_t ir, uint32_t ip, uint32_t
 	const Vec2& p = vtx[ip];
 	const Vec2& c = vtx[ic];
 	const Vec2& q = vtx[in];
+
+	// A vertex at the position of a corner of the ear is the other occurrence of a vertex duplicated by a bridge
+	// (see bridgeHole()). Its edges are outside of the ear (in the complementary sector of the vertex).
+	if ((r.x == p.x && r.y == p.y) || (r.x == c.x && r.y == c.y) || (r.x == q.x && r.y == q.y)) {
+		return false;
+	}
+
 	return orient2d(p, c, r) >= 0.0 && orient2d(c, q, r) >= 0.0 && orient2d(q, p, r) >= 0.0;
 }
 
-static uint32_t triangulateSimplePolygon(Stroker* stroker)
+// Ear clipping of a ring of n vertices (CCW, interior on the left). The ring is simple, or weakly simple if it
+// contains bridges to holes (see bridgeHole(); the vertices at the ends of a bridge appear twice). Writes the n - 2
+// triangles (ring vertex indices) to tri. Returns false if no ear was found (numerical problems) or if it takes too
+// long (let libtess2 handle the polygon then).
+// An ear (p, c, q) must be convex (or c on the segment p-q) and no other vertex may be inside or on the triangle. In
+// a simple polygon it's enough to test the reflex vertices (if there's a vertex inside the triangle, there's also a
+// reflex one). Flat vertices are tested as well.
+// The reflex vertices are binned into a grid (a linked list per cell: reflexHead[cell] -> reflexNext[vertex] -> ...
+// -> UINT16_MAX) so each ear is tested only against the reflex vertices in the cells its bounding box overlaps.
+// Vertices which become reflex later (only possible due to numerical issues) are added then.
+static bool earClipRing(const Vec2* vtx, uint32_t n, uint16_t* tri)
 {
-	if (stroker->m_NumContours != 1) {
-		return 0;
-	}
+	VG_CHECK(n >= 3 && n <= kMaxSimplePolygonRingVertices, "Invalid ring");
 
-	const uint32_t n = stroker->m_ContourSizes[0];
-	if (n < 3 || n > kMaxSimplePolygonVertices) {
-		return 0;
-	}
-
-	const Vec2* src = stroker->m_ContourVertices;
-
-	// Orientation (and degenerate polygons)
-	double area2 = 0.0;
-	for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
-		area2 += (double)src[j].x * (double)src[i].y - (double)src[i].x * (double)src[j].y;
-	}
-	if (!(bx::abs(area2) > 1e-6) || area2 != area2) {
-		return 0;
-	}
-
-	Vec2* vtx = stroker->m_SimplePolyVertices;
-	if (area2 > 0.0) {
-		bx::memCopy(vtx, src, n * sizeof(Vec2));
-	} else {
-		for (uint32_t i = 0; i < n; ++i) {
-			vtx[i] = src[n - 1 - i];
-		}
-	}
-
-	// Simplicity: adjacent edges must not fold back onto each other, other edges must not intersect or touch
-	// (this also rejects duplicate vertices).
-	bool isReflex[kMaxSimplePolygonVertices]; // Reflex or flat vertices (see ear clipping below)
-	float sumDx = 0.0f;
-	float sumDy = 0.0f;
-	double sumX = 0.0;
-	double sumY = 0.0;
+	uint16_t prev[kMaxSimplePolygonRingVertices];
+	uint16_t next[kMaxSimplePolygonRingVertices];
+	uint16_t reflexHead[PolygonGrid::kMaxCells];
+	uint16_t reflexNext[kMaxSimplePolygonRingVertices];
+	bool isReflex[kMaxSimplePolygonRingVertices];
+	bool isListed[kMaxSimplePolygonRingVertices];
+	uint32_t numReflex = 0; // Reflex vertices of the remaining polygon
 	Vec2 bbMin = vtx[0];
 	Vec2 bbMax = vtx[0];
 	for (uint32_t i = 0; i < n; ++i) {
-		const Vec2& p0 = vtx[i == 0 ? n - 1 : i - 1];
-		const Vec2& p1 = vtx[i];
-		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
-		if (p0.x == p1.x && p0.y == p1.y) {
-			return 0;
-		}
-		const double o = orient2d(p0, p1, p2);
-		if (o == 0.0 && ((double)p1.x - p0.x) * ((double)p2.x - p1.x) + ((double)p1.y - p0.y) * ((double)p2.y - p1.y) <= 0.0) {
-			return 0;
-		}
-
-		isReflex[i] = !(o > 0.0);
-		sumDx += bx::abs(p2.x - p1.x);
-		sumDy += bx::abs(p2.y - p1.y);
-		sumX += p1.x;
-		sumY += p1.y;
-		bbMin = { bx::min(bbMin.x, p1.x), bx::min(bbMin.y, p1.y) };
-		bbMax = { bx::max(bbMax.x, p1.x), bx::max(bbMax.y, p1.y) };
-	}
-
-	// Star-shaped polygons (e.g. stars, circles, rounded shapes) are simple if they wind exactly once around a point
-	// of their kernel (the average of the vertices is tried). Other polygons are tested with a sweep, unless they
-	// can't be simple because their edge direction doesn't turn around exactly once (Umlaufsatz; cheap).
-	const Vec2 center = { (float)(sumX / n), (float)(sumY / n) };
-	if (!windsOnceAround(vtx, n, center)) {
-		if (calcTurningNumber(vtx, n) != 1
-		||  hasIntersectingEdges(vtx, n, sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x))) {
-			return 0;
-		}
-	}
-
-
-	// Ear clipping. An ear (p, c, q) must be convex (or c on the segment p-q) and no other vertex may be inside
-	// or on the triangle. In a simple polygon it's enough to test the reflex vertices (if there's a vertex inside
-	// the triangle, there's also a reflex one). Flat vertices are tested as well.
-	// The reflex vertices are binned into the grid (a linked list per cell: reflexHead[cell] -> reflexNext[vertex]
-	// -> ... -> UINT16_MAX) so each ear is tested only against the reflex vertices in the cells its bounding box
-	// overlaps. Vertices which become reflex later (only possible due to numerical issues) are added then.
-	uint16_t prev[kMaxSimplePolygonVertices];
-	uint16_t next[kMaxSimplePolygonVertices];
-	uint16_t reflexHead[PolygonGrid::kMaxCells];
-	uint16_t reflexNext[kMaxSimplePolygonVertices];
-	bool isListed[kMaxSimplePolygonVertices];
-	uint32_t numReflex = 0; // Reflex vertices of the remaining polygon
-	for (uint32_t i = 0; i < n; ++i) {
+		prev[i] = (uint16_t)(i == 0 ? n - 1 : i - 1);
+		next[i] = (uint16_t)(i + 1 == n ? 0 : i + 1);
+		isReflex[i] = !(orient2d(vtx[prev[i]], vtx[i], vtx[next[i]]) > 0.0);
+		isListed[i] = isReflex[i];
 		numReflex += isReflex[i] ? 1 : 0;
+		bbMin = { bx::min(bbMin.x, vtx[i].x), bx::min(bbMin.y, vtx[i].y) };
+		bbMax = { bx::max(bbMax.x, vtx[i].x), bx::max(bbMax.y, vtx[i].y) };
 	}
 
 	PolygonGrid grid;
 	grid.init(bbMin, bbMax, n);
 	bx::memSet(reflexHead, 0xff, sizeof(uint16_t) * grid.m_Size * grid.m_Size);
 	for (uint32_t i = 0; i < n; ++i) {
-		prev[i] = (uint16_t)(i == 0 ? n - 1 : i - 1);
-		next[i] = (uint16_t)(i + 1 == n ? 0 : i + 1);
-		isListed[i] = isReflex[i];
 		if (isReflex[i]) {
 			const uint32_t cell = grid.getCellID(vtx[i]);
 			reflexNext[i] = reflexHead[cell];
@@ -1832,16 +1783,14 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 		}
 	}
 
-	// Bail out (and let libtess2 handle the polygon) if ear clipping takes too long.
 	int32_t budget = (int32_t)(n * 64 + 256);
 
-	uint16_t* tri = stroker->m_SimplePolyTriangles;
 	uint32_t numRemaining = n;
 	uint32_t c = 0;
 	uint32_t numTested = 0;
 	while (numRemaining > 3) {
 		if (numTested == numRemaining || budget < 0) {
-			return 0; // No ear found (numerical problems) or too slow
+			return false;
 		}
 		--budget;
 
@@ -1921,6 +1870,75 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 	tri[0] = prev[c];
 	tri[1] = (uint16_t)c;
 	tri[2] = next[c];
+	return true;
+}
+
+// Single contour: vertices in m_ContourVertices, n > 0. See triangulateSimplePolygon().
+static uint32_t triangulateSimpleContour(Stroker* stroker, uint32_t n)
+{
+	const Vec2* src = stroker->m_ContourVertices;
+
+	// Orientation (and degenerate polygons)
+	double area2 = 0.0;
+	for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
+		area2 += (double)src[j].x * (double)src[i].y - (double)src[i].x * (double)src[j].y;
+	}
+	if (!(bx::abs(area2) > 1e-6) || area2 != area2) {
+		return 0;
+	}
+
+	Vec2* vtx = stroker->m_SimplePolyVertices;
+	if (area2 > 0.0) {
+		bx::memCopy(vtx, src, n * sizeof(Vec2));
+	} else {
+		for (uint32_t i = 0; i < n; ++i) {
+			vtx[i] = src[n - 1 - i];
+		}
+	}
+
+	// Simplicity: adjacent edges must not fold back onto each other, other edges must not intersect or touch
+	// (this also rejects duplicate vertices).
+	float sumDx = 0.0f;
+	float sumDy = 0.0f;
+	double sumX = 0.0;
+	double sumY = 0.0;
+	Vec2 bbMin = vtx[0];
+	Vec2 bbMax = vtx[0];
+	for (uint32_t i = 0; i < n; ++i) {
+		const Vec2& p0 = vtx[i == 0 ? n - 1 : i - 1];
+		const Vec2& p1 = vtx[i];
+		const Vec2& p2 = vtx[i + 1 == n ? 0 : i + 1];
+		if (p0.x == p1.x && p0.y == p1.y) {
+			return 0;
+		}
+		const double o = orient2d(p0, p1, p2);
+		if (o == 0.0 && ((double)p1.x - p0.x) * ((double)p2.x - p1.x) + ((double)p1.y - p0.y) * ((double)p2.y - p1.y) <= 0.0) {
+			return 0;
+		}
+
+		sumDx += bx::abs(p2.x - p1.x);
+		sumDy += bx::abs(p2.y - p1.y);
+		sumX += p1.x;
+		sumY += p1.y;
+		bbMin = { bx::min(bbMin.x, p1.x), bx::min(bbMin.y, p1.y) };
+		bbMax = { bx::max(bbMax.x, p1.x), bx::max(bbMax.y, p1.y) };
+	}
+
+	// Star-shaped polygons (e.g. stars, circles, rounded shapes) are simple if they wind exactly once around a point
+	// of their kernel (the average of the vertices is tried). Other polygons are tested with a sweep, unless they
+	// can't be simple because their edge direction doesn't turn around exactly once (Umlaufsatz; cheap).
+	const Vec2 center = { (float)(sumX / n), (float)(sumY / n) };
+	if (!windsOnceAround(vtx, n, center)) {
+		if (calcTurningNumber(vtx, n) != 1
+		||  hasIntersectingEdges(vtx, n, sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x))) {
+			return 0;
+		}
+	}
+
+
+	if (!earClipRing(vtx, n, stroker->m_SimplePolyTriangles)) {
+		return 0;
+	}
 
 	// Boundary: vertices 0..n-1, a single contour (first = 0, count = n)
 	uint16_t* boundary = stroker->m_SimplePolyBoundary;
@@ -1930,7 +1948,446 @@ static uint32_t triangulateSimplePolygon(Stroker* stroker)
 	boundary[n + 0] = 0;
 	boundary[n + 1] = (uint16_t)n;
 
+	stroker->m_SimplePolyNumContours = 1;
+	stroker->m_SimplePolyNumIndices = (n - 2) * 3;
 	return n;
+}
+
+// Winding number of the contour (first, count) around p (p must not be on the contour).
+static int32_t contourWindingNumber(const Vec2* vtx, uint32_t first, uint32_t count, const Vec2& p)
+{
+	int32_t w = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		const Vec2& a = vtx[first + i];
+		const Vec2& b = vtx[first + (i + 1 == count ? 0 : i + 1)];
+		if (a.y <= p.y) {
+			if (b.y > p.y && orient2d(a, b, p) > 0.0) {
+				++w;
+			}
+		} else {
+			if (b.y <= p.y && orient2d(a, b, p) < 0.0) {
+				--w;
+			}
+		}
+	}
+
+	return w;
+}
+
+// Returns true if p is inside the (CCW) sector of ring vertex i.
+static bool isInSector(const Vec2* ringPos, const uint16_t* prev, const uint16_t* next, uint32_t i, const Vec2& p)
+{
+	const Vec2& a = ringPos[prev[i]];
+	const Vec2& b = ringPos[i];
+	const Vec2& c = ringPos[next[i]];
+	const bool left0 = orient2d(a, b, p) > 0.0;
+	const bool left1 = orient2d(b, c, p) > 0.0;
+	return orient2d(a, b, c) >= 0.0 ? (left0 && left1) : (left0 || left1);
+}
+
+// Joins the hole (CW, its vertices are vtx[first, first + count)) to the ring (CCW, a linked list of ring vertices,
+// ringPos[i] = vtx[ringVertex[i]]) with a bridge from the hole's leftmost vertex M to a visible ring vertex T (like
+// earcut): T -> M -> (hole) -> M' -> T' -> (the rest of the ring). M and T appear twice in the ring.
+// Returns false if no valid bridge was found.
+static bool bridgeHole(const Vec2* vtx, uint32_t first, uint32_t count, Vec2* ringPos, uint16_t* ringVertex, uint16_t* prev, uint16_t* next, uint32_t* ringSize)
+{
+	// Leftmost vertex of the hole
+	uint32_t m = first;
+	for (uint32_t i = first + 1; i < first + count; ++i) {
+		if (vtx[i].x < vtx[m].x || (vtx[i].x == vtx[m].x && vtx[i].y < vtx[m].y)) {
+			m = i;
+		}
+	}
+
+	const Vec2 M = vtx[m];
+	const uint32_t n = *ringSize;
+
+	// The closest ring edge hit by the ray from M towards -X. The endpoint with the smaller X is the candidate.
+	double qx = -DBL_MAX;
+	uint32_t target = UINT32_MAX;
+	for (uint32_t i = 0; i < n; ++i) {
+		if (prev[i] == UINT16_MAX) {
+			continue; // Not linked (unused)
+		}
+
+		const Vec2& a = ringPos[i];
+		const Vec2& b = ringPos[next[i]];
+		if ((a.y <= M.y && b.y >= M.y && a.y != b.y) || (a.y >= M.y && b.y <= M.y && a.y != b.y)) {
+			const double x = (double)a.x + ((double)M.y - a.y) * ((double)b.x - a.x) / ((double)b.y - a.y);
+			if (x <= (double)M.x && x > qx) {
+				qx = x;
+				target = a.x < b.x ? i : next[i];
+			}
+		}
+	}
+
+	if (target == UINT32_MAX) {
+		return false;
+	}
+
+	// If there are ring vertices inside the triangle (M, hit point, candidate), the one with the smallest angle to
+	// the ray is visible instead.
+	{
+		const Vec2 T = ringPos[target];
+		const Vec2 Q = { (float)qx, M.y };
+		const bool ccw = orient2d(M, Q, T) > 0.0;
+		double bestTan = DBL_MAX;
+		for (uint32_t i = 0; i < n; ++i) {
+			if (prev[i] == UINT16_MAX || i == target) {
+				continue;
+			}
+
+			const Vec2& p = ringPos[i];
+			if (p.x > M.x || p.x < T.x || (p.x == T.x && p.y == T.y)) {
+				continue;
+			}
+
+			const bool inside = ccw
+				? (orient2d(M, Q, p) >= 0.0 && orient2d(Q, T, p) >= 0.0 && orient2d(T, M, p) >= 0.0)
+				: (orient2d(M, Q, p) <= 0.0 && orient2d(Q, T, p) <= 0.0 && orient2d(T, M, p) <= 0.0);
+			if (!inside || p.x == M.x) {
+				continue;
+			}
+
+			const double tan = bx::abs((double)M.y - p.y) / ((double)M.x - p.x);
+			if (tan < bestTan && isInSector(ringPos, prev, next, i, M)) {
+				bestTan = tan;
+				target = i;
+			}
+		}
+	}
+
+	// T might appear more than once in the ring (end of a previous bridge): use the occurrence whose sector contains M.
+	{
+		const Vec2 T = ringPos[target];
+		if (!isInSector(ringPos, prev, next, target, M)) {
+			uint32_t found = UINT32_MAX;
+			for (uint32_t i = 0; i < n && found == UINT32_MAX; ++i) {
+				if (prev[i] != UINT16_MAX && i != target && ringPos[i].x == T.x && ringPos[i].y == T.y && isInSector(ringPos, prev, next, i, M)) {
+					found = i;
+				}
+			}
+
+			if (found == UINT32_MAX) {
+				return false;
+			}
+			target = found;
+		}
+	}
+
+	// The bridge must not intersect or touch any edge of the ring or the hole (except at its endpoints).
+	const Vec2 T = ringPos[target];
+	for (uint32_t i = 0; i < n; ++i) {
+		if (prev[i] == UINT16_MAX) {
+			continue;
+		}
+
+		const Vec2& a = ringPos[i];
+		const Vec2& b = ringPos[next[i]];
+		const bool sharesT = (a.x == T.x && a.y == T.y) || (b.x == T.x && b.y == T.y);
+		if (!sharesT && segmentsIntersect(M, T, a, b)) {
+			return false;
+		}
+	}
+	for (uint32_t i = 0; i < count; ++i) {
+		const uint32_t ia = first + i;
+		const uint32_t ib = first + (i + 1 == count ? 0 : i + 1);
+		if (ia != m && ib != m && segmentsIntersect(M, T, vtx[ia], vtx[ib])) {
+			return false;
+		}
+	}
+
+	if (n + count + 2 > kMaxSimplePolygonRingVertices) {
+		return false;
+	}
+
+	// Splice: T -> M -> hole (after M) ... -> M' -> T' -> next(T)
+	const uint16_t afterT = next[target];
+	uint32_t last = target;
+	for (uint32_t k = 0; k <= count; ++k) {
+		const uint32_t hv = first + (m - first + k) % count; // M, ..., the vertex before M, M again
+		const uint32_t node = n + k;
+		ringPos[node] = vtx[hv];
+		ringVertex[node] = (uint16_t)hv;
+		prev[node] = (uint16_t)last;
+		next[last] = (uint16_t)node;
+		last = node;
+	}
+
+	const uint32_t tDup = n + count + 1;
+	ringPos[tDup] = T;
+	ringVertex[tDup] = ringVertex[target];
+	prev[tDup] = (uint16_t)last;
+	next[last] = (uint16_t)tDup;
+	next[tDup] = afterT;
+	prev[afterT] = (uint16_t)tDup;
+
+	*ringSize = n + count + 2;
+	return true;
+}
+
+// Multiple contours: outer contours with holes (no intersections), see triangulateSimplePolygon().
+static uint32_t triangulateSimplePolygonWithHoles(Stroker* stroker, int windingRule)
+{
+	const uint32_t numContours = stroker->m_NumContours;
+	if (numContours > kMaxSimplePolygonContours) {
+		return 0;
+	}
+
+	uint32_t contourFirst[kMaxSimplePolygonContours];
+	uint32_t n = 0;
+	for (uint32_t c = 0; c < numContours; ++c) {
+		const uint32_t size = stroker->m_ContourSizes[c];
+		if (size < 3) {
+			return 0;
+		}
+		contourFirst[c] = n;
+		n += size;
+	}
+
+	if (n > kMaxSimplePolygonVertices) {
+		return 0;
+	}
+
+	const uint32_t* contourSize = stroker->m_ContourSizes;
+	Vec2* vtx = stroker->m_SimplePolyVertices;
+	bx::memCopy(vtx, stroker->m_ContourVertices, n * sizeof(Vec2));
+
+	// Orientations (and degenerate contours) and bounds
+	double area2[kMaxSimplePolygonContours];
+	float contourBounds[kMaxSimplePolygonContours][4];
+	for (uint32_t c = 0; c < numContours; ++c) {
+		const Vec2* v = &vtx[contourFirst[c]];
+		const uint32_t size = contourSize[c];
+		float* bounds = contourBounds[c];
+		bounds[0] = bounds[2] = v[0].x;
+		bounds[1] = bounds[3] = v[0].y;
+		double a = 0.0;
+		for (uint32_t i = 0, j = size - 1; i < size; j = i++) {
+			a += (double)v[j].x * (double)v[i].y - (double)v[i].x * (double)v[j].y;
+			bounds[0] = bx::min(bounds[0], v[i].x);
+			bounds[1] = bx::min(bounds[1], v[i].y);
+			bounds[2] = bx::max(bounds[2], v[i].x);
+			bounds[3] = bx::max(bounds[3], v[i].y);
+		}
+		if (!(bx::abs(a) > 1e-6) || a != a) {
+			return 0;
+		}
+		area2[c] = a;
+	}
+
+	// A contour can only contain the contours within its bounds. Reject contours with too many holes early (the
+	// bounds overestimate the number of contours a contour contains).
+	bool mightContain[kMaxSimplePolygonContours][kMaxSimplePolygonContours];
+	for (uint32_t d = 0; d < numContours; ++d) {
+		const float* bd = contourBounds[d];
+		uint32_t count = 0;
+		for (uint32_t c = 0; c < numContours; ++c) {
+			const float* bc = contourBounds[c];
+			mightContain[d][c] = d != c && bc[0] >= bd[0] && bc[1] >= bd[1] && bc[2] <= bd[2] && bc[3] <= bd[3];
+			count += mightContain[d][c] ? 1 : 0;
+		}
+		if (count > kMaxSimplePolygonHolesPerContour) {
+			return 0;
+		}
+	}
+
+	// Simplicity: adjacent edges must not fold back onto each other, other edges (of all the contours) must not
+	// intersect or touch.
+	uint16_t nextVertex[kMaxSimplePolygonVertices] = {}; // NOTE: Initialized to silence a false maybe-uninitialized warning
+	float sumDx = 0.0f;
+	float sumDy = 0.0f;
+	Vec2 bbMin = vtx[0];
+	Vec2 bbMax = vtx[0];
+	for (uint32_t c = 0; c < numContours; ++c) {
+		const uint32_t first = contourFirst[c];
+		const uint32_t size = contourSize[c];
+		for (uint32_t i = 0; i < size; ++i) {
+			const Vec2& p0 = vtx[first + (i == 0 ? size - 1 : i - 1)];
+			const Vec2& p1 = vtx[first + i];
+			const Vec2& p2 = vtx[first + (i + 1 == size ? 0 : i + 1)];
+			if (p0.x == p1.x && p0.y == p1.y) {
+				return 0;
+			}
+			if (orient2d(p0, p1, p2) == 0.0 && ((double)p1.x - p0.x) * ((double)p2.x - p1.x) + ((double)p1.y - p0.y) * ((double)p2.y - p1.y) <= 0.0) {
+				return 0;
+			}
+
+			nextVertex[first + i] = (uint16_t)(first + (i + 1 == size ? 0 : i + 1));
+			sumDx += bx::abs(p2.x - p1.x);
+			sumDy += bx::abs(p2.y - p1.y);
+			bbMin = { bx::min(bbMin.x, p1.x), bx::min(bbMin.y, p1.y) };
+			bbMax = { bx::max(bbMax.x, p1.x), bx::max(bbMax.y, p1.y) };
+		}
+	}
+
+	// Nesting: the depth of a contour is the number of contours containing it (if they don't intersect, testing
+	// one vertex is enough) and its parent is the innermost of them. Contours at even depths are outer contours,
+	// the ones at odd depths are holes of their parents. With the non-zero rule, holes have to be oriented
+	// opposite to their parents (otherwise they aren't holes).
+	uint32_t depth[kMaxSimplePolygonContours];
+	int32_t parent[kMaxSimplePolygonContours];
+	for (uint32_t c = 0; c < numContours; ++c) {
+		depth[c] = 0;
+		parent[c] = -1;
+	}
+	bool contains[kMaxSimplePolygonContours][kMaxSimplePolygonContours];
+	for (uint32_t c = 0; c < numContours; ++c) {
+		const Vec2& p = vtx[contourFirst[c]];
+		for (uint32_t d = 0; d < numContours; ++d) {
+			contains[d][c] = mightContain[d][c] && contourWindingNumber(vtx, contourFirst[d], contourSize[d], p) != 0;
+			depth[c] += contains[d][c] ? 1 : 0;
+		}
+	}
+	for (uint32_t c = 0; c < numContours; ++c) {
+		for (uint32_t d = 0; d < numContours; ++d) {
+			if (contains[d][c] && depth[d] + 1 == depth[c]) {
+				parent[c] = (int32_t)d;
+			}
+		}
+
+		if (depth[c] != 0 && parent[c] < 0) {
+			return 0;
+		}
+
+		if (windingRule == TESS_WINDING_NONZERO && parent[c] >= 0 && (area2[c] > 0.0) == (area2[parent[c]] > 0.0)) {
+			return 0;
+		}
+	}
+
+	uint32_t numChildren[kMaxSimplePolygonContours] = {};
+	for (uint32_t c = 0; c < numContours; ++c) {
+		if (parent[c] >= 0 && ++numChildren[parent[c]] > kMaxSimplePolygonHolesPerContour) {
+			return 0;
+		}
+	}
+
+	// NOTE: The nesting (and the number of holes) is only valid if the contours don't intersect, which is tested
+	// last because it's the most expensive test.
+	if (hasIntersectingEdges(vtx, n, sumDx * (bbMax.y - bbMin.y) > sumDy * (bbMax.x - bbMin.x), nextVertex)) {
+		return 0;
+	}
+
+	// Outer contours CCW, holes CW
+	for (uint32_t c = 0; c < numContours; ++c) {
+		const bool isHole = (depth[c] & 1) != 0;
+		if ((area2[c] > 0.0) == isHole) {
+			Vec2* v = &vtx[contourFirst[c]];
+			for (uint32_t i = 0, j = contourSize[c] - 1; i < j; ++i, --j) {
+				const Vec2 tmp = v[i];
+				v[i] = v[j];
+				v[j] = tmp;
+			}
+		}
+	}
+
+	// Join the holes of each outer contour to it (from left to right) and triangulate the resulting rings.
+	uint16_t* tri = stroker->m_SimplePolyTriangles;
+	uint32_t numIndices = 0;
+	for (uint32_t o = 0; o < numContours; ++o) {
+		if ((depth[o] & 1) != 0) {
+			continue;
+		}
+
+		Vec2 ringPos[kMaxSimplePolygonRingVertices];
+		uint16_t ringVertex[kMaxSimplePolygonRingVertices];
+		uint16_t prev[kMaxSimplePolygonRingVertices];
+		uint16_t next[kMaxSimplePolygonRingVertices];
+		const uint32_t outerFirst = contourFirst[o];
+		const uint32_t outerSize = contourSize[o];
+		for (uint32_t i = 0; i < outerSize; ++i) {
+			ringPos[i] = vtx[outerFirst + i];
+			ringVertex[i] = (uint16_t)(outerFirst + i);
+			prev[i] = (uint16_t)(i == 0 ? outerSize - 1 : i - 1);
+			next[i] = (uint16_t)(i + 1 == outerSize ? 0 : i + 1);
+		}
+		uint32_t ringSize = outerSize;
+
+		// Holes sorted by their leftmost X
+		uint32_t holes[kMaxSimplePolygonContours];
+		float holeMinX[kMaxSimplePolygonContours];
+		uint32_t numHoles = 0;
+		for (uint32_t h = 0; h < numContours; ++h) {
+			if (parent[h] != (int32_t)o) {
+				continue;
+			}
+
+			float minX = vtx[contourFirst[h]].x;
+			for (uint32_t i = 1; i < contourSize[h]; ++i) {
+				minX = bx::min(minX, vtx[contourFirst[h] + i].x);
+			}
+
+			uint32_t k = numHoles++;
+			for (; k > 0 && holeMinX[k - 1] > minX; --k) {
+				holes[k] = holes[k - 1];
+				holeMinX[k] = holeMinX[k - 1];
+			}
+			holes[k] = h;
+			holeMinX[k] = minX;
+		}
+
+		for (uint32_t k = 0; k < numHoles; ++k) {
+			if (!bridgeHole(vtx, contourFirst[holes[k]], contourSize[holes[k]], ringPos, ringVertex, prev, next, &ringSize)) {
+				return 0;
+			}
+		}
+
+		// Ring in order (starting at the first outer vertex)
+		Vec2 ring[kMaxSimplePolygonRingVertices];
+		uint16_t ringOrder[kMaxSimplePolygonRingVertices];
+		for (uint32_t i = 0, node = 0; i < ringSize; ++i, node = next[node]) {
+			ring[i] = ringPos[node];
+			ringOrder[i] = ringVertex[node];
+		}
+
+		if (!earClipRing(ring, ringSize, &tri[numIndices])) {
+			return 0;
+		}
+
+		const uint32_t numRingIndices = (ringSize - 2) * 3;
+		for (uint32_t i = 0; i < numRingIndices; ++i) {
+			tri[numIndices + i] = ringOrder[tri[numIndices + i]];
+		}
+		numIndices += numRingIndices;
+	}
+
+	// Boundary: vertices 0..n-1, one contour per input contour
+	uint16_t* boundary = stroker->m_SimplePolyBoundary;
+	for (uint32_t i = 0; i < n; ++i) {
+		boundary[i] = (uint16_t)i;
+	}
+	for (uint32_t c = 0; c < numContours; ++c) {
+		boundary[n + c * 2 + 0] = (uint16_t)contourFirst[c];
+		boundary[n + c * 2 + 1] = (uint16_t)contourSize[c];
+	}
+
+	stroker->m_SimplePolyNumContours = numContours;
+	stroker->m_SimplePolyNumIndices = numIndices;
+	return n;
+}
+
+// Fast path for concave fills: if the contours don't intersect or touch each other (no self intersections, no
+// duplicate vertices), with at most kMaxSimplePolygonVertices vertices, they are triangulated by ear clipping, which
+// is much faster than libtess2. Holes (contours inside other contours; with the non-zero rule they have to be
+// oriented opposite to the contour containing them) are joined to their outer contours by bridges first.
+// The vertices are stored in m_SimplePolyVertices, contour by contour, outer contours CCW and holes CW (like the
+// tesselator's boundary contours, with the interior on the left), the CCW triangles in m_SimplePolyTriangles
+// (m_SimplePolyNumIndices indices) and the boundary vertices and m_SimplePolyNumContours contours
+// in m_SimplePolyBoundary.
+// Returns the number of vertices, or 0 if the fast path can't be used (the contours have to be tesselated).
+static uint32_t triangulateSimplePolygon(Stroker* stroker, int windingRule)
+{
+	const uint32_t numContours = stroker->m_NumContours;
+	if (numContours == 0) {
+		return 0;
+	}
+
+	if (numContours == 1) {
+		const uint32_t n = stroker->m_ContourSizes[0];
+		return n >= 3 && n <= kMaxSimplePolygonVertices ? triangulateSimpleContour(stroker, n) : 0;
+	}
+
+	return triangulateSimplePolygonWithHoles(stroker, windingRule);
 }
 
 bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule)
@@ -1942,13 +2399,13 @@ bool strokerConcaveFillEnd(Stroker* stroker, Mesh* mesh, FillRule::Enum fillRule
 	// in XY space (previously the winding depended on the input). NonZero and EvenOdd are symmetric wrt the
 	// sign of the winding number, so the filled region is the same either way (the sweep direction might
 	// differ, so the exact triangulation can differ on degenerate input).
-	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker);
+	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker, windingRule);
 	if (numSimplePolyVertices != 0) {
 		mesh->m_PosBuffer = &stroker->m_SimplePolyVertices[0].x;
 		mesh->m_ColorBuffer = nullptr;
 		mesh->m_IndexBuffer = stroker->m_SimplePolyTriangles;
 		mesh->m_NumVertices = numSimplePolyVertices;
-		mesh->m_NumIndices = (numSimplePolyVertices - 2) * 3;
+		mesh->m_NumIndices = stroker->m_SimplePolyNumIndices;
 		return true;
 	}
 
@@ -2696,13 +3153,13 @@ bool strokerConcaveFillEndAA(Stroker* stroker, Mesh* mesh, uint32_t color, FillR
 	const TESSindex* corners;
 	const TESSindex* contours;
 	const TESSindex* boundaryVertices;
-	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker);
+	const uint32_t numSimplePolyVertices = triangulateSimplePolygon(stroker, windingRule);
 	if (numSimplePolyVertices != 0) {
-		numContours = 1;
+		numContours = stroker->m_SimplePolyNumContours;
 		tessVertices = stroker->m_SimplePolyVertices;
 		numTessVertices = numSimplePolyVertices;
 		triangles = stroker->m_SimplePolyTriangles;
-		numTriangleIndices = (numSimplePolyVertices - 2) * 3;
+		numTriangleIndices = stroker->m_SimplePolyNumIndices;
 		corners = stroker->m_SimplePolyTriangles;
 		boundaryVertices = stroker->m_SimplePolyBoundary;
 		contours = &stroker->m_SimplePolyBoundary[numSimplePolyVertices];
